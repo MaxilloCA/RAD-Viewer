@@ -19,7 +19,8 @@ fn main() -> Result<(), String> {
         recipe.version = 2;
         recipe.detail_mode = "radiograph".into();
         recipe.local_contrast = 0.4;
-        recipe.sharpen = 5.0;
+        recipe.gamma = 0.22;
+        recipe.sharpen = 6.0;
         recipe.radius = 2.2;
         recipe.threshold = 0.0015;
         recipe.halo = 0.35;

@@ -30,15 +30,15 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-## Compare images
+## View and adjust images
 
-Open local RVG, PANO, DICOM, JPEG or PNG files. DICOM is detected from content, independently of its extension. Select an image in the strip. Neutral starts with spatial filters disabled. Pan and zoom stay linked between the neutral, adjusted and reference panes. Choose 100% to inspect source pixels; fit returns to the complete image. Bypass shows the neutral rendering immediately.
+Open local RVG, PANO, DICOM, JPEG or PNG files. DICOM is detected from content, independently of its extension. Select an image in the strip. Version 0.3.0 shows one enhanced image, with gamma **0.22** and sharpness **6** on every import and Reset. Gamma controls span **0.1–0.9** and sharpness **5–10**. Eligible high-depth intraoral DICOM also receives a source-aware starting window; other images use their supplied or neutral starting window.
 
-Version 0.2.0 opens eligible high-depth intraoral DICOM with the revised Bitewing preset in the adjusted pane; the original pane stays neutral. References, ordinary images and panoramic images retain neutral defaults. Source-aware window/gamma and multiscale processing improve contrast and detail. Expand advanced controls for local contrast, noise reduction and detail enhancement. Check clipping, noise, halos and small structures at 100%. Undo, redo and reset affect the selected image. Existing saved presets retain their version 1 rendering. PNG export always processes the full source resolution. See [the research and comparison report](verification/IMAGE_QUALITY_REVIEW.md).
+Hold the left mouse button on the image and drag **right/left to lighten/darken tone**, or **up/down to increase/decrease gamma**. Shift-drag or middle-drag pans; the wheel zooms; double-click fits. Choose 100% to inspect source pixels. A completed drag is one undo step. Tone and Contrast use short, labeled relative scales instead of raw detector values. The monochrome histogram uses linear pixel counts and a black-to-white intensity strip.
 
-Use a rendered Carestream v7 PNG/JPEG as the reference. Record its DEJ or Endo setting, Sharpness, orientation and capture zoom in the reference notes. Verify that the exported reference preserves Carestream's displayed appearance. A screenshot with toolbars, borders, a different orientation or different crop must be cropped/aligned externally before a valid matched-scale comparison; synchronized navigation does not register unmatched images automatically.
+**Colorize** toggles an ordered sampled Viridis false-color mapping of processed intensity, retaining current tone/detail settings. The legend runs from low to high intensity. Histogram and clipping describe intensity before the color mapping. Colorize is included in PNG exports and saved presets. Neutral and Endo preset buttons, the original/reference panes and bypass are removed. Source pixels remain immutable internally.
 
-Save a comparison review JSON to record the recipe and reference context. It is a review record, not a reopenable workspace session. Reference images are visual targets, not decoding ground truth.
+Expand advanced controls for local contrast, noise reduction and detail enhancement. Undo, redo and Reset affect the selected image. Old saved recipes retain their rendering, even when stored values fall outside the new slider ranges; the UI identifies those values. PNG export always processes the full source resolution. Save review JSON to record recipes; it is not a reopenable workspace session. See [processing details](PROCESSING.md) and [the earlier research and comparison report](verification/IMAGE_QUALITY_REVIEW.md). Matched-scale Carestream comparison remains part of the user's image-quality review.
 
 ## Privacy and source preservation
 

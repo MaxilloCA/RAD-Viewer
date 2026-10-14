@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { commit, experimentalPreset, redo, sourcePixelScale, undo } from './model';
+import { commit, contrastValue, dragAdjustment, experimentalPreset, redo, sameRecipe, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
 import type { Recipe } from './model';
 
-const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, localContrast: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false };
+const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, localContrast: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false, colorize: false };
 describe('non-destructive per-image adjustment history', () => {
   it('maps source pixels to physical display pixels on HiDPI displays', () => {
     expect(sourcePixelScale(2)).toBe(.5);
@@ -37,11 +37,47 @@ describe('non-destructive per-image adjustment history', () => {
     const suggested = { ...neutral, windowCenter: 2800, windowWidth: 1400, gamma: .38 };
     expect(experimentalPreset('neutral', neutral, suggested)).toEqual(neutral);
     expect(experimentalPreset('bitewing', neutral, suggested).windowCenter).toBe(2800);
-    expect(experimentalPreset('endo', neutral, suggested).windowWidth).toBe(1400);
-    expect(experimentalPreset('bitewing', neutral, suggested).gamma).toBe(.38);
-    expect(experimentalPreset('endo', neutral, suggested).gamma).toBeCloseTo(.646);
-    expect(experimentalPreset('detail', neutral, suggested).gamma).toBeCloseTo(.399);
-    expect(experimentalPreset('bitewing', neutral).gamma).toBe(1);
+    expect(experimentalPreset('detail', neutral, suggested).windowWidth).toBe(1400);
+    expect(experimentalPreset('bitewing', neutral, suggested).gamma).toBe(.22);
+    expect(experimentalPreset('bitewing', neutral).sharpen).toBe(6);
+    expect(experimentalPreset('detail', neutral, suggested).gamma).toBe(.22);
+    expect(experimentalPreset('detail', neutral).sharpen).toBe(8);
     expect(neutral.windowWidth).toBe(4096);
+  });
+  it('normalizes tone and contrast without changing source baseline', () => {
+    const enhanced = experimentalPreset('bitewing', neutral);
+    expect(withTone(enhanced, neutral, 100).windowCenter).toBe(1024);
+    expect(toneValue(withTone(enhanced, neutral, 75), neutral)).toBe(75);
+    expect(withContrast(enhanced, neutral, 100).windowWidth).toBe(2048);
+    expect(withContrast(enhanced, neutral, -100).windowWidth).toBe(8192);
+    expect(contrastValue(withContrast(enhanced, neutral, 40), neutral)).toBeCloseTo(40);
+    expect(neutral.windowCenter).toBe(2048);
+  });
+  it('keeps rightward tone brighter for both polarities and inverted display', () => {
+    const start = experimentalPreset('bitewing', neutral);
+    expect(dragAdjustment(start, neutral, 100, 0, 'MONOCHROME2').windowCenter).toBeLessThan(start.windowCenter);
+    expect(dragAdjustment(start, neutral, 100, 0, 'MONOCHROME1').windowCenter).toBeGreaterThan(start.windowCenter);
+    expect(dragAdjustment({ ...start, invert: true }, neutral, 100, 0, 'MONOCHROME2').windowCenter).toBeGreaterThan(start.windowCenter);
+    expect(dragAdjustment({ ...start, invert: true }, neutral, 100, 0, 'MONOCHROME1').windowCenter).toBeLessThan(start.windowCenter);
+  });
+  it('uses captured drag coordinates with bounded gamma and tone', () => {
+    const start = experimentalPreset('bitewing', neutral);
+    expect(dragAdjustment(start, neutral, 0, -80).gamma).toBeCloseTo(.42);
+    expect(dragAdjustment(start, neutral, 0, -160).gamma).toBeCloseTo(.62);
+    expect(dragAdjustment(start, neutral, 100000, -100000).gamma).toBe(.9);
+    expect(dragAdjustment(start, neutral, -100000, 100000).gamma).toBe(.1);
+    expect(toneValue(dragAdjustment(start, neutral, 100000, 0), neutral)).toBe(100);
+    expect(toneValue(dragAdjustment(start, neutral, -100000, 0), neutral)).toBe(-100);
+  });
+  it('preserves legacy out-of-range values on an unmoved axis', () => {
+    const legacy = { ...neutral, gamma: 1.2, windowCenter: neutral.windowCenter + neutral.windowWidth };
+    expect(dragAdjustment(legacy, neutral, 0, 0)).toBe(legacy);
+    expect(dragAdjustment(legacy, neutral, 50, 0).gamma).toBe(1.2);
+    expect(dragAdjustment(legacy, neutral, 0, -50).windowCenter).toBe(legacy.windowCenter);
+  });
+  it('compares recipes independently of JSON property ordering', () => {
+    const reordered = Object.fromEntries(Object.entries(neutral).reverse()) as unknown as Recipe;
+    expect(sameRecipe(neutral, reordered)).toBe(true);
+    expect(sameRecipe(neutral, { ...reordered, colorize: true })).toBe(false);
   });
 });

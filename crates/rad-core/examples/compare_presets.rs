@@ -22,28 +22,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bitewing.version = 2;
     bitewing.detail_mode = "radiograph".into();
     bitewing.local_contrast = 0.4;
-    bitewing.sharpen = 5.0;
+    bitewing.gamma = 0.22;
+    bitewing.sharpen = 6.0;
     bitewing.radius = 2.2;
     bitewing.threshold = 0.0015;
     bitewing.halo = 0.35;
-    let mut endo = bitewing.clone();
-    endo.gamma = (endo.gamma * 1.7).min(5.0);
-    endo.local_contrast = 0.3;
-    endo.sharpen = 3.5;
-    endo.radius = 2.0;
-    endo.threshold = 0.002;
-    endo.halo = 0.5;
+    let mut colorized = bitewing.clone();
+    colorized.colorize = true;
     let mut detail = bitewing.clone();
-    detail.gamma = (detail.gamma * 1.05).min(5.0);
     detail.local_contrast = 0.35;
-    detail.sharpen = 6.0;
+    detail.sharpen = 8.0;
     detail.radius = 2.5;
     detail.threshold = 0.001;
     let mut recipes = vec![
         ("neutral", neutral),
         ("legacy-bitewing", legacy),
         ("bitewing", bitewing),
-        ("endo", endo),
+        ("colorized", colorized),
         ("detail", detail),
     ];
     if args.len() == 4 {

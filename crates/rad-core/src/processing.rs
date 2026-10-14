@@ -21,6 +21,8 @@ pub struct Recipe {
     pub halo: f32,
     pub detail_mode: String,
     pub invert: bool,
+    #[serde(default)]
+    pub colorize: bool,
 }
 
 impl Recipe {
@@ -51,12 +53,16 @@ impl Recipe {
             halo: 0.7,
             detail_mode: "unsharp".into(),
             invert: false,
+            colorize: false,
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
         if !matches!(self.version, 1 | 2) {
             return Err("Unsupported processing recipe version".into());
+        }
+        if self.colorize && self.version != 2 {
+            return Err("Colorize requires a version 2 processing recipe".into());
         }
         if !self.window_center.is_finite()
             || !self.window_width.is_finite()
@@ -73,7 +79,7 @@ impl Recipe {
                 "sharpen",
                 self.sharpen,
                 0.0,
-                if self.version == 2 { 6.0 } else { 3.0 },
+                if self.version == 2 { 10.0 } else { 3.0 },
             ),
             ("radius", self.radius, 0.35, 12.0),
             ("threshold", self.threshold, 0.0, 0.25),
@@ -255,7 +261,9 @@ fn finish_render(source: &SourceImage, recipe: &Recipe, mut values: Vec<f32>) ->
         rendered.clipped_high += u32::from(y >= 1.0);
         let gray = quantize(y);
         rendered.histogram[gray as usize] += 1;
-        if let Some(colors) = &source.color {
+        if recipe.colorize {
+            rendered.rgba.extend(sampled_viridis(y).map(quantize));
+        } else if let Some(colors) = &source.color {
             let rgb = colors[i].map(|v| v / color_scale);
             let channels = recolor(rgb, y);
             rendered.rgba.extend(channels.map(quantize));
@@ -269,6 +277,30 @@ fn finish_render(source: &SourceImage, recipe: &Recipe, mut values: Vec<f32>) ->
 
 fn quantize(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Approximate sampled Viridis: linear RGB interpolation between nine fixed
+/// display-color stops. This remaps processed luminance only; it does not add
+/// image information, alter enhancement, or change luminance histogram counts.
+fn sampled_viridis(luminance: f32) -> [f32; 3] {
+    const STOPS: [[f32; 3]; 9] = [
+        [68.0, 1.0, 84.0],
+        [71.0, 44.0, 122.0],
+        [59.0, 81.0, 139.0],
+        [44.0, 113.0, 142.0],
+        [33.0, 144.0, 141.0],
+        [39.0, 173.0, 129.0],
+        [92.0, 200.0, 99.0],
+        [170.0, 220.0, 50.0],
+        [253.0, 231.0, 37.0],
+    ];
+    let position = luminance.clamp(0.0, 1.0) * 8.0;
+    let index = (position as usize).min(STOPS.len() - 2);
+    let fraction = position - index as f32;
+    std::array::from_fn(|channel| {
+        (STOPS[index][channel] + (STOPS[index + 1][channel] - STOPS[index][channel]) * fraction)
+            / 255.0
+    })
 }
 
 /// Adjust luminance and shrink chroma only as needed to remain within RGB gamut.
@@ -891,7 +923,7 @@ mod tests {
     #[test]
     fn radiograph_flat_fields_tiny_images_and_ramps_remain_finite() {
         let mut r = radiograph_recipe();
-        r.sharpen = 6.0;
+        r.sharpen = 10.0;
         r.local_contrast = 1.0;
         r.threshold = 0.0;
         for (w, h) in [(1, 1), (2, 3), (129, 65)] {
@@ -936,8 +968,9 @@ mod tests {
                             })
                             .collect();
                         for (local, strength, radius, threshold) in [
-                            (0.4, 5.0, 2.2, 0.0015), // revised Bitewing
-                            (0.35, 6.0, 2.5, 0.001), // revised Detail
+                            (0.4, 5.0, 2.2, 0.0015), // historical v0.2 Bitewing
+                            (0.35, 6.0, 2.5, 0.001), // historical v0.2 Detail
+                            (0.4, 10.0, 2.5, 0.001), // maximum sharpness stress
                         ] {
                             let mut recipe = radiograph_recipe();
                             recipe.local_contrast = local;
@@ -1035,8 +1068,10 @@ mod tests {
         r.halo = 0.8;
         let mut json = serde_json::to_value(&r).unwrap();
         json.as_object_mut().unwrap().remove("localContrast");
+        json.as_object_mut().unwrap().remove("colorize");
         let restored: Recipe = serde_json::from_value(json).unwrap();
         assert_eq!(restored.local_contrast, 0.0);
+        assert!(!restored.colorize);
         assert_eq!(
             process(&s, &restored).unwrap().rgba,
             process(&s, &r).unwrap().rgba
@@ -1103,6 +1138,141 @@ mod tests {
             );
         }
         assert_eq!(source.samples, original);
+    }
+
+    #[test]
+    fn sampled_viridis_endpoints_channels_and_luminance_order_are_stable() {
+        assert_eq!(sampled_viridis(0.0).map(quantize), [68, 1, 84]);
+        assert_eq!(sampled_viridis(1.0).map(quantize), [253, 231, 37]);
+        assert_eq!(sampled_viridis(0.5).map(quantize), [33, 144, 141]);
+        let luminance = |rgb: [f32; 3]| rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+        let mut previous = -1.0;
+        for i in 0..=4096 {
+            let rgb = sampled_viridis(i as f32 / 4096.0);
+            assert!(rgb.iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)));
+            let current = luminance(rgb);
+            assert!(current >= previous);
+            previous = current;
+        }
+        // Verify actual rounded colors for every 8-bit display-luminance value,
+        // not only the nine control points.
+        previous = -1.0;
+        for i in 0..=255 {
+            let rgb = sampled_viridis(i as f32 / 255.0)
+                .map(quantize)
+                .map(f32::from);
+            let current = luminance(rgb);
+            assert!(current >= previous);
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn colorize_is_final_only_preserves_histogram_source_and_cached_gray_output() {
+        let mut s = source(256, 1, (0..256).map(|v| v as f32).collect());
+        s.metadata.format = "PNG".into();
+        s.metadata.bits_stored = 8;
+        let source = Arc::new(s);
+        let original = source.samples.clone();
+        let mut recipe = Recipe::neutral(&source);
+        recipe.version = 2;
+        let mut session = ProcessingSession::new(source.clone());
+        let grayscale = session.process(&recipe).unwrap();
+        let allocation = session.prepared.as_ref().unwrap().1.as_ptr();
+        recipe.colorize = true;
+        let colorized = session.process(&recipe).unwrap();
+        assert_eq!(allocation, session.prepared.as_ref().unwrap().1.as_ptr());
+        assert_eq!(&colorized.rgba[..4], &[68, 1, 84, 255]);
+        assert_eq!(
+            &colorized.rgba[colorized.rgba.len() - 4..],
+            &[253, 231, 37, 255]
+        );
+        assert_ne!(colorized.rgba, grayscale.rgba);
+        assert_eq!(colorized.histogram, grayscale.histogram);
+        assert_eq!(
+            (colorized.clipped_low, colorized.clipped_high),
+            (grayscale.clipped_low, grayscale.clipped_high)
+        );
+        assert_eq!(colorized.rgba, process(&source, &recipe).unwrap().rgba);
+        recipe.colorize = false;
+        assert_eq!(grayscale.rgba, session.process(&recipe).unwrap().rgba);
+        assert_eq!(source.samples, original);
+        recipe.version = 1;
+        assert_eq!(grayscale.rgba, process(&source, &recipe).unwrap().rgba);
+        recipe.colorize = true;
+        assert!(process(&source, &recipe).unwrap_err().contains("version 2"));
+    }
+
+    #[test]
+    fn explicit_colorize_maps_original_color_by_processed_luminance() {
+        let colors = vec![
+            [255.0, 0.0, 0.0],
+            [25.0, 130.0, 210.0],
+            [255.0; 3],
+            [0.0; 3],
+        ];
+        let mut s = source(
+            4,
+            1,
+            colors
+                .iter()
+                .map(|p| p[0] * 0.2126 + p[1] * 0.7152 + p[2] * 0.0722)
+                .collect(),
+        );
+        s.metadata.bits_stored = 8;
+        s.metadata.format = "PNG".into();
+        s.color = Some(colors.clone());
+        let mut r = Recipe::neutral(&s);
+        r.version = 2;
+        let original_display = process(&s, &r).unwrap();
+        r.colorize = true;
+        let mapped = process(&s, &r).unwrap();
+        let mut monochrome = s.clone();
+        monochrome.color = None;
+        assert_eq!(mapped.rgba, process(&monochrome, &r).unwrap().rgba);
+        assert_ne!(mapped.rgba, original_display.rgba);
+        r.colorize = false;
+        assert_eq!(original_display.rgba, process(&s, &r).unwrap().rgba);
+        assert_eq!(s.color.unwrap(), colors);
+    }
+
+    #[test]
+    fn version_two_sharpness_six_through_ten_remains_finite_and_version_one_is_bounded() {
+        let (w, h) = (65, 33);
+        let samples: Vec<f32> = (0..w * h)
+            .map(|i| {
+                (if i % w < 32 { 0.2 } else { 0.8 }) + ((i * 37 % 29) as f32 / 28.0 - 0.5) * 0.005
+            })
+            .collect();
+        let s = source(w as u32, h as u32, samples.clone());
+        let mut r = radiograph_recipe();
+        for strength in [6.0, 8.0, 10.0] {
+            r.sharpen = strength;
+            assert!(r.validate().is_ok());
+            for halo in [0.0, 0.35, 0.8, 1.0] {
+                r.halo = halo;
+                let floating =
+                    radiograph_bands(&radiograph_bands(&samples, w, h, &r, true), w, h, &r, false);
+                assert!(floating
+                    .iter()
+                    .all(|v| v.is_finite() && (-0.5..=1.5).contains(v)));
+                for gamma in [0.1, 0.22, 0.9, 1.0] {
+                    r.gamma = gamma;
+                    assert_eq!(
+                        process(&s, &r).unwrap().histogram.iter().sum::<u32>(),
+                        (w * h) as u32
+                    );
+                }
+            }
+        }
+        r.sharpen = 10.01;
+        assert!(r.validate().is_err());
+        r.version = 1;
+        r.detail_mode = "unsharp".into();
+        r.sharpen = 3.0;
+        assert!(r.validate().is_ok());
+        r.sharpen = 3.01;
+        assert!(r.validate().is_err());
     }
 
     #[test]

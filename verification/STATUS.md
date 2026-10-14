@@ -2,6 +2,17 @@
 
 Phase A comparison prototype, 2026-10-13 (America/Toronto).
 
+## 0.3.0 interaction revision
+
+The user's latest request supersedes the earlier comparison UI and defaults: one enhanced image, gamma 0.1–0.9/default 0.22, sharpness 5–10/default 6, relative Tone/Contrast, left-drag tone/gamma adjustment, a linear monochrome histogram and Colorize in place of Neutral/Endo. All imports and Reset use these defaults, including panorama and ordinary images. Source-aware window suggestions still apply only to eligible intraoral sources.
+
+- **43 Rust tests pass**, with two manual benchmarks ignored. Strict Clippy and rustfmt checks pass. New tests verify sampled Viridis ordering/endpoints, pre-color histogram/clipping equality, source/RGB immutability, cached/direct equality, old recipe loading and sharpness 10 stability.
+- R4 full-resolution current-default grayscale and Colorize outputs were generated and visually inspected. The P2 panorama rendered successfully with both mappings. One CPU-only run measured approximately 506 ms for R4 default and 1,560 ms for P2 default, excluding PNG encoding/IPC/display; these are functional observations, not latency guarantees.
+- All four source SHA-256 values still match the original independent pixel-fidelity report. Patient renderings remain in ignored `local-verification/v030/`.
+- **23 frontend tests and the production frontend build pass.** Coverage includes exact defaults/ranges, a single enhanced viewport, relative tone/polarity, independent drag axes, no-op clicks, one-step undo/cancellation, Shift/middle panning, slow-render progress/coalescing, switching/closing during rendering, per-image Reset, legacy values, Colorize and linear histogram data. Historical 0.2.0 appearance-comparison scores below do not describe the new gamma 0.22 default.
+- Built and launched the final Windows executable and `RAD Viewer_0.3.0_x64-setup.exe`. All four samples opened progressively. R4 displayed one enhanced viewport, gamma 0.22, sharpness 6, relative Tone/Contrast and the monochrome histogram. Dragging 60 CSS pixels right and 40 up produced tone 30/gamma 0.32; one Undo restored both and left no earlier history. Colorize displayed the matching legend while clipping stayed at 9.22% black/0.09% white. The displayed R4 processing times were 503 ms initially, 472 ms after the drag and 526 ms for Colorize, including PNG; these are observations, not controlled latency measurements.
+- Native Colorize export contained **1200 × 900 RGBA pixels, all byte-identical to the full-resolution core pipeline output**. The test export and machine-readable comparison are retained under ignored `local-verification/v030/`. The rebuilt app is left available for the user's review. A separate clean-PC installation and image-quality acceptance are still pending.
+
 ## 0.2.0 image-quality revision
 
 - User supplied a Carestream/app comparison, accepted the interface, and rejected the original image detail. Both captures match R4. Investigation identified neutral linear mapping of a high-depth `FOR PROCESSING` image as the main tone mismatch, compounded by weak detail presets. See `IMAGE_QUALITY_REVIEW.md` for evidence and primary sources.
@@ -31,7 +42,7 @@ Phase A comparison prototype, 2026-10-13 (America/Toronto).
 
 ## Required review gate
 
-One Carestream/app screenshot pair has been supplied; the user rejected the earlier prototype's quality. Version 0.2.0 is a new comparison candidate, not an accepted result. Exact Carestream preset/Sharpness settings and a full-resolution corresponding export remain unrecorded. Matched crops, orientation and pixel scale must be checked; automatic registration is not implemented. Additional bitewings beyond the supplied tuning samples are still required for representative review.
+One Carestream/app screenshot pair has been supplied; the user rejected the earlier prototype's quality and then requested the current control/default changes. The current revision remains a review candidate, not an accepted result. Exact Carestream preset/Sharpness settings and a full-resolution corresponding export remain unrecorded. Matched crops, orientation and pixel scale must be checked; automatic registration is not implemented. Additional bitewings beyond the supplied tuning samples are still required for representative review.
 
 The experimental presets are starting points. Pixel fidelity, automated tests and developer visual inspection do not establish diagnostic superiority or satisfy the user's image-quality acceptance requirement.
 
@@ -46,7 +57,7 @@ Per `IMPLEMENTATION.md`, mounting templates/free arrangement, rotation/flips, im
 - Display and PNG export are RGBA8 after floating-point processing; source precision is retained internally.
 - Supported DICOM is single-frame integer MONOCHROME1/2, 8/16-bit containers, standard LINEAR VOI and rescale mapping. Other LUT/presentation/functional-group cases are rejected clearly. See `DECODING.md`.
 - PNG/JPEG ICC color management and monitor grayscale calibration are not implemented. A reference must be checked against Carestream on the review display.
-- Two bounded background workers, debounced full-resolution rendering, stale-result rejection, pinned neutral and recent rendered-image caches. There is no reduced-resolution preview; the last completed render remains visibly marked while processing.
+- Two bounded background workers and coalesced full-resolution rendering. One interactive render runs at a time; newer changes replace pending work. Completions can update the same image during a gesture but are marked as processing until the latest recipe completes. There is no reduced-resolution preview. Recent rendered images are cached.
 - Final renders and the floating-point pre-detail stage are cached. Upstream tone/noise/CLAHE changes invalidate the intermediate cache. Retention is capped at 32 MiB per source; larger sources are processed without that cache.
 - The prototype has a 24-open-image resource limit; this is not verification of the later 20-image mounting workflow.
 - The development release is unsigned.

@@ -1,6 +1,21 @@
 # Versioned radiograph processing
 
-## Version 2 image-quality revision
+## 0.3.0 controls and false color
+
+The default gamma is 0.22 and sharpness 6 for all imports and Reset. UI gamma ranges from 0.1 to 0.9 and sharpness from 5 to 10. The engine still accepts gamma through 5 and spatial strength zero for old saved recipes and its neutral baseline; version 1 sharpness remains limited to 3. New defaults use version 2 recipes. No source samples change.
+
+The viewer displays only the enhanced image. Tone is a relative offset of the starting window center, bounded to one quarter of the starting width in either direction. Contrast changes width by a factor of two over each half of its relative scale. Direction is corrected for MONOCHROME1. Left-drag adjusts tone horizontally and gamma vertically; Shift-drag or middle-drag pans. Every gesture records one history step. A linear-count monochrome histogram shows the processed intensity distribution.
+
+`colorize` is optional when reading recipes and defaults to false. When enabled, the final display stage maps processed floating-point luminance to nine fixed sampled Viridis stops, with linear interpolation in display RGB. It is a deterministic false-color lookup, not reconstruction of natural color or new detail. Ordered sequential maps suit ordered intensity values; see [Matplotlib's colormap guidance](https://matplotlib.org/stable/users/explain/colors/colormaps.html). This nine-stop approximation is not a claim of exact perceptual uniformity. Inversion precedes the lookup; histogram and saturation counts precede colorization and remain identical on toggle. PNG exports share this exact pipeline. Explicit colorization of an RGB source maps its processed luminance; turning it off restores the normal hue-preserving path.
+
+| Preset | Gamma | Local contrast | Fine strength | Radius px | Threshold | Halo |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Bitewing / Reset | 0.22 | 0.40 | 6.0 | 2.2 | 0.0015 | 0.35 |
+| Detail | 0.22 | 0.35 | 8.0 | 2.5 | 0.0010 | 0.35 |
+
+Colorize toggles the current recipe without replacing its tone or detail. Neutral and Endo buttons were removed at the user's request. The rules here supersede earlier UI defaults below; the numerical processing algorithms are unchanged except for the higher version 2 sharpness ceiling and optional final lookup.
+
+## Version 2 image-quality revision (0.2.0 history)
 
 The 0.2.0 prototype adds source-aware tone suggestions and a `radiograph` detail mode. Version 1 algorithms remain unchanged for saved recipes. `localContrast` defaults to zero when older JSON is read. Neutral remains version 1 with all spatial filters off.
 
@@ -20,7 +35,7 @@ For images without a source-aware suggestion, explicitly choosing these presets 
 
 Tone statistics and processing run on background workers. The prepared-stage cache keys version and local contrast as well as earlier controls; when broad contrast is active, threshold and halo also participate. Preview and export share deterministic processing.
 
-See [image-quality research and comparison](verification/IMAGE_QUALITY_REVIEW.md) for primary sources, rationale and limits. Reproduce current preset outputs with `cargo run --release --locked -p rad-core --example compare_presets -- INPUT local-verification/OUTPUT`. The optional third argument is a recipe JSON, producing only a candidate render. Outputs are private clinical material and must stay out of Git.
+See [image-quality research and comparison](verification/IMAGE_QUALITY_REVIEW.md) for primary sources, rationale and limits. Reproduce the latest preset outputs with `cargo run --release --locked -p rad-core --example compare_presets -- INPUT local-verification/OUTPUT`. The optional third argument is a recipe JSON, producing only a candidate render. Outputs are private clinical material and must stay out of Git.
 
 Version 2 R1, 12 sharpness changes after warm-up: **208.59 ms cached median**, **779.66 ms uncached median**, byte-identical outputs. Reproduce with `cargo run --release --locked -p rad-core --example cache_benchmark -- "Sample RAD Files/R1.rvg" --v2`. Without `--v2` it retains the historical v1 workload. These are CPU-only measurements. Native R4 automatic Bitewing reported 603 ms including PNG while other samples imported. Busy concurrent-build runs exceeded one second on intraoral images, so sub-second end-to-end interaction is not guaranteed.
 

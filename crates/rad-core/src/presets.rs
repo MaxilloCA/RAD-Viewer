@@ -77,7 +77,7 @@ pub fn suggested_recipe(source: &SourceImage) -> Recipe {
     recipe.window_width = window;
     // Pipeline gamma uses exponent 1/gamma. This convex curve expands the bright
     // anatomical range while darkening the air/shadow range; no spatial filter.
-    recipe.gamma = 0.38;
+    recipe.gamma = 0.22;
     recipe
 }
 
@@ -120,7 +120,7 @@ mod tests {
         let before = s.samples.clone();
         let r = suggested_recipe(&s);
         assert_eq!(r.version, 2);
-        assert_eq!(r.gamma, 0.38);
+        assert_eq!(r.gamma, 0.22);
         assert!((r.window_center - 1531.125).abs() < 0.01);
         assert!((r.window_width - 1022.25).abs() < 0.01);
         assert_eq!(r.sharpen, 0.0);

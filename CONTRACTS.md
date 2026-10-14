@@ -1,6 +1,14 @@
 # Phase A integration contract
 
-## 0.2.0 contract extension
+## 0.3.0 controls and display contract
+
+This section supersedes older UI descriptions. One enhanced viewport replaces original/adjusted/reference panes. All imports and Reset use version 2 Bitewing with gamma 0.22, sharpness 6 and the suggested window (neutral window when no source-aware suggestion applies). Neutral remains an internal immutable-source baseline. There is no original/bypass control, Neutral preset button, Endo button or reference loading UI.
+
+`Recipe.colorize: bool` / `colorize: boolean` defaults to false for older serialized recipes. Colorize requires version 2; the UI upgrades explicitly when toggled. It is part of full recipe equality for the final PNG cache but is absent from the upstream floating-stage cache key because only the display stage uses it. Histogram/clipping remain pre-colorization intensity values. Exports and display share the final lookup. Version 2 sharpness validates through 10; version 1 retains its previous maximum 3 and gamma validation remains 0.1–5 for legacy compatibility.
+
+UI gamma bounds are 0.1–0.9, sharpness 5–10. Stored presets outside these ranges retain their exact recipe until edited and are labeled accordingly. Tone/Contrast expose relative -100…100 scales against each image's initial window. Horizontal left-drag changes tone and vertical left-drag gamma; Shift-left/middle drag pans. Pointer release/cancellation ends one history transaction. During changes, bounded/coalesced full-resolution rendering retains the last completed image with a processing indication. Switching/closing images cannot attach an old response to another source. The histogram uses linear counts and monochrome fill, with a black-to-white intensity strip. Colorize shows an intensity legend.
+
+## 0.2.0 contract extension (historical UI)
 
 `Recipe` now includes `local_contrast: f32` / `localContrast: number`, defaulting to zero when reading old JSON. Version 1 rendering is preserved. Version 2 adds `detail_mode: "radiograph"`, strength up to six and independent local contrast. A deliberate choice of a new control upgrades the selected recipe to version 2; loading a saved version 1 preset does not.
 
