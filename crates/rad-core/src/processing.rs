@@ -2,6 +2,7 @@
 //! Source samples stay immutable; quantization occurs only at the final RGBA conversion.
 use crate::SourceImage;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -90,7 +91,52 @@ pub struct RenderedImage {
     pub clipped_high: u32,
 }
 
+/// One immutable source and one bounded, floating-point pre-detail stage.
+/// Keeping the source inside the session prevents reusing another image's cache.
+pub struct ProcessingSession {
+    source: Arc<SourceImage>,
+    prepared: Option<([u32; 5], Vec<f32>)>,
+}
+
+impl ProcessingSession {
+    pub fn new(source: Arc<SourceImage>) -> Self {
+        Self {
+            source,
+            prepared: None,
+        }
+    }
+
+    pub fn process(&mut self, recipe: &Recipe) -> Result<RenderedImage, String> {
+        validate_source(&self.source, recipe)?;
+        let key = [
+            recipe.window_center,
+            recipe.window_width,
+            recipe.gamma,
+            recipe.denoise,
+            recipe.clahe,
+        ]
+        .map(f32::to_bits);
+        let values =
+            if let Some((_, values)) = self.prepared.as_ref().filter(|(old, _)| *old == key) {
+                values.clone()
+            } else {
+                let values = prepare(&self.source, recipe)?;
+                // At most 32 MiB per open source (768 MiB for the desktop's 24-image
+                // cap). Larger sources still work, using the uncached pipeline.
+                self.prepared = (values.len() <= 8 * 1024 * 1024).then(|| (key, values.clone()));
+                values
+            };
+        Ok(finish_render(&self.source, recipe, values))
+    }
+}
+
 pub fn process(source: &SourceImage, recipe: &Recipe) -> Result<RenderedImage, String> {
+    validate_source(source, recipe)?;
+    let values = prepare(source, recipe)?;
+    Ok(finish_render(source, recipe, values))
+}
+
+fn validate_source(source: &SourceImage, recipe: &Recipe) -> Result<(), String> {
     recipe.validate()?;
     let (w, h) = (source.width as usize, source.height as usize);
     let n = w
@@ -107,6 +153,12 @@ pub fn process(source: &SourceImage, recipe: &Recipe) -> Result<RenderedImage, S
     {
         return Err("Non-finite source samples or modality transform".into());
     }
+    Ok(())
+}
+
+fn prepare(source: &SourceImage, recipe: &Recipe) -> Result<Vec<f32>, String> {
+    let (w, h) = (source.width as usize, source.height as usize);
+    let m = &source.metadata;
     // Normalize modality values into window-relative units before filtering. This
     // is an affine coordinate change, not display clipping; precision is retained.
     let scale = (recipe.window_width - 1.0).max(1.0);
@@ -147,6 +199,13 @@ pub fn process(source: &SourceImage, recipe: &Recipe) -> Result<RenderedImage, S
     if recipe.clahe > 0.0 {
         values = clahe(&values, w, h, recipe.clahe);
     }
+    Ok(values)
+}
+
+fn finish_render(source: &SourceImage, recipe: &Recipe, mut values: Vec<f32>) -> RenderedImage {
+    let (w, h) = (source.width as usize, source.height as usize);
+    let n = w * h;
+    let m = &source.metadata;
     if recipe.sharpen > 0.0 {
         values = detail(&values, w, h, recipe);
     }
@@ -177,7 +236,7 @@ pub fn process(source: &SourceImage, recipe: &Recipe) -> Result<RenderedImage, S
         }
         rendered.rgba.push(255);
     }
-    Ok(rendered)
+    rendered
 }
 
 fn quantize(v: f32) -> u8 {
@@ -465,6 +524,76 @@ mod tests {
     }
     fn grays(r: &RenderedImage) -> Vec<u8> {
         r.rgba.as_chunks::<4>().0.iter().map(|p| p[0]).collect()
+    }
+
+    #[test]
+    fn cached_preview_matches_uncached_export_across_all_adjustments() {
+        let s = Arc::new(source(
+            63,
+            35,
+            (0..63 * 35).map(|i| ((i * 173) % 4096) as f32).collect(),
+        ));
+        let original = s.samples.clone();
+        let mut session = ProcessingSession::new(s.clone());
+        let mut recipe = Recipe::neutral(&s);
+        let mut recipes = vec![recipe.clone()];
+        recipe.denoise = 0.3;
+        recipes.push(recipe.clone());
+        recipe.gamma = 0.9;
+        recipes.push(recipe.clone());
+        recipe.clahe = 0.4;
+        recipes.push(recipe.clone());
+        recipe.window_center += 80.0;
+        recipes.push(recipe.clone());
+        recipe.window_width *= 0.8;
+        recipes.push(recipe.clone());
+        recipe.sharpen = 1.2;
+        recipes.push(recipe.clone());
+        recipe.radius = 3.2;
+        recipes.push(recipe.clone());
+        recipe.threshold = 0.06;
+        recipes.push(recipe.clone());
+        recipe.halo = 1.0;
+        recipes.push(recipe.clone());
+        recipe.detail_mode = "multiscale".into();
+        recipes.push(recipe.clone());
+        recipe.invert = true;
+        recipes.push(recipe.clone());
+        // Undo and reset must invalidate earlier-stage changes as well.
+        recipes.extend(recipes.clone().into_iter().rev());
+        for r in recipes {
+            let cached = session.process(&r).unwrap();
+            let direct = process(&s, &r).unwrap();
+            assert_eq!(cached.rgba, direct.rgba);
+            assert_eq!(cached.histogram, direct.histogram);
+            assert_eq!(
+                (cached.clipped_low, cached.clipped_high),
+                (direct.clipped_low, direct.clipped_high)
+            );
+        }
+        assert_eq!(s.samples, original);
+    }
+
+    #[test]
+    fn cache_reuses_tone_stage_for_detail_and_never_crosses_sources() {
+        let a = Arc::new(source(4, 1, vec![0.0, 512.0, 2048.0, 4095.0]));
+        let b = Arc::new(source(4, 1, vec![4095.0, 2048.0, 512.0, 0.0]));
+        let mut first = ProcessingSession::new(a.clone());
+        let mut second = ProcessingSession::new(b.clone());
+        let mut recipe = Recipe::neutral(&a);
+        first.process(&recipe).unwrap();
+        let cached_allocation = first.prepared.as_ref().unwrap().1.as_ptr();
+        recipe.sharpen = 0.8;
+        let one = first.process(&recipe).unwrap();
+        assert_eq!(
+            cached_allocation,
+            first.prepared.as_ref().unwrap().1.as_ptr()
+        );
+        let two = second.process(&recipe).unwrap();
+        assert_ne!(one.rgba, two.rgba);
+        assert_eq!(two.rgba, process(&b, &recipe).unwrap().rgba);
+        recipe.version = 2;
+        assert!(first.process(&recipe).is_err());
     }
 
     #[test]

@@ -15,6 +15,7 @@ Phase A comparison prototype, 2026-10-13 (America/Toronto).
 - Native 100% inspection and dragging kept both panes synchronized. Selecting P2 returned to fit with neutral gamma and zero spatial enhancement. This is functional observation, not a frame-rate measurement.
 - Native PNG export of neutral P2 produced 2861 × 1316 RGBA pixels. All RGB samples exactly matched an independent NumPy mapping of pydicom's raw pixels (`round(clamp(raw / 4095) × 255)`); all alpha samples were 255. The generated image stays in ignored `local-verification/`.
 - Windows NSIS installer built successfully. Installation on a separate clean Windows PC remains untested.
+- Intermediate cache follow-up: 25 Rust tests pass (plus the nine unchanged frontend tests), including byte-identical cached/direct rendering across all adjustments and rejecting a request superseded while waiting for its source cache. Strict Clippy passes. A 12-change R1 sharpness workload measured 94.62 ms cached versus 139.13 ms uncached median; output bytes matched exactly. See `PROCESSING.md`.
 
 ## Required review gate
 
@@ -34,6 +35,6 @@ Per `IMPLEMENTATION.md`, mounting templates/free arrangement, rotation/flips, im
 - Supported DICOM is single-frame integer MONOCHROME1/2, 8/16-bit containers, standard LINEAR VOI and rescale mapping. Other LUT/presentation/functional-group cases are rejected clearly. See `DECODING.md`.
 - PNG/JPEG ICC color management and monitor grayscale calibration are not implemented. A reference must be checked against Carestream on the review display.
 - Two bounded background workers, debounced full-resolution rendering, stale-result rejection, pinned neutral and recent rendered-image caches. There is no reduced-resolution preview; the last completed render remains visibly marked while processing.
-- Final renders are cached; individual intermediate filter stages are not yet cached. Measured full-resolution pipeline times are below one second on this PC.
+- Final renders and the floating-point pre-detail stage are cached. Upstream tone/noise/CLAHE changes invalidate the intermediate cache. Retention is capped at 32 MiB per source; larger sources are processed without that cache.
 - The prototype has a 24-open-image resource limit; this is not verification of the later 20-image mounting workflow.
 - The development release is unsigned.

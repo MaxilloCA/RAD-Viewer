@@ -42,4 +42,12 @@ Release build, five independent full-resolution renders after one warm-up, measu
 
 R1 with every optional stage active (denoise 0.35, gamma 0.94, CLAHE 0.3, multiscale detail 0.7, radius 2, threshold 0.01, halo 0.7) measured **248.43 ms**, range **243.52–275.53 ms**. All measured CPU processing runs were below one second. Neutral remains the default for the panoramic image; non-neutral panoramic results above are timing exercises, not endorsed panoramic settings.
 
-The numerical processing suite passed **11 tests**, with the two manual benchmark tests excluded from routine runs. No source images or rendered sample pixels are included in this document or version control.
+The numerical processing suite passed **13 tests**, with the two manual benchmark tests excluded from routine runs. No source images or rendered sample pixels are included in this document or version control.
+
+### Intermediate reuse during adjustments
+
+Each desktop image owns a `ProcessingSession` bound to its immutable source. It retains one floating-point result through modality mapping, denoise, window/gamma and CLAHE, keyed by all five upstream controls. Sharpness strength, radius, threshold, halo, detail method and inversion reuse this result. Tone changes invalidate it. Retained intermediate data is capped at 32 MiB per image; larger images use uncached processing. Closing an image releases its cache after in-flight work finishes.
+
+The per-image cache lock is asynchronous and acquired before the global worker permit. The renderer checks request freshness after both waits, avoiding work superseded while waiting for an earlier render. Regression tests verify this scheduling behavior and byte-identical cached/direct outputs across every control, undo-like reverse sequences, reset and separate sources. Export continues to use the uncached full-resolution pipeline.
+
+`cargo run --release --locked -p rad-core --example cache_benchmark -- "Sample RAD Files/R1.rvg"` exercises 12 distinct sharpness changes after warming both paths. On this PC, cached processing had a **94.62 ms median**, versus **139.13 ms** uncached in the same run; every output byte matched. These timings exclude PNG/IPC/display and do not replace end-to-end latency measurements.

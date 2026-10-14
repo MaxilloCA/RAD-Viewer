@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use image::ImageEncoder;
+use rad_core::processing::ProcessingSession;
 use rad_core::{decode, process, ImageMetadata, Recipe, SourceImage};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -14,6 +15,7 @@ use tokio::sync::Semaphore;
 
 struct Entry {
     source: Arc<SourceImage>,
+    processor: Arc<tokio::sync::Mutex<ProcessingSession>>,
     latest: u64,
 }
 #[derive(Clone)]
@@ -153,10 +155,15 @@ async fn import_image(path: String, state: State<'_, AppState>) -> Result<ImageI
     if images.len() >= 24 {
         return Err("Close an image before opening more (24 image limit).".into());
     }
+    let source = Arc::new(source);
+    let processor = Arc::new(tokio::sync::Mutex::new(ProcessingSession::new(
+        source.clone(),
+    )));
     images.insert(
         id,
         Entry {
-            source: Arc::new(source),
+            source,
+            processor,
             latest: 0,
         },
     );
@@ -169,14 +176,14 @@ async fn render_image(
     request_id: u64,
     state: State<'_, AppState>,
 ) -> Result<RenderInfo, String> {
-    let source = {
+    let (source, processor) = {
         let mut images = state.images.lock().unwrap();
         let entry = images.get_mut(&id).ok_or("Image is closed")?;
         if request_id < entry.latest {
             return Err("Superseded render".into());
         }
         entry.latest = request_id;
-        entry.source.clone()
+        (entry.source.clone(), entry.processor.clone())
     };
     let recipe_key = serde_json::to_string(&recipe).map_err(|e| e.to_string())?;
     let key = format!("{id}:{recipe_key}");
@@ -185,20 +192,12 @@ async fn render_image(
         info.request_id = request_id;
         return Ok(info);
     }
-    let permit = state
-        .workers
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|e| e.to_string())?;
-    if state.images.lock().unwrap().get(&id).map(|e| e.latest) != Some(request_id) {
-        return Err("Superseded render".into());
-    }
+    let (mut processor, permit) = processing_slot(&state, &id, request_id, processor).await?;
     let neutral = serde_json::to_string(&Recipe::neutral(&source)).unwrap() == recipe_key;
     let (bytes, render, elapsed) = tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
         let start = Instant::now();
-        let render = process(&source, &recipe)?;
+        let render = processor.process(&recipe)?;
         let bytes = png(&render)?;
         Ok::<_, String>((bytes, render, start.elapsed().as_secs_f64() * 1000.0))
     })
@@ -240,6 +239,33 @@ async fn render_image(
         },
     );
     Ok(info)
+}
+
+async fn processing_slot(
+    state: &AppState,
+    id: &str,
+    request_id: u64,
+    processor: Arc<tokio::sync::Mutex<ProcessingSession>>,
+) -> Result<
+    (
+        tokio::sync::OwnedMutexGuard<ProcessingSession>,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+    String,
+> {
+    // Waiting on one source must not occupy another source's worker slot.
+    let processor = processor.lock_owned().await;
+    let permit = state
+        .workers
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| e.to_string())?;
+    // Includes requests superseded during either wait, and closed images.
+    if state.images.lock().unwrap().get(id).map(|e| e.latest) != Some(request_id) {
+        return Err("Superseded render".into());
+    }
+    Ok((processor, permit))
 }
 #[tauri::command]
 fn release_image(id: String, state: State<'_, AppState>) {
@@ -420,6 +446,40 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn superseded_cache_waiter_does_not_process_or_occupy_worker() {
+        use std::{future::Future, task::Poll};
+        tauri::async_runtime::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("synthetic.png");
+            image::GrayImage::from_raw(2, 1, vec![0, 255])
+                .unwrap()
+                .save(&path)
+                .unwrap();
+            let source = Arc::new(decode(&path).unwrap());
+            let processor = Arc::new(tokio::sync::Mutex::new(ProcessingSession::new(
+                source.clone(),
+            )));
+            let state = AppState::default();
+            state.images.lock().unwrap().insert(
+                "test".into(),
+                Entry {
+                    source,
+                    processor: processor.clone(),
+                    latest: 1,
+                },
+            );
+            let held = processor.clone().lock_owned().await;
+            let mut waiting = std::pin::pin!(processing_slot(&state, "test", 1, processor));
+            let polled = std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx))).await;
+            assert!(polled.is_pending());
+            assert_eq!(state.workers.available_permits(), 2);
+            state.images.lock().unwrap().get_mut("test").unwrap().latest = 2;
+            drop(held);
+            assert!(matches!(waiting.await, Err(e) if e == "Superseded render"));
+            assert_eq!(state.workers.available_permits(), 2);
+        });
+    }
     #[test]
     fn atomic_save_replaces_complete_document_and_leaves_no_temp() {
         let directory = tempfile::tempdir().unwrap();
