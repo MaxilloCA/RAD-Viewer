@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ImageInfo, PatientDiscovery, Recipe, RenderInfo } from './model';
 
@@ -29,6 +29,7 @@ beforeEach(() => {
     if (command === 'choose_images') return Promise.resolve(openPaths);
     if (command === 'import_image') return Promise.resolve(info(String(args.path)));
     if (command === 'render_image') return Promise.resolve(result(String(args.id), Number(args.requestId)));
+    if (command === 'render_snapshot') return Promise.resolve({ ...result(String(args.id), Number(args.requestId)), url: `data:image/png;base64,${args.id}-${args.requestId}` });
     if (command === 'image_thumbnail') return Promise.resolve('data:image/png;base64,dGVzdA==');
     return Promise.resolve(null);
   });
@@ -308,11 +309,11 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     openPaths = ['first.rvg', 'second.rvg'];
     customInvoke = (command, args) => command === 'import_image' && args.path === 'first.rvg' ? Promise.resolve({ ...info('first.rvg'), metadata: { ...info('first.rvg').metadata, imageDate: '2026-04-08', dateSource: 'ContentDate' } }) : undefined;
     render(<App />); await open(); await readyThumbnail('02 second.rvg');
-    expect(screen.getAllByText('08-Apr-2026')).toHaveLength(2);
-    expect(screen.getAllByTitle('Image content date')).toHaveLength(2);
+    expect(screen.getAllByText('08-Apr-2026')).toHaveLength(3);
+    expect(screen.getAllByTitle('Image content date')).toHaveLength(3);
     expect(screen.getByRole('button', { name: '02 second.rvg' }).querySelector('time')?.textContent).toBe('Date unavailable');
     fireEvent.click(screen.getByRole('button', { name: '02 second.rvg' }));
-    expect(screen.getAllByText('Date unavailable')).toHaveLength(2);
+    expect(screen.getAllByText('Date unavailable')).toHaveLength(3);
     fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
     expect(screen.getByLabelText('Local contrast color legend').textContent).toContain('Darker than nearbyLighter than nearby');
   });
@@ -379,5 +380,151 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     render(<App />); await open(); fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_review', expect.objectContaining({ review: expect.objectContaining({ images: [expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, gamma: .22, sharpen: 6 }) })] }) })));
+  });
+});
+
+const pane = (name: string) => screen.getByRole('region', { name: `Image: ${name}` });
+const paneNames = () => screen.getAllByRole('region', { name: /^Image:/ }).map(element => element.getAttribute('aria-label'));
+const pin = async (name: string) => {
+  fireEvent.click(screen.getByRole('button', { name: `Pin image ${name}` }));
+  await screen.findByRole('button', { name: `Unpin image ${name}` });
+};
+const selectThumbnail = (index: number, name: string) => fireEvent.click(screen.getByRole('button', { name: `${String(index).padStart(2, '0')} ${name}` }));
+
+describe('pinned panes', () => {
+  it('keeps pins while replacing one working pane and never duplicates a selected pin', async () => {
+    openPaths = ['first.rvg', 'second.rvg', 'third.rvg']; render(<App />); await open(); await readyThumbnail('03 third.rvg');
+    await pin('first.rvg'); selectThumbnail(2, 'second.rvg');
+    expect(paneNames()).toEqual(['Image: first.rvg', 'Image: second.rvg']);
+    selectThumbnail(3, 'third.rvg');
+    expect(paneNames()).toEqual(['Image: first.rvg', 'Image: third.rvg']);
+    fireEvent.click(screen.getByRole('button', { name: 'Select image first.rvg' }));
+    expect(paneNames()).toEqual(['Image: first.rvg']);
+    expect(pane('first.rvg').getAttribute('data-selected')).toBe('true');
+  });
+  it('keeps existing panes in pin order when earlier strip images are pinned later', async () => {
+    openPaths = ['first.rvg', 'second.rvg', 'third.rvg']; render(<App />); await open(); await readyThumbnail('03 third.rvg');
+    selectThumbnail(3, 'third.rvg'); await pin('third.rvg');
+    selectThumbnail(1, 'first.rvg');
+    expect(paneNames()).toEqual(['Image: third.rvg', 'Image: first.rvg']);
+    await pin('first.rvg');
+    expect(paneNames()).toEqual(['Image: third.rvg', 'Image: first.rvg']);
+    selectThumbnail(2, 'second.rvg'); await pin('second.rvg');
+    expect(paneNames()).toEqual(['Image: third.rvg', 'Image: first.rvg', 'Image: second.rvg']);
+    fireEvent.click(screen.getByRole('button', { name: 'Select image third.rvg' }));
+    expect(paneNames()).toEqual(['Image: third.rvg', 'Image: first.rvg', 'Image: second.rvg']);
+  });
+  it('fits three, four, and five panes, preserving zoom when only activation changes', async () => {
+    openPaths = ['first.rvg', 'second.rvg', 'third.rvg', 'fourth.rvg', 'fifth.rvg'];
+    render(<App />); await open(); await readyThumbnail('05 fifth.rvg');
+    await pin('first.rvg');
+    for (let index = 1; index < openPaths.length; index++) {
+      selectThumbnail(index + 1, openPaths[index]); await pin(openPaths[index]);
+      expect(paneNames()).toHaveLength(index + 1);
+    }
+    expect(screen.getByLabelText('Image panes').getAttribute('style')).toContain('repeat(3, minmax(0, 1fr))');
+    fireEvent.click(screen.getByRole('button', { name: '100%' }));
+    expect(screen.getByAltText('Enhanced: fifth.rvg').getAttribute('style')).toContain('scale(1)');
+    fireEvent.click(screen.getByRole('button', { name: 'Select image first.rvg' }));
+    expect(screen.getByAltText('Enhanced: fifth.rvg').getAttribute('style')).toContain('scale(1)');
+    fireEvent.click(screen.getByRole('button', { name: 'Unpin image fourth.rvg' }));
+    expect(paneNames()).toHaveLength(4);
+    expect(screen.getByLabelText('Image panes').getAttribute('style')).toContain('repeat(2, minmax(0, 1fr))');
+    expect(screen.getByAltText('Enhanced: fifth.rvg').getAttribute('style')).not.toContain('scale(1)');
+  });
+  it('unpins inactive panes immediately, keeps the active working pane, and closes pins', async () => {
+    openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg');
+    await pin('first.rvg'); selectThumbnail(2, 'second.rvg'); await pin('second.rvg');
+    fireEvent.click(screen.getByRole('button', { name: 'Unpin image first.rvg' }));
+    expect(paneNames()).toEqual(['Image: second.rvg']);
+    fireEvent.click(screen.getByRole('button', { name: 'Unpin image second.rvg' }));
+    expect(paneNames()).toEqual(['Image: second.rvg']);
+    await pin('second.rvg');
+    fireEvent.click(screen.getByRole('button', { name: 'Close selected' }));
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Image: second.rvg' })).toBeNull());
+    expect(screen.queryByRole('button', { name: 'Unpin image second.rvg' })).toBeNull();
+  });
+  it('activates passive panes without changing either recipe and isolates rotation/adjustments', async () => {
+    openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg');
+    await pin('first.rvg'); selectThumbnail(2, 'second.rvg'); await pin('second.rvg'); setSlider('Gamma', .5);
+    const firstViewport = within(pane('first.rvg')).getByTestId('image-viewport');
+    fireEvent.pointerDown(firstViewport, { button: 0, clientX: 100, clientY: 100, pointerId: 1 });
+    fireEvent.pointerMove(firstViewport, { clientX: 200, clientY: 20, pointerId: 1 });
+    fireEvent.pointerUp(firstViewport, { pointerId: 1 });
+    expect(slider('Gamma').value).toBe('0.22');
+    expect((screen.getByRole('button', { name: '↶ Undo' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Rotate 90 degrees clockwise' }));
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).toContain('rotate(90deg)');
+    expect(screen.getByAltText('Enhanced: second.rvg').getAttribute('style')).toContain('rotate(0deg)');
+    fireEvent.click(screen.getByRole('button', { name: 'Select image second.rvg' }));
+    expect(slider('Gamma').value).toBe('0.5');
+  });
+  it('keeps pinned views beside a failed selected image and clears pins on patient replacement', async () => {
+    openPaths = ['first.rvg', 'broken.rvg'];
+    customInvoke = (command, args) => command === 'import_image' && args.path === 'broken.rvg' ? Promise.reject('Synthetic failure') : command === 'open_patient' ? Promise.resolve(patient(['new.rvg'], '00456')) : undefined;
+    render(<App />); await open(); await pin('first.rvg'); selectThumbnail(2, 'broken.rvg');
+    await screen.findByText('Image unavailable');
+    expect(screen.getByAltText('Enhanced: first.rvg')).toBeTruthy();
+    expect(paneNames()).toHaveLength(2);
+    submitPatient('00456'); await screen.findByAltText('Enhanced: new.rvg');
+    expect(paneNames()).toEqual(['Image: new.rvg']);
+    expect(screen.queryByRole('button', { name: /Unpin image/ })).toBeNull();
+  });
+  it('refreshes a pin after editing then switching without publishing a stale intermediate snapshot', async () => {
+    openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg'); await pin('first.rvg');
+    let finish!: (value: RenderInfo) => void;
+    let requested!: { id: string; recipe: Recipe; requestId: number };
+    customInvoke = (command, args) => command === 'render_snapshot' ? new Promise(resolve => { finish = resolve; requested = args as typeof requested; }) : undefined;
+    setSlider('Gamma', .45);
+    await waitFor(() => expect(finish).toBeTruthy());
+    selectThumbnail(2, 'second.rvg');
+    const prior = screen.getByAltText('Enhanced: first.rvg').getAttribute('src');
+    expect(within(pane('first.rvg')).getByText(/Updating/)).toBeTruthy();
+    expect(requested.recipe.gamma).toBe(.45);
+    await act(async () => finish({ ...result(requested.id, requested.requestId), url: 'data:image/png;base64,updated-pin' }));
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('src')).toBe('data:image/png;base64,updated-pin');
+    expect(prior).not.toBe('data:image/png;base64,updated-pin');
+    expect(pane('second.rvg').getAttribute('data-selected')).toBe('true');
+  });
+});
+
+describe('pending pin UI', () => {
+  it('keeps an initial pending pin visible after selection changes and cancels it without resurrection', async () => {
+    openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg');
+    let finish!: (value: RenderInfo) => void;
+    let requested!: { id: string; requestId: number };
+    customInvoke = (command, args) => command === 'render_snapshot' ? new Promise(resolve => { finish = resolve; requested = args as typeof requested; }) : undefined;
+    fireEvent.click(screen.getByRole('button', { name: 'Pin image first.rvg' }));
+    await waitFor(() => expect(finish).toBeTruthy());
+    selectThumbnail(2, 'second.rvg');
+    expect(paneNames()).toEqual(['Image: first.rvg', 'Image: second.rvg']);
+    expect(within(pane('first.rvg')).getByText('Preparing your image…')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Pin image first.rvg' }).getAttribute('aria-busy')).toBe('true');
+    fireEvent.click(screen.getByRole('button', { name: 'Pin image first.rvg' }));
+    expect(paneNames()).toEqual(['Image: second.rvg']);
+    await act(async () => finish({ ...result(requested.id, requested.requestId), url: 'data:image/png;base64,cancelled' }));
+    expect(paneNames()).toEqual(['Image: second.rvg']);
+  });
+  it('keeps a persistent stale-pin warning after dismissing a failed-refresh notification', async () => {
+    openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg'); await pin('first.rvg');
+    customInvoke = command => command === 'render_snapshot' ? Promise.reject('Synthetic pin failure') : undefined;
+    setSlider('Gamma', .47);
+    await screen.findByText('Pinned copy update failed');
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss error' }));
+    selectThumbnail(2, 'second.rvg');
+    expect(within(pane('first.rvg')).getByText('Pinned image update failed · showing previous settings')).toBeTruthy();
+    customInvoke = undefined;
+    fireEvent.click(screen.getByRole('button', { name: 'Select image first.rvg' }));
+    setSlider('Gamma', .48);
+    await waitFor(() => expect(screen.queryByText('Pinned copy update failed')).toBeNull());
+  });
+  it('saves pin state and individual pane views without embedding full image snapshots', async () => {
+    openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg');
+    await pin('first.rvg'); selectThumbnail(2, 'second.rvg'); await pin('second.rvg');
+    fireEvent.click(screen.getByRole('button', { name: '100%' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_review', expect.objectContaining({ review: expect.objectContaining({ images: [expect.objectContaining({ source: 'first.rvg', pinned: true, view: expect.objectContaining({ fit: true }) }), expect.objectContaining({ source: 'second.rvg', pinned: true, view: expect.objectContaining({ fit: false, scale: 1 }) })] }) })));
+    const saved = mocks.invoke.mock.calls.find(([command]) => command === 'save_review')?.[1];
+    expect(JSON.stringify(saved)).not.toContain('data:image');
   });
 });

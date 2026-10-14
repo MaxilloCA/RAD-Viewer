@@ -1,5 +1,15 @@
 # Phase A integration contract
 
+## 0.3.6 pinned radiograph panes
+
+The user's explicit request adds a pinned multi-image review view. Visible entries are the pinned entries plus the selected entry if it is not already pinned; there is at most one unpinned working pane. Two images are side by side and larger collections reflow within the main viewport. There is no two-image cap. Selecting a displayed pin does not duplicate it. Unpinning an inactive entry removes its pane; the selected unpinned entry remains visible. Closing removes the entry and its pin, and patient replacement clears all previous pins.
+
+Image identity, recipe/history, rotation and view state are per entry. The selected pane owns the shared toolbar, controls, histogram and single-image PNG export. Activating an inactive pane does not apply the initiating pointer gesture to the previously selected image. Full-resolution immutable PNG snapshots keep inactive pins visible independently of the eight-entry decoded-source cache; bottom-strip thumbnails are never used for these panes. Committed adjustments refresh pin snapshots independently of the selected render queue, with generation/recipe checks and coalescing to reject stale results after rapid edits, unpinning, closing or patient replacement.
+
+The pin setting is review state, not part of processing `Recipe`, and does not alter pixels or source files. Saved review JSON records pins; it remains a settings record rather than a reopenable workspace session. This feature does not implement mounting templates, annotations or printing.
+
+`render_snapshot { id, recipe, requestId } -> RenderInfo` returns a durable full-resolution PNG data URL using the same processing engine as preview/export. It retains the source processor before awaiting work, uses the existing per-source lock and worker semaphore, and does not change the selected render's supersession counter or cache tokens. The frontend runs one snapshot request at a time, coalesces each pin's pending committed recipe, and temporarily protects queued/in-flight snapshot sources from decoded-cache eviction. Completed pin snapshots survive eviction. `pinPending` displays progress; a failed refresh keeps the previous snapshot with a persistent `pinError` indicator. Cancelled and old-patient completions cannot repopulate panes.
+
 ## 0.3.5 selective local Colorize
 
 Version-2 Colorize now uses signed local contrast rather than a global intensity palette. `Recipe` adds `color_strength: f32` / `colorStrength` (0–1, default 0.8) and `color_scale: f32` / `colorScale` (2–24 source pixels, default 8). Serde supplies defaults for older JSON; frontend equality treats omitted values as those defaults. Invalid/nonfinite values are rejected. This intentionally changes the appearance of older Colorize recipes; grayscale recipes retain their rendering.

@@ -38,6 +38,7 @@ export interface ImageEntry {
   key: string; path: string; name: string; patient?: PatientIdentity;
   image?: OpenImage; details?: ImageInfo; history?: History; defaultRecipe?: Recipe;
   thumbnail?: string; error?: string; lastUsed: number; rotationQuarterTurns: number;
+  pinned?: boolean; pinPending?: boolean; pinError?: string; pinOrder?: number; pinnedRender?: RenderInfo;
 }
 /** Calendar-only parsing: no local timezone conversion or inferred acquisition date. */
 export function formatImageDate(value?: string | null): string {

@@ -16,6 +16,7 @@ let maxLive: number;
 let serial: number;
 const imported: string[] = [];
 const allocate = (path: string) => { const id = `source-${++serial}`; live.add(id); maxLive = Math.max(maxLive, live.size); return image(path, id); };
+const snapshot = (args: Record<string, unknown>, suffix = ''): RenderInfo => ({ id: String(args.id), requestId: Number(args.requestId), url: `data:image/png;base64,${args.id}-${args.requestId}-${(args.recipe as Recipe).gamma}${suffix}`, histogram: [], clippedLow: 0, clippedHigh: 0, renderMs: 1 });
 beforeEach(() => {
   live = new Set(); maxLive = 0; serial = 0; imported.length = 0; customInvoke = undefined;
   mocks.invoke.mockReset().mockImplementation((command: string, args: Record<string, unknown> = {}) => {
@@ -24,6 +25,7 @@ beforeEach(() => {
     if (command === 'import_image') return Promise.resolve(allocate(String(args.path)));
     if (command === 'render_image') return Promise.resolve({ id: String(args.id), requestId: Number(args.requestId), url: `http://test.local/${args.id}.png`, histogram: [], clippedLow: 0, clippedHigh: 0, renderMs: 1 } satisfies RenderInfo);
     if (command === 'image_thumbnail') return Promise.resolve('data:image/png;base64,dGVzdA==');
+    if (command === 'render_snapshot') return Promise.resolve(snapshot(args));
     if (command === 'release_image') live.delete(String(args.id));
     return Promise.resolve(null);
   });
@@ -124,5 +126,181 @@ describe('bounded patient image library', () => {
     expect(result.current.selectedKey).toBe(victim.key);
     expect(maxLive).toBeLessThanOrEqual(DECODED_IMAGE_LIMIT);
     customInvoke = undefined;
+  });
+
+  it('keeps twelve full-resolution pins after decoded eviction and restores the saved recipe', async () => {
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    for (let index = 0; index < 12; index++) {
+      act(() => result.current.append([`pin-${index}.rvg`], patient('00123')));
+      await waitFor(() => expect(result.current.entries[index].image).toBeTruthy());
+      act(() => result.current.changeHistory(history => commit(history, { ...history.present, gamma: .3 + index / 100 })));
+      await act(async () => result.current.togglePin(result.current.entries[index].key));
+    }
+    expect(result.current.entries.every(entry => entry.pinned && entry.pinnedRender?.url.startsWith('data:image/png;base64,'))).toBe(true);
+    expect(result.current.entries[0].image).toBeUndefined();
+    expect(result.current.entries[0].pinnedRender?.url).not.toBe(result.current.entries[0].thumbnail);
+    expect(maxLive).toBeLessThanOrEqual(DECODED_IMAGE_LIMIT);
+    const first = result.current.entries[0];
+    act(() => result.current.select(first.key));
+    await waitFor(() => expect(result.current.entries[0].image).toBeTruthy());
+    expect(result.current.entries[0].image!.info.id).not.toBe(first.details!.id);
+    expect(result.current.entries[0].history!.present.gamma).toBe(.3);
+    expect(result.current.entries[0].pinnedRender).toEqual(first.pinnedRender);
+    await act(async () => result.current.togglePin(result.current.entries[1].key));
+    expect(result.current.entries[1].pinnedRender).toBeUndefined();
+  });
+
+  it('coalesces committed edits and refreshes an inactive pin without installing a stale frame', async () => {
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    act(() => result.current.append(['first.rvg', 'second.rvg']));
+    await waitFor(() => expect(result.current.entries.every(entry => entry.image)).toBe(true));
+    const key = result.current.entries[0].key;
+    await act(async () => result.current.togglePin(key));
+    const original = result.current.entries[0].pinnedRender;
+    const calls: { args: Record<string, unknown>; finish: (value: RenderInfo) => void }[] = [];
+    customInvoke = (command, args) => command === 'render_snapshot' ? new Promise(resolve => calls.push({ args, finish: resolve })) : undefined;
+    act(() => result.current.changeHistory(history => commit(history, { ...history.present, gamma: .33 })));
+    act(() => result.current.changeHistory(history => commit(history, { ...history.present, gamma: .44 })));
+    act(() => result.current.changeHistory(history => commit(history, { ...history.present, gamma: .55 })));
+    act(() => result.current.select(result.current.entries[1].key));
+    expect(calls).toHaveLength(1);
+    expect(result.current.entries[0].pinPending).toBe(true);
+    expect(result.current.entries[0].pinnedRender).toEqual(original);
+    await act(async () => calls[0].finish(snapshot(calls[0].args)));
+    expect(calls).toHaveLength(2);
+    expect((calls[1].args.recipe as Recipe).gamma).toBe(.55);
+    expect(result.current.entries[0].pinnedRender).toEqual(original);
+    await act(async () => calls[1].finish(snapshot(calls[1].args)));
+    expect(result.current.entries[0].pinnedRender).toEqual(snapshot(calls[1].args));
+    expect(result.current.entries[0].pinPending).toBe(false);
+    await act(async () => result.current.refreshPinned(key));
+    expect(calls).toHaveLength(2);
+  });
+
+  it('assigns pin order by pin actions and preserves it through refreshes', async () => {
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    act(() => result.current.append(['earlier.rvg', 'later.rvg']));
+    await waitFor(() => expect(result.current.entries.every(entry => entry.image)).toBe(true));
+    const [earlier, later] = result.current.entries;
+    await act(async () => result.current.togglePin(later.key));
+    await act(async () => result.current.togglePin(earlier.key));
+    const order = result.current.entries.map(entry => entry.pinOrder!);
+    expect(order[1]).toBeLessThan(order[0]);
+    await act(async () => result.current.changeHistory(history => commit(history, { ...history.present, gamma: .44 })));
+    expect(result.current.entries.map(entry => entry.pinOrder)).toEqual(order);
+    await act(async () => result.current.togglePin(later.key));
+    expect(result.current.entries[1].pinOrder).toBeUndefined();
+    await act(async () => result.current.togglePin(later.key));
+    expect(result.current.entries[1].pinOrder).toBeGreaterThan(order[0]);
+  });
+
+  it('rejects cancelled pin generations when the same entry is pinned again', async () => {
+    const calls: { args: Record<string, unknown>; finish: (value: RenderInfo) => void }[] = [];
+    customInvoke = (command, args) => command === 'render_snapshot' ? new Promise(resolve => calls.push({ args, finish: resolve })) : undefined;
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    act(() => result.current.append(['first.rvg']));
+    await waitFor(() => expect(result.current.entries[0].image).toBeTruthy());
+    const key = result.current.entries[0].key;
+    act(() => { void result.current.togglePin(key); });
+    await act(async () => result.current.togglePin(key));
+    expect(result.current.entries[0].pinPending).toBe(false);
+    act(() => { void result.current.togglePin(key); });
+    expect(calls).toHaveLength(1);
+    await act(async () => calls[0].finish(snapshot(calls[0].args, '-cancelled')));
+    expect(calls).toHaveLength(2);
+    expect(result.current.entries[0].pinnedRender).toBeUndefined();
+    await act(async () => calls[1].finish(snapshot(calls[1].args)));
+    expect(result.current.entries[0].pinnedRender).toEqual(snapshot(calls[1].args));
+    expect(result.current.entries[0].pinned).toBe(true);
+  });
+
+  it('discards active and queued pins when the patient changes', async () => {
+    const calls: { args: Record<string, unknown>; finish: (value: RenderInfo) => void }[] = [];
+    customInvoke = (command, args) => command === 'render_snapshot' ? new Promise(resolve => calls.push({ args, finish: resolve })) : undefined;
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    act(() => result.current.append(['same.rvg', 'queued.rvg'], patient('00123')));
+    await waitFor(() => expect(result.current.entries.every(entry => entry.image)).toBe(true));
+    const oldKeys = result.current.entries.map(entry => entry.key);
+    act(() => { for (const key of oldKeys) void result.current.togglePin(key); });
+    expect(calls).toHaveLength(1);
+    await act(async () => result.current.replace(['same.rvg'], patient('00456')));
+    await waitFor(() => expect(result.current.entries[0].image).toBeTruthy());
+    await act(async () => calls[0].finish(snapshot(calls[0].args)));
+    expect(calls).toHaveLength(1);
+    expect(result.current.entries[0].patient?.patientNumber).toBe('00456');
+    expect(oldKeys).not.toContain(result.current.entries[0].key);
+    expect(result.current.entries[0].pinnedRender).toBeUndefined();
+  });
+
+  it('protects queued latest recipes until captured while retaining the eight-source bound', async () => {
+    const calls: { args: Record<string, unknown>; finish: (value: RenderInfo) => void }[] = [];
+    customInvoke = (command, args) => command === 'render_snapshot' ? new Promise(resolve => calls.push({ args, finish: resolve })) : undefined;
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    act(() => result.current.append(Array.from({ length: 8 }, (_, index) => `pin-${index}.rvg`)));
+    await waitFor(() => expect(result.current.entries.every(entry => entry.image)).toBe(true));
+    const firstId = result.current.entries[0].image!.info.id;
+    act(() => { for (const entry of result.current.entries) void result.current.togglePin(entry.key); });
+    act(() => result.current.changeHistory(history => commit(history, { ...history.present, gamma: .44 })));
+    act(() => result.current.append(['ninth.rvg']));
+    expect(calls).toHaveLength(1);
+    expect(imported).toHaveLength(8);
+    await act(async () => calls[0].finish(snapshot(calls[0].args)));
+    expect(calls[1].args.id).toBe(firstId);
+    expect((calls[1].args.recipe as Recipe).gamma).toBe(.44);
+    expect(live.has(firstId)).toBe(true);
+    expect(imported).toHaveLength(8);
+    await act(async () => calls[1].finish(snapshot(calls[1].args)));
+    await waitFor(() => expect(result.current.entries[8].image).toBeTruthy());
+    expect(live.has(firstId)).toBe(false);
+    expect(result.current.entries[0].pinnedRender).toEqual(snapshot(calls[1].args));
+    for (let index = 2; index < 9; index++) await act(async () => calls[index].finish(snapshot(calls[index].args)));
+    expect(result.current.entries.slice(0, 8).every(entry => entry.pinned && !entry.pinPending)).toBe(true);
+    expect(maxLive).toBeLessThanOrEqual(DECODED_IMAGE_LIMIT);
+  });
+
+  it('retains a visible failure marker and last good pin until a retry succeeds', async () => {
+    const onError = vi.fn();
+    const { result } = renderHook(() => useImageLibrary(onError));
+    act(() => result.current.append(['first.rvg']));
+    await waitFor(() => expect(result.current.entries[0].image).toBeTruthy());
+    const key = result.current.entries[0].key;
+    await act(async () => result.current.togglePin(key));
+    const original = result.current.entries[0].pinnedRender;
+    customInvoke = command => command === 'render_snapshot' ? Promise.reject(new Error('Synthetic failure')) : undefined;
+    await act(async () => result.current.changeHistory(history => commit(history, { ...history.present, gamma: .44 })));
+    expect(result.current.entries[0].pinError).toContain('Synthetic failure');
+    expect(result.current.entries[0].pinnedRender).toEqual(original);
+    expect(onError).toHaveBeenCalledOnce();
+    customInvoke = undefined;
+    await act(async () => result.current.refreshPinned(key));
+    expect(result.current.entries[0].pinError).toBeUndefined();
+    expect(result.current.entries[0].pinnedRender).not.toEqual(original);
+  });
+
+  it('discards snapshots after close/unmount and never overrides a selection made during close', async () => {
+    let finishSnapshot!: (value: RenderInfo) => void;
+    let snapshotArgs!: Record<string, unknown>;
+    let finishRelease!: () => void;
+    const onError = vi.fn();
+    const { result, unmount } = renderHook(() => useImageLibrary(onError));
+    act(() => result.current.append(['first.rvg', 'second.rvg', 'third.rvg']));
+    await waitFor(() => expect(result.current.entries.every(entry => entry.image)).toBe(true));
+    const [first, , third] = result.current.entries;
+    customInvoke = (command, args) => {
+      if (command === 'render_snapshot') { snapshotArgs = args; return new Promise(resolve => { finishSnapshot = resolve; }); }
+      if (command === 'release_image' && args.id === first.image!.info.id) return new Promise(resolve => { finishRelease = () => { live.delete(String(args.id)); resolve(null); }; });
+      return undefined;
+    };
+    act(() => { void result.current.togglePin(first.key); });
+    let closing!: Promise<void>;
+    act(() => { closing = result.current.close(); });
+    act(() => result.current.select(third.key));
+    await act(async () => { finishRelease(); await closing; finishSnapshot(snapshot(snapshotArgs)); });
+    expect(result.current.selectedKey).toBe(third.key);
+    expect(result.current.entries.every(entry => !entry.pinnedRender)).toBe(true);
+    act(() => { void result.current.togglePin(third.key); });
+    unmount();
+    await act(async () => finishSnapshot(snapshot(snapshotArgs)));
+    expect(onError).not.toHaveBeenCalled();
   });
 });

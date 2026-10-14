@@ -3,14 +3,16 @@ import type { Dispatch, SetStateAction } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { clamp, commit, contrastValue, dateSourceLabel, dragAdjustment, experimentalPreset, formatImageDate, orientedDimensions, redo, sameRecipe, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
-import type { CustomPreset, History, ImageInfo, PatientDiscovery, Recipe, RenderInfo } from './model';
+import type { CustomPreset, History, ImageEntry, PatientDiscovery, Recipe, RenderInfo } from './model';
 import { useRenderedImage } from './useRenderedImage';
 import { useImageLibrary } from './useImageLibrary';
+import ImagePane, { defaultPaneView, paneGrid } from './ImagePane';
+import type { PaneView } from './ImagePane';
 
 const desktop = isTauri();
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const presetOptions = [['bitewing', 'Bitewing'], ['detail', 'Detail']] as const;
-type View = { scale: number; x: number; y: number; fit: boolean };
+type View = PaneView;
 
 function PatientOpenDialog({ onClose, onOpen }: { onClose: () => void; onOpen: (patient: PatientDiscovery) => Promise<void> }) {
   const dialog = useRef<HTMLDialogElement>(null);
@@ -69,41 +71,6 @@ function Histogram({ render, pixels }: { render: RenderInfo; pixels: number }) {
   return <div className="histogram"><svg viewBox="0 0 256 80" preserveAspectRatio="none" role="img" aria-label="Monochrome intensity histogram before false color, linear count scale"><path d={`${path} L256,80 L0,80 Z`} /></svg><div className="histogram-tonal-strip" /><div className="histogram-scale"><span>Black</span><span>Midtones</span><span>White</span></div><div className="clipping"><span>Black <b>{(render.clippedLow / pixels * 100).toFixed(2)}%</b></span><span>White <b>{(render.clippedHigh / pixels * 100).toFixed(2)}%</b></span></div></div>;
 }
 
-function ImagePane({ info, render, view, setView, processing, onSize, pixelRatio, onAdjustStart, onAdjustMove, onAdjustEnd, badge, rotationQuarterTurns }: {
-  info: ImageInfo; render: RenderInfo; view: View; setView: Dispatch<SetStateAction<View>>; processing: boolean;
-  onSize: (width: number, height: number) => void; pixelRatio: number; badge: string; rotationQuarterTurns: number;
-  onAdjustStart: () => void; onAdjustMove: (dx: number, dy: number) => void; onAdjustEnd: () => void;
-}) {
-  const viewport = useRef<HTMLDivElement>(null);
-  const [failedUrl, setFailedUrl] = useState<string | null>(null);
-  const drag = useRef<{ pointerId: number; x: number; y: number; originalX: number; originalY: number; scale: number; mode: 'pan' | 'adjust' } | null>(null);
-  useEffect(() => {
-    const element = viewport.current;
-    if (!element) return;
-    const observer = new ResizeObserver(entries => onSize(entries[0].contentRect.width, entries[0].contentRect.height));
-    observer.observe(element); return () => observer.disconnect();
-  }, [onSize]);
-  const finish = () => { const current = drag.current; drag.current = null; if (current?.mode === 'adjust') onAdjustEnd(); };
-  return <section className="image-pane" aria-label="Enhanced image"><header><strong>Enhanced</strong><span>{badge}</span></header>
-    <div ref={viewport} className="image-viewport enhanced-viewport" data-testid="image-viewport" onContextMenu={event => event.preventDefault()} onWheel={event => setView(previous => ({ ...previous, fit: false, scale: clamp(previous.scale * Math.exp(-event.deltaY * .0015), .025, 8) }))}
-      onPointerDown={event => {
-        if (event.button !== 0 && event.button !== 1) return;
-        event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId);
-        const mode = event.button === 1 || event.shiftKey ? 'pan' : 'adjust';
-        drag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, originalX: view.x, originalY: view.y, scale: view.scale, mode };
-        if (mode === 'adjust') onAdjustStart();
-      }} onPointerMove={event => {
-        const origin = drag.current;
-        if (!origin || event.pointerId !== origin.pointerId) return;
-        const dx = event.clientX - origin.x; const dy = event.clientY - origin.y;
-        if (origin.mode === 'adjust') onAdjustMove(dx, dy);
-        else setView(previous => ({ ...previous, fit: false, x: origin.originalX + dx / origin.scale, y: origin.originalY + dy / origin.scale }));
-      }} onPointerUp={finish} onPointerCancel={finish} onLostPointerCapture={finish} onDoubleClick={() => setView(previous => ({ ...previous, fit: true, x: 0, y: 0 }))}>
-      <img src={render.url} alt={`Enhanced: ${info.metadata.name}`} draggable={false} onError={() => setFailedUrl(render.url)} style={{ width: info.width, height: info.height, visibility: failedUrl === render.url ? 'hidden' : 'visible', imageRendering: view.scale * pixelRatio >= 1 ? 'pixelated' : 'auto', transform: `translate(-50%, -50%) translate(${view.x * view.scale}px, ${view.y * view.scale}px) scale(${view.scale}) rotate(${rotationQuarterTurns * 90}deg)` }} />
-      {failedUrl === render.url && <div className="image-load-error" role="alert"><strong>Image display failed</strong><span>The rendered image could not be loaded. Try reopening this image.</span></div>}
-      {processing && <div className="processing-pill"><span className="spinner" /> Updating · last completed image</div>}
-    </div><footer><span>{info.width} × {info.height}</span><span>{processing ? 'Updating' : 'Full-resolution processing'}</span></footer></section>;
-}
 
 function Slider({ label, value, min, max, step = .01, onChange, onCommit, endpoints, formatValue }: {
   label: string; value: number; min: number; max: number; step?: number;
@@ -122,19 +89,20 @@ export default function App() {
   const draftRef = useRef<Recipe | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const { entries: images, selectedKey: selected, loading, select: selectImage, append: appendImages, replace: replaceImages, changeHistory: updateHistory, close: closeLibraryImage, rotate: rotateImage } = useImageLibrary(setError);
+  const { entries: images, selectedKey: selected, loading, select: selectImage, append: appendImages, replace: replaceImages, changeHistory: updateHistory, close: closeLibraryImage, rotate: rotateImage, togglePin } = useImageLibrary(setError);
   const [presets, setPresets] = useState<CustomPreset[]>([]);
   const [presetName, setPresetName] = useState('');
   const [advanced, setAdvanced] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [patientDialogOpen, setPatientDialogOpen] = useState(false);
-  const [view, setView] = useState<View>({ scale: .4, x: 0, y: 0, fit: true });
+  const [paneViews, setPaneViews] = useState<Record<string, View>>({});
+  const gridRef = useRef<HTMLDivElement>(null);
+  const [gridSize, setGridSize] = useState({ width: 1000, height: 600 });
   const [pixelRatio, setPixelRatio] = useState(window.devicePixelRatio || 1);
-  const [paneSize, setPaneSize] = useState({ width: 500, height: 500 });
+  const [paneSizes, setPaneSizes] = useState<Record<string, { width: number; height: number }>>({});
   const activeEntry = images.find(image => image.key === selected);
   const active = activeEntry?.image;
   const rotationQuarterTurns = activeEntry?.rotationQuarterTurns ?? 0;
-  const displayDimensions = active ? orientedDimensions(active.info.width, active.info.height, rotationQuarterTurns) : null;
   const recipe = draft ?? active?.history.present;
   const base = active?.info.suggested ?? active?.info.neutral;
   const photometric = active?.info.metadata.photometric ?? 'MONOCHROME2';
@@ -144,14 +112,44 @@ export default function App() {
   const { rendered, processing } = useRenderedImage(active, recipe, setError);
   const currentPreset = active && recipe ? presetOptions.find(([key]) => sameRecipe({ ...recipe, colorize: false, colorStrength: .8, colorScale: 8 }, experimentalPreset(key, active.info.neutral, active.info.suggested)))?.[1]
     ?? presets.find(preset => sameRecipe(recipe, preset.recipe))?.name ?? 'Custom adjustments' : null;
-  const onPaneSize = useCallback((width: number, height: number) => setPaneSize({ width, height }), []);
-  const fitScale = displayDimensions ? Math.min((paneSize.width - 28) / displayDimensions.width, (paneSize.height - 28) / displayDimensions.height) : 1;
-  const effectiveView = { ...view, scale: view.fit ? Math.max(.025, fitScale) : view.scale };
+  const onPaneSize = useCallback((key: string, width: number, height: number) => setPaneSizes(previous => previous[key]?.width === width && previous[key]?.height === height ? previous : { ...previous, [key]: { width, height } }), []);
+  const viewFor = (entry: ImageEntry): View => {
+    const stored = paneViews[entry.key] ?? defaultPaneView;
+    const size = paneSizes[entry.key] ?? { width: 500, height: 500 };
+    const dimensions = entry.details ? orientedDimensions(entry.details.width, entry.details.height, entry.rotationQuarterTurns) : null;
+    const fitScale = dimensions ? Math.min((size.width - 28) / dimensions.width, (size.height - 28) / dimensions.height) : 1;
+    return { ...stored, scale: stored.fit ? Math.max(.025, fitScale) : stored.scale };
+  };
+  const view = selected ? paneViews[selected] ?? defaultPaneView : defaultPaneView;
+  const effectiveView = activeEntry ? viewFor(activeEntry) : defaultPaneView;
+  const setView: Dispatch<SetStateAction<View>> = update => {
+    if (!selected) return;
+    setPaneViews(previous => ({ ...previous, [selected]: typeof update === 'function' ? update(previous[selected] ?? defaultPaneView) : update }));
+  };
+  const updatePaneView = (entry: ImageEntry, update: SetStateAction<View>) => {
+    const current = viewFor(entry);
+    setPaneViews(previous => ({ ...previous, [entry.key]: typeof update === 'function' ? update(current) : update }));
+  };
   const nativePixelScale = sourcePixelScale(pixelRatio);
-  const updateView: Dispatch<SetStateAction<View>> = update => setView(previous => {
-    const current = { ...previous, scale: previous.fit ? Math.max(.025, fitScale) : previous.scale };
-    return typeof update === 'function' ? update(current) : update;
-  });
+  const visibleEntries = [...images.filter(image => image.pinned || image.pinPending).sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0)), ...activeEntry && !activeEntry.pinned && !activeEntry.pinPending ? [activeEntry] : []];
+  const grid = paneGrid(visibleEntries.length, gridSize.width, gridSize.height);
+  const visibleKeys = useRef<string[]>([]); visibleKeys.current = visibleEntries.map(entry => entry.key);
+  useEffect(() => {
+    setPaneViews(previous => {
+      const updated = { ...previous };
+      for (const key of visibleKeys.current) updated[key] = { ...(previous[key] ?? defaultPaneView), fit: true, x: 0, y: 0 };
+      return updated;
+    });
+  }, [grid.columns, grid.rows, visibleEntries.length]);
+  useEffect(() => {
+    const element = gridRef.current;
+    if (!element) return;
+    const observer = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      setGridSize(previous => previous.width === width && previous.height === height ? previous : { width, height });
+    });
+    observer.observe(element); return () => observer.disconnect();
+  }, [Boolean(visibleEntries.length)]);
   useEffect(() => {
     const updatePixelRatio = () => setPixelRatio(window.devicePixelRatio || 1);
     const query = window.matchMedia?.(`(resolution: ${pixelRatio}dppx)`);
@@ -164,11 +162,11 @@ export default function App() {
     if (!paths.length) return;
     if (draftRef.current) { const value = draftRef.current; updateHistory(history => commit(history, value)); }
     setError(null); setDraft(null); draftRef.current = null; dragRecipe.current = null;
-    setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); appendImages(paths);
+    appendImages(paths);
   }, [appendImages, updateHistory]);
   const openPatient = async (patient: PatientDiscovery) => {
     setError(null); setDraft(null); draftRef.current = null; dragRecipe.current = null;
-    setView(previous => ({ ...previous, fit: true, x: 0, y: 0 }));
+    setPaneViews({}); setPaneSizes({});
     await replaceImages(patient.paths, { patientNumber: patient.patientNumber, patientName: patient.patientName, directory: patient.directory });
     setNotice(patient.warnings.length ? patient.warnings.join('\n') : null);
   };
@@ -188,6 +186,9 @@ export default function App() {
     updateHistory(operation);
   }, [updateHistory]);
   const commitDraft = () => { if (draftRef.current) { const value = draftRef.current; changeHistory(history => commit(history, value)); } };
+  const activateImage = (key: string) => {
+    commitDraft(); dragRecipe.current = null; selectImage(key); setDraft(null); draftRef.current = null; setError(null);
+  };
   const updateDraft = (value: Recipe) => { draftRef.current = value; setDraft(value); };
   const changeValue = (key: keyof Recipe, value: number | string | boolean) => {
     if (recipe) updateDraft({ ...recipe, [key]: value, version: key === 'localContrast' || key === 'sharpen' || key === 'colorStrength' || key === 'colorScale' ? 2 : recipe.version });
@@ -211,7 +212,7 @@ export default function App() {
     if (!active) return;
     try {
       const path = await invoke<string | null>('save_review', { review: { version: 1, processingVersion: recipe?.version ?? 2, createdAt: new Date().toISOString(), qualityAcceptance: 'Pending user review', selectedImageId: active.info.id,
-        images: images.map(image => ({ source: image.path, rotationQuarterTurns: image.rotationQuarterTurns, patient: image.patient, metadata: image.details?.metadata, width: image.details?.width, height: image.details?.height, recipe: image.key === selected ? recipe : image.history?.present ?? null })), view: effectiveView } });
+        images: images.map(image => ({ source: image.path, pinned: Boolean(image.pinned), pinOrder: image.pinOrder, view: viewFor(image), rotationQuarterTurns: image.rotationQuarterTurns, patient: image.patient, metadata: image.details?.metadata, width: image.details?.width, height: image.details?.height, recipe: image.key === selected ? recipe : image.history?.present ?? null })), view: effectiveView } });
       if (path) setNotice(`Viewer settings saved: ${path}`);
     } catch (problem) { setError(`Save failed: ${message(problem)}`); }
   };
@@ -239,13 +240,20 @@ export default function App() {
     <div className="main-body"><div className="workspace"><div className="toolbar">
       <div className="document-title"><strong>{active?.info.metadata.name ?? activeEntry?.name ?? 'Radiograph workspace'}</strong>{activeEntry && <time className="image-date" title={dateSourceLabel(activeEntry.details?.metadata.dateSource)}>{formatImageDate(activeEntry.details?.metadata.imageDate)}</time>}<span>{active ? `${active.info.metadata.format} · ${active.info.metadata.bitsStored}-bit · ${active.info.metadata.photometric}` : 'Enhanced, full-resolution viewing'}</span></div>
       <div className="view-tools"><button disabled={!active} aria-label="Rotate 90 degrees clockwise" title="Rotate clockwise; separate from adjustment undo" onClick={() => { commitDraft(); rotateImage(); setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); }}>↻ Rotate 90°{rotationQuarterTurns ? ` · ${rotationQuarterTurns * 90}°` : ''}</button><button className={view.fit ? 'active' : ''} disabled={!active} onClick={() => setView(previous => ({ ...previous, fit: true, x: 0, y: 0 }))}>Fit</button><button className={!view.fit && Math.abs(view.scale - nativePixelScale) < .00001 ? 'active' : ''} disabled={!active} title="One source pixel per physical display pixel" onClick={() => setView({ scale: nativePixelScale, x: 0, y: 0, fit: false })}>100%</button><span className="zoom-label" title="Source pixels relative to physical display pixels">{active ? `${Math.round(effectiveView.scale * pixelRatio * 100)}%` : '—'}</span></div></div>
-      {active && rendered ? <div className="single-image-workspace"><ImagePane key={active.info.id} info={active.info} rotationQuarterTurns={rotationQuarterTurns} render={rendered} view={effectiveView} setView={updateView} processing={processing} onSize={onPaneSize} pixelRatio={pixelRatio} badge={`${currentPreset ?? 'Enhanced'}${recipe?.colorize ? ' · Local color' : ''}`}
-        onAdjustStart={() => { if (activeRef.current && recipeRef.current) dragRecipe.current = { id: activeRef.current.info.id, start: recipeRef.current, base: activeRef.current.info.suggested ?? activeRef.current.info.neutral, photometric: activeRef.current.info.metadata.photometric }; }}
-        onAdjustMove={(dx, dy) => { const snapshot = dragRecipe.current; if (snapshot && snapshot.id === activeRef.current?.info.id) updateDraft(dragAdjustment(snapshot.start, snapshot.base, dx, dy, snapshot.photometric)); }}
-        onAdjustEnd={() => { const snapshot = dragRecipe.current; dragRecipe.current = null; if (snapshot?.id === activeRef.current?.info.id) commitDraft(); }} /></div>
-      : <div className="empty-workspace"><div className="empty-frame"><span /><span /><span /><span /><svg width="64" height="64" viewBox="0 0 64 64" aria-hidden="true"><path d="M17 13h30v38H17zM25 24h14M25 32h14M25 40h8" /></svg></div><h1>{activeEntry?.error ? 'Image unavailable' : activeEntry ? 'Preparing your image…' : 'Open a radiograph.'}</h1><p>{activeEntry?.error ?? 'Review enhanced images with responsive tone and detail controls, processed on this computer.'}</p>{activeEntry?.error ? <button className="primary" onClick={() => selectImage(activeEntry.key)}>Retry image</button> : !activeEntry && <button className="primary" onClick={() => void chooseImages()} disabled={!desktop}>Open radiographs</button>}<span className="supported-formats">RVG · PANO · SC · DICOM · PNG · JPEG</span></div>}
+      {visibleEntries.length > 0 ? <div ref={gridRef} className="image-grid" aria-label="Image panes" style={{ gridTemplateColumns: `repeat(${grid.columns}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${grid.rows}, minmax(0, 1fr))` }}>
+        {visibleEntries.map(entry => {
+          const isActive = entry.key === selected;
+          const paneRender = isActive ? rendered ?? entry.pinnedRender : entry.pinnedRender;
+          return <ImagePane key={entry.key} entry={entry} render={paneRender} active={isActive} view={viewFor(entry)} setView={update => updatePaneView(entry, update)} processing={(isActive && processing) || Boolean(entry.pinPending)} onSize={onPaneSize} pixelRatio={pixelRatio}
+            badge={isActive ? `${currentPreset ?? 'Enhanced'}${recipe?.colorize ? ' · Local color' : ''}` : 'Enhanced'}
+            onSelect={() => activateImage(entry.key)} onPin={() => { if (isActive) commitDraft(); void togglePin(entry.key); }}
+            onAdjustStart={() => { if (isActive && activeRef.current && recipeRef.current) dragRecipe.current = { id: activeRef.current.info.id, start: recipeRef.current, base: activeRef.current.info.suggested ?? activeRef.current.info.neutral, photometric: activeRef.current.info.metadata.photometric }; }}
+            onAdjustMove={(dx, dy) => { const snapshot = dragRecipe.current; if (isActive && snapshot && snapshot.id === activeRef.current?.info.id) updateDraft(dragAdjustment(snapshot.start, snapshot.base, dx, dy, snapshot.photometric)); }}
+            onAdjustEnd={() => { const snapshot = dragRecipe.current; dragRecipe.current = null; if (isActive && snapshot?.id === activeRef.current?.info.id) commitDraft(); }} />;
+        })}
+      </div> : <div className="empty-workspace"><div className="empty-frame"><span /><span /><span /><span /><svg width="64" height="64" viewBox="0 0 64 64" aria-hidden="true"><path d="M17 13h30v38H17zM25 24h14M25 32h14M25 40h8" /></svg></div><h1>Open a radiograph.</h1><p>Review enhanced images with responsive tone and detail controls, processed on this computer.</p><button className="primary" onClick={() => void chooseImages()} disabled={!desktop}>Open radiographs</button><span className="supported-formats">RVG · PANO · SC · DICOM · PNG · JPEG</span></div>}
       <div className="workspace-help"><span>{loading ? <><span className="spinner" /> {loading}</> : active ? 'Drag ↑↓ gamma · Drag ←→ tone · Shift-drag or middle-drag to pan · Scroll to zoom' : 'Drop radiographs anywhere in the desktop window'}</span>{activeEntry && <button className="text-button" onClick={() => void closeImage()}>Close selected</button>}</div>
-      <div className="filmstrip" aria-label="Open images">{images.map((image, index) => <button key={image.key} aria-label={`${String(index + 1).padStart(2, '0')} ${image.name}`} aria-describedby={`date-${image.key}`} className={`thumbnail ${selected === image.key ? 'selected' : ''}`} title={image.error ?? image.path} onClick={() => { commitDraft(); dragRecipe.current = null; selectImage(image.key); setDraft(null); draftRef.current = null; setError(null); setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); }} aria-pressed={selected === image.key}>{image.thumbnail ? <span className={`thumbnail-image ${image.rotationQuarterTurns % 2 ? 'quarter-turned' : ''}`}><img src={image.thumbnail} alt="" style={{ transform: `translate(-50%, -50%) rotate(${image.rotationQuarterTurns * 90}deg)` }} /></span> : <span className="thumbnail-placeholder" aria-hidden="true">{image.error ? 'Unavailable' : 'Loading…'}</span>}<span className="thumbnail-number">{String(index + 1).padStart(2, '0')}</span><span className="thumbnail-name">{image.name}</span><time id={`date-${image.key}`} className="thumbnail-date" title={dateSourceLabel(image.details?.metadata.dateSource)}>{formatImageDate(image.details?.metadata.imageDate)}</time></button>)}<button className="add-thumbnail" onClick={() => void chooseImages()} disabled={!desktop}><span>＋</span>{images.length ? 'Add images' : 'Open images'}</button></div>
+      <div className="filmstrip" aria-label="Open images">{images.map((image, index) => <button key={image.key} aria-label={`${String(index + 1).padStart(2, '0')} ${image.name}`} aria-describedby={`date-${image.key}`} className={`thumbnail ${selected === image.key ? 'selected' : ''}`} title={image.error ?? image.path} onClick={() => activateImage(image.key)} aria-pressed={selected === image.key}>{image.thumbnail ? <span className={`thumbnail-image ${image.rotationQuarterTurns % 2 ? 'quarter-turned' : ''}`}><img src={image.thumbnail} alt="" style={{ transform: `translate(-50%, -50%) rotate(${image.rotationQuarterTurns * 90}deg)` }} /></span> : <span className="thumbnail-placeholder" aria-hidden="true">{image.error ? 'Unavailable' : 'Loading…'}</span>}<span className="thumbnail-number">{String(index + 1).padStart(2, '0')}</span>{image.pinned && <span className="thumbnail-pin" aria-label="Pinned">◆</span>}<span className="thumbnail-name">{image.name}</span><time id={`date-${image.key}`} className="thumbnail-date" title={dateSourceLabel(image.details?.metadata.dateSource)}>{formatImageDate(image.details?.metadata.imageDate)}</time></button>)}<button className="add-thumbnail" onClick={() => void chooseImages()} disabled={!desktop}><span>＋</span>{images.length ? 'Add images' : 'Open images'}</button></div>
     </div><aside className="adjustments"><div className="panel-title"><h2>Adjustments</h2><span>NON-DESTRUCTIVE</span></div><fieldset disabled={!active} className="adjustment-fields">
       <div className="history-tools"><button disabled={!active?.history.past.length} title="Undo (Ctrl+Z)" onClick={() => changeHistory(undo)}>↶ Undo</button><button disabled={!active?.history.future.length} title="Redo (Ctrl+Y)" onClick={() => changeHistory(redo)}>↷ Redo</button><button onClick={() => active && applyRecipe(active.defaultRecipe)}>Reset</button></div>
       <div className="section-label">PROCESSING PRESET <span>Experimental</span></div><div className="preset-grid">{presetOptions.map(([key, label]) => <button key={key} className={currentPreset === label ? 'active' : ''} onClick={() => active && applyRecipe({ ...experimentalPreset(key, active.info.neutral, active.info.suggested), colorize: Boolean(recipe?.colorize), colorStrength: recipe?.colorStrength ?? .8, colorScale: recipe?.colorScale ?? 8 })}>{label}</button>)}</div>

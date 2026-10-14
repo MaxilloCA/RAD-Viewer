@@ -36,6 +36,10 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ## View and adjust images
 
+Click the **thumbtack** in a radiograph's pane to keep it in the main viewer. Select another bottom-strip preview to view it alongside the pinned images. Only pinned images stay when you select a different preview: there is at most one unpinned working image. You can pin a third, fourth, fifth or more radiographs; the grid resizes to fit them. Two images appear side by side.
+
+Click a pane to select it for adjustments, rotation, Fit, 100%, undo and export. Its border identifies the selected image. Each pane shows its filename and date and retains its own processing settings and orientation. Clicking an already visible image selects it without creating a duplicate. Unpinning an inactive pane removes it from the main view; unpinning the selected pane leaves it as the working image. Opening another patient clears the previous patient's pins. Pinned images use full-resolution rendered snapshots, so they remain visible when their decoded source is unloaded from the bounded cache.
+
 **Rotate 90° clockwise** turns the selected image and its preview by one quarter turn; four clicks return it to its original orientation. Fit accounts for the rotated dimensions. Rotation is kept separately for each image, survives decoded-image cache eviction, and is included in exported PNGs and saved review JSON. Source files remain unchanged.
 
 Each image and preview displays its embedded date as **DD-MMM-YYYY** (for example, `14-Oct-2026`). Date priority is Acquisition Date/Time, Acquisition Date, Content Date, Study Date, then Series Date. The tooltip identifies the source. Dates are validated without timezone conversion. Images without usable embedded date metadata show **Date unavailable**.

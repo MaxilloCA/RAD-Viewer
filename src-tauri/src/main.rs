@@ -359,6 +359,58 @@ async fn processing_slot(
     }
     Ok((processor, permit))
 }
+
+#[tauri::command]
+async fn render_snapshot(
+    id: String,
+    recipe: Recipe,
+    request_id: u64,
+    state: State<'_, AppState>,
+) -> Result<RenderInfo, String> {
+    let processor = state
+        .images
+        .lock()
+        .unwrap()
+        .get(&id)
+        .ok_or("Image is closed")?
+        .processor
+        .clone();
+    // The processor owns the immutable source. A pin render survives eviction,
+    // without changing the selected preview's latest request or PNG cache.
+    let mut processor = processor.lock_owned().await;
+    let permit = state
+        .workers
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let start = Instant::now();
+        let render = processor.process(&recipe)?;
+        let bytes = png(&render)?;
+        Ok(RenderInfo {
+            id,
+            request_id,
+            url: snapshot_data_url(&bytes),
+            histogram: render.histogram,
+            clipped_low: render.clipped_low,
+            clipped_high: render.clipped_high,
+            render_ms: start.elapsed().as_secs_f64() * 1000.0,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn snapshot_data_url(bytes: &[u8]) -> String {
+    use base64::Engine;
+    format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
 #[tauri::command]
 async fn image_thumbnail(
     id: String,
@@ -571,6 +623,7 @@ fn main() {
             choose_reference,
             import_image,
             render_image,
+            render_snapshot,
             release_image,
             image_thumbnail,
             load_presets,
@@ -758,6 +811,38 @@ mod tests {
         let decoded = image::load_from_memory(&png(&render).unwrap())
             .unwrap()
             .to_rgba8();
+        assert_eq!(decoded.into_raw(), render.rgba);
+    }
+
+    #[test]
+    fn full_resolution_snapshot_preserves_png_bytes_dimensions_and_every_channel() {
+        use base64::Engine;
+        let (width, height) = (401, 203);
+        let render = rad_core::RenderedImage {
+            width,
+            height,
+            rgba: (0..width * height)
+                .flat_map(|i| {
+                    [
+                        (i % 256) as u8,
+                        ((i * 13) % 256) as u8,
+                        ((i * 29) % 256) as u8,
+                        255,
+                    ]
+                })
+                .collect(),
+            histogram: vec![0; 256],
+            clipped_low: 0,
+            clipped_high: 0,
+        };
+        let encoded = png(&render).unwrap();
+        let snapshot = snapshot_data_url(&encoded);
+        let restored = base64::engine::general_purpose::STANDARD
+            .decode(snapshot.strip_prefix("data:image/png;base64,").unwrap())
+            .unwrap();
+        assert_eq!(restored, encoded);
+        let decoded = image::load_from_memory(&restored).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (width, height));
         assert_eq!(decoded.into_raw(), render.rgba);
     }
 }
