@@ -11,6 +11,58 @@ const message = (error: unknown) => error instanceof Error ? error.message : Str
 const presetOptions = [['bitewing', 'Bitewing'], ['detail', 'Detail']] as const;
 type View = { scale: number; x: number; y: number; fit: boolean };
 
+function PatientOpenDialog({ onClose, onChoose }: { onClose: () => void; onChoose: (paths: string[]) => Promise<void> }) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const input = useRef<HTMLInputElement>(null);
+  const alive = useRef(true);
+  const pending = useRef(false);
+  const [patientNumber, setPatientNumber] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
+  const trimmed = patientNumber.trim();
+  const valid = /^[0-9]{2,64}$/.test(trimmed);
+  const folder = valid ? `D:\\ABELDent\\DATA\\NOTES\\${trimmed.slice(-2)}\\${trimmed}` : null;
+  useEffect(() => {
+    alive.current = true;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const element = dialog.current;
+    if (element && !element.open) element.showModal();
+    input.current?.focus();
+    return () => { alive.current = false; element?.close(); previousFocus?.focus(); };
+  }, []);
+  const submit = async () => {
+    if (pending.current) return;
+    if (!valid) { setError('Enter a patient number containing 2–64 digits only.'); input.current?.focus(); return; }
+    pending.current = true; setBusy('Choosing radiographs…'); setError(null); setStatus(null);
+    try {
+      const paths = await invoke<string[]>('choose_patient_images', { patientNumber: trimmed });
+      if (!alive.current) return;
+      if (!paths.length) { setStatus('No radiographs selected.'); return; }
+      setBusy('Opening selected radiographs…');
+      await onChoose(paths);
+      if (alive.current) onClose();
+    } catch (problem) { if (alive.current) setError(message(problem)); }
+    finally { pending.current = false; if (alive.current) setBusy(null); }
+  };
+  return <dialog ref={dialog} className="patient-dialog" aria-labelledby="patient-dialog-title" aria-describedby="patient-dialog-description" aria-busy={Boolean(busy)}
+    onCancel={event => { event.preventDefault(); if (!pending.current) onClose(); }}
+    onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (!pending.current) onClose(); } }}>
+    <form aria-label="Open patient" noValidate onSubmit={event => { event.preventDefault(); void submit(); }}>
+      <h2 id="patient-dialog-title">Open patient</h2>
+      <p id="patient-dialog-description">Enter the patient number, then choose the radiographs you want from their folder.</p>
+      <label className="patient-number-label" htmlFor="patient-number">Patient number</label>
+      <input ref={input} id="patient-number" type="text" inputMode="numeric" autoComplete="off" maxLength={64} value={patientNumber} disabled={Boolean(busy)} aria-invalid={Boolean(error) && !valid} aria-describedby={error ? 'patient-number-error patient-folder-preview' : 'patient-folder-preview'}
+        onChange={event => { setPatientNumber(event.target.value); setError(null); setStatus(null); }} />
+      <div id="patient-folder-preview" className="patient-folder-preview"><span>Folder</span><code>{folder ?? 'Enter at least two digits to preview the folder.'}</code></div>
+      <p className="patient-selection-note">Select only the images needed for this review. Up to 24 images can be open at once.</p>
+      {error && <p id="patient-number-error" className="patient-dialog-error" role="alert">{error}</p>}
+      {(busy || status) && <p className="patient-dialog-status" role="status">{busy && <span className="spinner" />}{busy ?? status}</p>}
+      <div className="patient-dialog-actions"><button type="button" disabled={Boolean(busy)} onClick={onClose}>Cancel</button><button type="submit" className="primary" disabled={Boolean(busy)}>Choose radiographs</button></div>
+    </form>
+  </dialog>;
+}
+
 function Histogram({ render, pixels }: { render: RenderInfo; pixels: number }) {
   const maximum = Math.max(1, ...render.histogram);
   const path = render.histogram.map((value, index) => `${index === 0 ? 'M' : 'L'}${index / Math.max(1, render.histogram.length - 1) * 256},${78 - value / maximum * 76}`).join(' ');
@@ -77,6 +129,7 @@ export default function App() {
   const [presetName, setPresetName] = useState('');
   const [advanced, setAdvanced] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [patientDialogOpen, setPatientDialogOpen] = useState(false);
   const [view, setView] = useState<View>({ scale: .4, x: 0, y: 0, fit: true });
   const [pixelRatio, setPixelRatio] = useState(window.devicePixelRatio || 1);
   const [paneSize, setPaneSize] = useState({ width: 500, height: 500 });
@@ -115,8 +168,9 @@ export default function App() {
       return { path, info, initial, defaultRecipe, history: { past: [], present: defaultRecipe, future: [] } };
     } catch (problem) { await invoke('release_image', { id: info.id }).catch(() => {}); throw problem; }
   }, []);
-  const importPaths = useCallback(async (paths: string[]) => {
-    if (!paths.length || importBusy.current) return;
+  const importPaths = useCallback(async (paths: string[], localErrors = false) => {
+    if (!paths.length) return;
+    if (importBusy.current) { if (localErrors) throw new Error('Another image import is in progress. Please try again when it finishes.'); return; }
     importBusy.current = true; setError(null); let first = true; const failures: string[] = [];
     for (let index = 0; index < paths.length; index++) {
       setLoading(`Opening ${index + 1} of ${paths.length}`);
@@ -125,7 +179,8 @@ export default function App() {
         if (first) { setSelected(entry.info.id); setDraft(null); draftRef.current = null; dragRecipe.current = null; setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); first = false; }
       } catch (problem) { failures.push(`${paths[index].split(/[\\/]/).pop()}: ${message(problem)}`); }
     }
-    setLoading(null); importBusy.current = false; if (failures.length) setError(failures.join('\n'));
+    setLoading(null); importBusy.current = false;
+    if (failures.length) { if (localErrors) throw new Error(failures.join('\n')); setError(failures.join('\n')); }
   }, [loadImage]);
   useEffect(() => {
     if (!desktop) return;
@@ -150,7 +205,7 @@ export default function App() {
   const applyRecipe = (value: Recipe) => changeHistory(history => commit(history, value));
   useEffect(() => {
     const down = (event: KeyboardEvent) => {
-      if ((event.target as HTMLElement).closest('input, textarea, select')) return;
+      if ((event.target as HTMLElement).closest('input, textarea, select, dialog')) return;
       if ((event.ctrlKey || event.metaKey) && event.code === 'KeyZ') { event.preventDefault(); changeHistory(event.shiftKey ? redo : undo); }
       if ((event.ctrlKey || event.metaKey) && event.code === 'KeyY') { event.preventDefault(); changeHistory(redo); }
     };
@@ -189,7 +244,7 @@ export default function App() {
   return <main className="app-shell"><header className="app-header">
     <div className="brand"><span className="brand-symbol" aria-hidden="true">R</span><div><strong>RAD <span>Viewer</span></strong><small>RADIOGRAPH VIEWER</small></div></div>
     <div className="header-divider" /><div className="header-context"><span className="status-dot" />Local processing<small>Original files preserved</small></div>
-    <div className="header-actions"><button onClick={() => void saveReview()} disabled={!active}>Save settings</button><button onClick={() => void exportImage()} disabled={!active}>Export PNG</button><button className="primary" onClick={() => void chooseImages()} disabled={!desktop || !!loading}>＋ Open images</button></div></header>
+    <div className="header-actions"><button onClick={() => void saveReview()} disabled={!active}>Save settings</button><button onClick={() => void exportImage()} disabled={!active}>Export PNG</button><button onClick={() => setPatientDialogOpen(true)} disabled={!desktop || !!loading}>Open patient</button><button className="primary" onClick={() => void chooseImages()} disabled={!desktop || !!loading}>＋ Open images</button></div></header>
     {!desktop && <div className="browser-banner"><strong>Desktop application required.</strong> Open RAD Viewer to import local radiographs and use the Rust processing engine. This browser view is the interface only.</div>}
     {error && <div role="alert" className="notice error"><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
     {notice && <div role="status" className="notice"><span>{notice}</span><button onClick={() => setNotice(null)} aria-label="Dismiss notification">×</button></div>}
@@ -224,5 +279,6 @@ export default function App() {
     </fieldset></aside></div>
     <footer className="status-bar"><span><span className="status-dot amber" />Image-quality review pending</span><span>{active ? `${Math.round(active.info.decodeMs)} ms decode · ${Math.round(rendered?.renderMs ?? 0)} ms processing · ${images.length} image${images.length === 1 ? '' : 's'}` : 'Offline · CPU processing'}</span></footer>
     {dragging && <div className="drop-overlay"><strong>Drop radiographs to open</strong><span>RVG · PANO · DICOM · PNG · JPEG</span></div>}
+    {patientDialogOpen && <PatientOpenDialog onClose={() => setPatientDialogOpen(false)} onChoose={paths => importPaths(paths, true)} />}
   </main>;
 }

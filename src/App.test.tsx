@@ -21,6 +21,8 @@ beforeEach(() => {
     constructor(type: string, options: PointerEventInit = {}) { super(type, options); this.pointerId = options.pointerId ?? 1; }
   });
   Object.defineProperty(HTMLElement.prototype, 'setPointerCapture', { configurable: true, value: vi.fn() });
+  Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: function (this: HTMLDialogElement) { this.setAttribute('open', ''); } });
+  Object.defineProperty(HTMLDialogElement.prototype, 'close', { configurable: true, value: function (this: HTMLDialogElement) { this.removeAttribute('open'); } });
   mocks.invoke.mockReset().mockImplementation((command: string, args: Record<string, unknown> = {}) => {
     const custom = customInvoke?.(command, args); if (custom) return custom;
     if (command === 'load_presets') return Promise.resolve([]);
@@ -39,6 +41,80 @@ const moveDrag = (x: number, y: number) => fireEvent.pointerMove(screen.getByTes
 const finishDrag = () => fireEvent.pointerUp(screen.getByTestId('image-viewport'), { pointerId: 1 });
 
 describe('enhanced viewer with test-only Tauri IPC', () => {
+  it('opens selected patient radiographs with a trimmed, leading-zero-preserving number', async () => {
+    render(<App />); await open();
+    customInvoke = command => command === 'choose_patient_images' ? Promise.resolve(['selected-patient.rvg']) : undefined;
+    fireEvent.click(screen.getByRole('button', { name: 'Open patient' }));
+    expect(screen.getByRole('dialog', { name: 'Open patient' })).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByLabelText('Patient number'));
+    fireEvent.change(screen.getByLabelText('Patient number'), { target: { value: ' 0067589 ' } });
+    expect(screen.getByText('D:\\ABELDent\\DATA\\NOTES\\89\\0067589')).toBeTruthy();
+    fireEvent.submit(screen.getByRole('form', { name: 'Open patient' }));
+    await screen.findByAltText('Enhanced: selected-patient.rvg');
+    expect(mocks.invoke).toHaveBeenCalledWith('choose_patient_images', { patientNumber: '0067589' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByRole('button', { name: '01 first.rvg' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '02 selected-patient.rvg' })).toBeTruthy();
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === 'import_image').map(([, args]) => args.path)).toEqual(['first.rvg', 'selected-patient.rvg']);
+  });
+  it('rejects invalid patient numbers without calling the file picker', () => {
+    render(<App />); fireEvent.click(screen.getByRole('button', { name: 'Open patient' }));
+    for (const value of ['', '1', '12a', '../123', '１２３', '9'.repeat(65)]) {
+      fireEvent.change(screen.getByLabelText('Patient number'), { target: { value } });
+      fireEvent.submit(screen.getByRole('form', { name: 'Open patient' }));
+      expect(screen.getByRole('alert').textContent).toContain('2–64 digits only');
+    }
+    expect(mocks.invoke.mock.calls.some(([command]) => command === 'choose_patient_images')).toBe(false);
+    expect(screen.getByRole('dialog')).toBeTruthy();
+  });
+  it('closes the patient dialog with Cancel or Escape without opening files', () => {
+    render(<App />); fireEvent.click(screen.getByRole('button', { name: 'Open patient' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Open patient' }));
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(mocks.invoke.mock.calls.some(([command]) => command === 'choose_patient_images')).toBe(false);
+  });
+  it('keeps patient lookup errors local and permits retry without losing the number', async () => {
+    customInvoke = command => command === 'choose_patient_images' ? Promise.reject('Patient folder not found') : undefined;
+    render(<App />); fireEvent.click(screen.getByRole('button', { name: 'Open patient' }));
+    fireEvent.change(screen.getByLabelText('Patient number'), { target: { value: '67589' } });
+    fireEvent.submit(screen.getByRole('form', { name: 'Open patient' }));
+    await screen.findByText('Patient folder not found');
+    expect(screen.getByRole('dialog').contains(screen.getByRole('alert'))).toBe(true);
+    expect((screen.getByLabelText('Patient number') as HTMLInputElement).value).toBe('67589');
+    expect((screen.getByRole('button', { name: 'Choose radiographs' }) as HTMLButtonElement).disabled).toBe(false);
+    customInvoke = command => command === 'choose_patient_images' ? Promise.resolve([]) : undefined;
+    fireEvent.submit(screen.getByRole('form', { name: 'Open patient' }));
+    await screen.findByText('No radiographs selected.');
+    expect(screen.getByRole('dialog')).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+  it('coalesces patient submissions while the native picker is busy and handles cancellation', async () => {
+    let finishPicker!: (paths: string[]) => void;
+    customInvoke = command => command === 'choose_patient_images' ? new Promise(resolve => { finishPicker = resolve; }) : undefined;
+    render(<App />); fireEvent.click(screen.getByRole('button', { name: 'Open patient' }));
+    fireEvent.change(screen.getByLabelText('Patient number'), { target: { value: '0012' } });
+    fireEvent.submit(screen.getByRole('form', { name: 'Open patient' }));
+    fireEvent.submit(screen.getByRole('form', { name: 'Open patient' }));
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === 'choose_patient_images')).toHaveLength(1);
+    expect((screen.getByLabelText('Patient number') as HTMLInputElement).disabled).toBe(true);
+    await act(async () => finishPicker([]));
+    expect(screen.getByText('No radiographs selected.')).toBeTruthy();
+    expect(mocks.invoke.mock.calls.some(([command]) => command === 'import_image')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+  it('keeps failed selected-image imports in the patient dialog', async () => {
+    customInvoke = (command, args) => command === 'choose_patient_images' ? Promise.resolve(['broken.rvg']) : command === 'import_image' && args.path === 'broken.rvg' ? Promise.reject('Unsupported encoding') : undefined;
+    render(<App />); fireEvent.click(screen.getByRole('button', { name: 'Open patient' }));
+    fireEvent.change(screen.getByLabelText('Patient number'), { target: { value: '67589' } });
+    fireEvent.submit(screen.getByRole('form', { name: 'Open patient' }));
+    await screen.findByText('broken.rvg: Unsupported encoding');
+    expect(screen.getByRole('dialog').contains(screen.getByRole('alert'))).toBe(true);
+    expect((screen.getByRole('button', { name: 'Choose radiographs' }) as HTMLButtonElement).disabled).toBe(false);
+  });
   it('opens one enhanced viewport with exact defaults and requested ranges', async () => {
     render(<App />); await open();
     expect(screen.getAllByAltText('Enhanced: first.rvg')).toHaveLength(1);

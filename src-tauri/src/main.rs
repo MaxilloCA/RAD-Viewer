@@ -88,22 +88,61 @@ fn png(render: &rad_core::RenderedImage) -> Result<Vec<u8>, String> {
 }
 #[tauri::command]
 async fn choose_images() -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        rfd::FileDialog::new()
-            .set_title("Open radiographs")
-            .add_filter(
-                "Radiographs",
-                &["rvg", "pano", "dcm", "dicom", "jpg", "jpeg", "png"],
-            )
-            .add_filter("All files (DICOM by content)", &["*"])
-            .pick_files()
-            .unwrap_or_default()
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect()
+    tauri::async_runtime::spawn_blocking(|| pick_radiographs(None))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn pick_radiographs(directory: Option<&Path>) -> Vec<String> {
+    let mut dialog = rfd::FileDialog::new().set_title("Open radiographs");
+    if let Some(directory) = directory {
+        dialog = dialog.set_directory(directory);
+    }
+    dialog
+        .add_filter(
+            "Radiographs",
+            &["rvg", "pano", "dcm", "dicom", "jpg", "jpeg", "png"],
+        )
+        .add_filter("All files (DICOM by content)", &["*"])
+        .pick_files()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn patient_directory(root: &Path, patient_number: &str) -> Result<PathBuf, String> {
+    let number = patient_number.trim();
+    if !(2..=64).contains(&number.len()) || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("Enter a patient number containing 2–64 digits only.".into());
+    }
+    // Keep the identifier as text so leading zeros are preserved. ASCII-only
+    // validation also prevents separators or traversal from becoming path parts.
+    Ok(root.join(&number[number.len() - 2..]).join(number))
+}
+
+fn existing_patient_directory(root: &Path, patient_number: &str) -> Result<PathBuf, String> {
+    let directory = patient_directory(root, patient_number)?;
+    match std::fs::metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => Ok(directory),
+        Ok(_) => Err(format!("Patient location is not a folder: {}", directory.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "Patient folder not found: {}. Check the patient number and that drive D: is available.",
+            directory.display()
+        )),
+        Err(error) => Err(format!("Cannot open patient folder {}: {error}", directory.display())),
+    }
+}
+
+#[tauri::command]
+async fn choose_patient_images(patient_number: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let directory =
+            existing_patient_directory(Path::new(r"D:\ABELDent\DATA\NOTES"), &patient_number)?;
+        Ok(pick_radiographs(Some(&directory)))
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?
 }
 #[tauri::command]
 async fn choose_reference() -> Result<Option<String>, String> {
@@ -436,6 +475,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             choose_images,
+            choose_patient_images,
             choose_reference,
             import_image,
             render_image,
@@ -452,6 +492,55 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn patient_paths_use_last_two_digits_and_preserve_leading_zeros() {
+        let root = Path::new("notes");
+        assert_eq!(
+            patient_directory(root, " 67589 ").unwrap(),
+            root.join("89").join("67589")
+        );
+        assert_eq!(
+            patient_directory(root, "00102").unwrap(),
+            root.join("02").join("00102")
+        );
+        assert_eq!(
+            patient_directory(root, "12").unwrap(),
+            root.join("12").join("12")
+        );
+        for invalid in [
+            "",
+            "1",
+            "../67589",
+            "67/589",
+            "67\\589",
+            "-67589",
+            "67 589",
+            "６７５８９",
+        ] {
+            assert!(patient_directory(root, invalid).is_err(), "{invalid}");
+        }
+        assert!(patient_directory(root, &"1".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn patient_lookup_checks_only_the_requested_existing_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = root.path().join("89").join("67589");
+        assert!(existing_patient_directory(root.path(), "67589")
+            .unwrap_err()
+            .contains("not found"));
+        std::fs::create_dir_all(&expected).unwrap();
+        assert_eq!(
+            existing_patient_directory(root.path(), "67589").unwrap(),
+            expected
+        );
+        let file = root.path().join("89").join("67589-file");
+        std::fs::write(&file, b"not a folder").unwrap();
+        std::fs::write(root.path().join("89").join("12389"), b"not a folder").unwrap();
+        assert!(existing_patient_directory(root.path(), "12389")
+            .unwrap_err()
+            .contains("not a folder"));
+    }
     #[test]
     fn superseded_cache_waiter_does_not_process_or_occupy_worker() {
         use std::{future::Future, task::Poll};

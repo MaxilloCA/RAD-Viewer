@@ -2,6 +2,13 @@
 
 Phase A comparison prototype, 2026-10-13 (America/Toronto).
 
+## 0.3.1 patient folder shortcut — 2026-10-14
+
+- Added **Open patient**, with patient-number entry, exact folder preview and native radiograph selection. Patient `67589` resolves to `D:\ABELDent\DATA\NOTES\89\67589`. Lookup is read-only and checks only the requested directory. Existing images remain open and cancelling does not import files.
+- Six desktop-shell tests pass, including new tests for last-two-digit mapping, leading zeros, invalid/path-like identifiers, absent folders and non-directory targets. Strict workspace Clippy passes. All 29 frontend tests and the production frontend build pass, including six new patient-dialog tests for selection/import, validation, cancellation, retry, duplicate-submit prevention and local errors.
+- The example directory was checked read-only: it exists, with an XML file and no supported images or subfolders. An empty radiograph picker there is expected.
+- Built the Windows executable and `RAD Viewer_0.3.1_x64-setup.exe`. Native UI verification confirmed that entering `67589` opens the picker at exactly `D:\ABELDent\DATA\NOTES\89\67589`. Cancelling returns to the patient dialog with no files imported and allows retry. The updated app is open; the previous viewer session was preserved with its image adjustments.
+
 ## 0.3.0 interaction revision
 
 The user's latest request supersedes the earlier comparison UI and defaults: one enhanced image, gamma 0.1–0.9/default 0.22, sharpness 5–10/default 6, relative Tone/Contrast, left-drag tone/gamma adjustment, a linear monochrome histogram and Colorize in place of Neutral/Endo. All imports and Reset use these defaults, including panorama and ordinary images. Source-aware window suggestions still apply only to eligible intraoral sources.

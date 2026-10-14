@@ -32,6 +32,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ## View and adjust images
 
+Choose **Open patient**, enter the patient number, then choose the radiographs in that patient's folder. For example, `67589` opens the file picker at `D:\ABELDent\DATA\NOTES\89\67589`. The final two digits select the first subfolder; the complete number selects the patient subfolder. Leading zeros are preserved. Missing or inaccessible folders show an error, and cancelling leaves the current images unchanged. The lookup checks only the requested folder, without scanning the patient archive.
+
 Open local RVG, PANO, DICOM, JPEG or PNG files. DICOM is detected from content, independently of its extension. Select an image in the strip. Version 0.3.0 shows one enhanced image, with gamma **0.22** and sharpness **6** on every import and Reset. Gamma controls span **0.1–0.9** and sharpness **5–10**. Eligible high-depth intraoral DICOM also receives a source-aware starting window; other images use their supplied or neutral starting window.
 
 Hold the left mouse button on the image and drag **right/left to lighten/darken tone**, or **up/down to increase/decrease gamma**. Shift-drag or middle-drag pans; the wheel zooms; double-click fits. Choose 100% to inspect source pixels. A completed drag is one undo step. Tone and Contrast use short, labeled relative scales instead of raw detector values. The monochrome histogram uses linear pixel counts and a black-to-white intensity strip.

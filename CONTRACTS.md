@@ -1,5 +1,9 @@
 # Phase A integration contract
 
+## 0.3.1 patient folder shortcut
+
+`choose_patient_images { patientNumber: string } -> string[]` validates a trimmed ASCII identifier of 2–64 digits, preserves leading zeros, and resolves `D:\ABELDent\DATA\NOTES\<last two digits>\<complete number>`. It checks folder existence on a blocking worker, then opens the standard radiograph multi-select dialog there. Cancellation returns an empty array. Missing/non-directory/inaccessible paths return an actionable error; no archive enumeration occurs. Selected paths use the existing progressive import and resource limits. The frontend provides an Open patient dialog with a path preview and retains the existing images.
+
 ## 0.3.0 controls and display contract
 
 This section supersedes older UI descriptions. One enhanced viewport replaces original/adjusted/reference panes. All imports and Reset use version 2 Bitewing with gamma 0.22, sharpness 6 and the suggested window (neutral window when no source-aware suggestion applies). Neutral remains an internal immutable-source baseline. There is no original/bypass control, Neutral preset button, Endo button or reference loading UI.
