@@ -1,5 +1,13 @@
 # Phase A integration contract
 
+## 0.3.7 centered defaults and mouse shortcuts
+
+Imports and Reset use version-2 Med with Gamma 0.5, Tone 35, Contrast −50 and Sharpness 3. Tone/Contrast retain their existing calculations against the original suggested-or-neutral base window; they are not re-zeroed. MONOCHROME1 polarity is accounted for when building the initial recipe. Gamma stays 0.1–0.9, Tone/Contrast −100…100, and Sharpness is now 1–10. A piecewise linear thumb-position mapping places each requested default at 50% without changing the actual recipe values or engine validation. Sliders display/expose actual units and support actual-step keyboard changes and Home/End.
+
+Low/Med/High replace the previous built-in buttons. Their gamma/sharpness pairs are 0.3/1, 0.5/3 and 0.7/6, with common Tone35/Contrast−50 and unchanged radiograph-detail parameters (local contrast0.4, radius2.2, threshold0.0015, halo0.35). Selecting a built-in retains Colorize settings; Reset turns Colorize off and restores its defaults. Serialized old recipes are not migrated or remapped.
+
+Image panes distinguish single from double right-click. A single right-click rotates the targeted pane 90° clockwise after the double-click interval; double-right-click toggles its pin without rotation. Targeting uses the entry key rather than whichever image is selected when a timer expires. Pointer cancellation, dragging and unmount prevent unintended delayed actions. Existing toolbar/pin buttons and left-double-click fit remain available. Source pixels and PNG export processing are unchanged.
+
 ## 0.3.6 pinned radiograph panes
 
 The user's explicit request adds a pinned multi-image review view. Visible entries are the pinned entries plus the selected entry if it is not already pinned; there is at most one unpinned working pane. Two images are side by side and larger collections reflow within the main viewport. There is no two-image cap. Selecting a displayed pin does not duplicate it. Unpinning an inactive entry removes its pane; the selected unpinned entry remains visible. Closing removes the entry and its pin, and patient replacement clears all previous pins.

@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { sliderPosition } from './model';
 import type { ImageInfo, PatientDiscovery, Recipe, RenderInfo } from './model';
 
 const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -44,7 +45,13 @@ const submitPatient = (value = '00123') => {
 };
 const readyThumbnail = async (name: string) => waitFor(() => expect(screen.getByRole('button', { name }).querySelector('img')).toBeTruthy());
 const slider = (label: string) => screen.getByRole('slider', { name: label }) as HTMLInputElement;
-const setSlider = (label: string, value: number) => { fireEvent.change(slider(label), { target: { value: String(value) } }); fireEvent.blur(slider(label)); };
+const centers: Record<string, number> = { Gamma: .5, Tone: 35, Contrast: -50, 'Sharpness strength': 3 };
+const actualValue = (label: string) => String(Number(Number(slider(label).getAttribute('aria-valuenow')).toFixed(6)));
+const setSlider = (label: string, value: number) => {
+  const control = slider(label);
+  const position = label in centers ? sliderPosition(value, Number(control.getAttribute('aria-valuemin')), centers[label], Number(control.getAttribute('aria-valuemax'))) : value;
+  fireEvent.change(control, { target: { value: String(position) } }); fireEvent.blur(control);
+};
 const startDrag = (options: PointerEventInit = {}) => fireEvent.pointerDown(screen.getByTestId('image-viewport'), { button: 0, clientX: 100, clientY: 100, pointerId: 1, ...options });
 const moveDrag = (x: number, y: number) => fireEvent.pointerMove(screen.getByTestId('image-viewport'), { clientX: x, clientY: y, pointerId: 1 });
 const finishDrag = () => fireEvent.pointerUp(screen.getByTestId('image-viewport'), { pointerId: 1 });
@@ -147,10 +154,63 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     expect(screen.queryByRole('button', { name: 'Endo' })).toBeNull();
     expect(screen.queryByText(/Add reference/)).toBeNull();
     expect(screen.queryByAltText(/Original:/)).toBeNull();
-    expect(slider('Gamma').value).toBe('0.22'); expect(slider('Gamma').min).toBe('0.1'); expect(slider('Gamma').max).toBe('0.9');
-    expect(slider('Sharpness strength').value).toBe('6'); expect(slider('Sharpness strength').min).toBe('5'); expect(slider('Sharpness strength').max).toBe('10');
-    expect(slider('Tone').value).toBe('0'); expect(slider('Contrast').value).toBe('0');
+    expect(actualValue('Gamma')).toBe('0.5'); expect(slider('Gamma').getAttribute('aria-valuemin')).toBe('0.1'); expect(slider('Gamma').getAttribute('aria-valuemax')).toBe('0.9');
+    expect(actualValue('Sharpness strength')).toBe('3'); expect(slider('Sharpness strength').getAttribute('aria-valuemin')).toBe('1'); expect(slider('Sharpness strength').getAttribute('aria-valuemax')).toBe('10');
+    expect(actualValue('Tone')).toBe('35'); expect(actualValue('Contrast')).toBe('-50');
     expect(screen.queryByRole('slider', { name: 'Window center' })).toBeNull();
+  });
+  it('centers the main controls at their actual defaults and applies Low, Med, High presets', async () => {
+    render(<App />); await open();
+    for (const [label, middle] of Object.entries(centers)) {
+      expect(Number(slider(label).value)).toBeCloseTo(50);
+      expect(Number(slider(label).getAttribute('aria-valuenow'))).toBeCloseTo(middle);
+      expect(slider(label).closest('label')?.querySelector('.slider-center-tick')).toBeTruthy();
+    }
+    expect(screen.queryByRole('button', { name: 'Bitewing' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Detail' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Low' }));
+    expect(actualValue('Gamma')).toBe('0.3'); expect(actualValue('Sharpness strength')).toBe('1');
+    expect(actualValue('Tone')).toBe('35'); expect(actualValue('Contrast')).toBe('-50');
+    expect(Number(slider('Gamma').value)).toBeCloseTo(25); expect(Number(slider('Sharpness strength').value)).toBe(0);
+    fireEvent.click(screen.getByRole('button', { name: 'High' }));
+    expect(actualValue('Gamma')).toBe('0.7'); expect(actualValue('Sharpness strength')).toBe('6');
+    expect(actualValue('Tone')).toBe('35'); expect(actualValue('Contrast')).toBe('-50');
+    fireEvent.click(screen.getByRole('button', { name: 'Med' }));
+    for (const label of Object.keys(centers)) expect(Number(slider(label).value)).toBeCloseTo(50);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ gamma: .5, sharpen: 3, windowCenter: neutral.windowCenter - neutral.windowWidth * .25 * .35, windowWidth: neutral.windowWidth * Math.SQRT2 }) })));
+  });
+  it('maps pointer slider positions back to real tone and contrast values', async () => {
+    render(<App />); await open();
+    setSlider('Tone', -30); setSlider('Contrast', 70);
+    expect(actualValue('Tone')).toBe('-30'); expect(actualValue('Contrast')).toBe('70');
+    fireEvent.change(slider('Tone'), { target: { value: '50' } }); fireEvent.blur(slider('Tone'));
+    fireEvent.change(slider('Contrast'), { target: { value: '50' } }); fireEvent.blur(slider('Contrast'));
+    expect(actualValue('Tone')).toBe('35'); expect(actualValue('Contrast')).toBe('-50');
+    fireEvent.change(slider('Sharpness strength'), { target: { value: '100' } }); fireEvent.blur(slider('Sharpness strength'));
+    expect(actualValue('Sharpness strength')).toBe('10');
+    fireEvent.change(slider('Sharpness strength'), { target: { value: '0' } }); fireEvent.blur(slider('Sharpness strength'));
+    expect(actualValue('Sharpness strength')).toBe('1');
+  });
+  it('steps centered sliders in actual units and commits a held keyboard adjustment once', async () => {
+    render(<App />); await open();
+    const gamma = slider('Gamma'); gamma.focus();
+    fireEvent.keyDown(gamma, { key: 'ArrowRight' }); fireEvent.keyDown(gamma, { key: 'ArrowRight', repeat: true }); fireEvent.keyUp(gamma, { key: 'ArrowRight' }); fireEvent.blur(gamma);
+    expect(actualValue('Gamma')).toBe('0.52'); expect(gamma.getAttribute('aria-valuetext')).toBe('0.52');
+    fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
+    expect(actualValue('Gamma')).toBe('0.5'); expect((screen.getByRole('button', { name: '↶ Undo' }) as HTMLButtonElement).disabled).toBe(true);
+    for (const [label, min, max, increment] of [['Gamma', .1, .9, .01], ['Tone', -100, 100, 1], ['Contrast', -100, 100, 1], ['Sharpness strength', 1, 10, .1]] as const) {
+      fireEvent.keyDown(slider(label), { key: 'Home' }); fireEvent.keyUp(slider(label), { key: 'Home' }); expect(Number(actualValue(label))).toBe(min);
+      fireEvent.keyDown(slider(label), { key: 'ArrowRight' }); fireEvent.keyUp(slider(label), { key: 'ArrowRight' }); expect(Number(actualValue(label))).toBeCloseTo(min + increment);
+      fireEvent.keyDown(slider(label), { key: 'End' }); fireEvent.keyUp(slider(label), { key: 'End' }); expect(Number(actualValue(label))).toBe(max);
+    }
+  });
+  it('uses polarity-aware preset tone for MONOCHROME1 sources', async () => {
+    customInvoke = (command, args) => command === 'import_image' ? Promise.resolve({ ...info(String(args.path)), metadata: { ...info(String(args.path)).metadata, photometric: 'MONOCHROME1' } }) : undefined;
+    render(<App />); await open();
+    expect(actualValue('Tone')).toBe('35');
+    fireEvent.click(screen.getByRole('button', { name: 'High' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ gamma: .7, sharpen: 6, windowCenter: neutral.windowCenter + neutral.windowWidth * .25 * .35 }) })));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('High');
   });
   it('shows the first enhanced image while subsequent imports are pending', async () => {
     openPaths = ['first.rvg', 'second.rvg'];
@@ -165,28 +225,28 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
   it('adjusts both drag axes from the snapshot and records one undo entry', async () => {
     render(<App />); await open();
     startDrag(); moveDrag(140, 80); moveDrag(180, 60);
-    expect(Number(slider('Gamma').value)).toBeCloseTo(.32);
-    expect(Number(slider('Tone').value)).toBeCloseTo(40);
+    expect(Number(actualValue('Gamma'))).toBeCloseTo(.6);
+    expect(Number(actualValue('Tone'))).toBeCloseTo(75);
     finishDrag();
     fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
-    expect(slider('Gamma').value).toBe('0.22'); expect(slider('Tone').value).toBe('0');
+    expect(actualValue('Gamma')).toBe('0.5'); expect(actualValue('Tone')).toBe('35');
     expect((screen.getByRole('button', { name: '↶ Undo' }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: '↷ Redo' }));
-    expect(slider('Gamma').value).toBe('0.32');
+    expect(actualValue('Gamma')).toBe('0.6');
   });
   it('bounds drag changes and commits cancellation exactly once', async () => {
     render(<App />); await open();
     startDrag(); moveDrag(10000, -10000);
-    expect(slider('Gamma').value).toBe('0.9'); expect(slider('Tone').value).toBe('100');
+    expect(actualValue('Gamma')).toBe('0.9'); expect(actualValue('Tone')).toBe('100');
     fireEvent.pointerCancel(screen.getByTestId('image-viewport'), { pointerId: 1 });
     fireEvent.lostPointerCapture(screen.getByTestId('image-viewport'), { pointerId: 1 });
     fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
-    expect(slider('Gamma').value).toBe('0.22');
+    expect(actualValue('Gamma')).toBe('0.5');
     expect((screen.getByRole('button', { name: '↶ Undo' }) as HTMLButtonElement).disabled).toBe(true);
   });
   it('does not create undo history for a click or zero-distance move', async () => {
     render(<App />); await open(); startDrag(); moveDrag(100, 100); finishDrag();
-    expect(slider('Gamma').value).toBe('0.22');
+    expect(actualValue('Gamma')).toBe('0.5');
     expect((screen.getByRole('button', { name: '↶ Undo' }) as HTMLButtonElement).disabled).toBe(true);
   });
   it('pans with Shift or middle drag without changing processing or history', async () => {
@@ -194,9 +254,9 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     const initialTransform = screen.getByAltText('Enhanced: first.rvg').getAttribute('style');
     startDrag({ shiftKey: true }); moveDrag(140, 120); finishDrag();
     expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).not.toBe(initialTransform);
-    expect(slider('Gamma').value).toBe('0.22'); expect(slider('Tone').value).toBe('0');
+    expect(actualValue('Gamma')).toBe('0.5'); expect(actualValue('Tone')).toBe('35');
     startDrag({ button: 1 }); moveDrag(200, 150); finishDrag();
-    expect(slider('Gamma').value).toBe('0.22');
+    expect(actualValue('Gamma')).toBe('0.5');
     expect((screen.getByRole('button', { name: '↶ Undo' }) as HTMLButtonElement).disabled).toBe(true);
   });
   it('updates during continuous adjustment and coalesces pending work behind a slow render', async () => {
@@ -210,7 +270,7 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('src')).toBe(result(pending[0].id, pending[0].requestId).url);
     expect(screen.getByText(/Updating · last completed image/)).toBeTruthy();
     await waitFor(() => expect(pending).toHaveLength(2));
-    expect(pending[1].recipe.gamma).toBeCloseTo(.52);
+    expect(pending[1].recipe.gamma).toBeCloseTo(.8);
     expect(pending[1].requestId).toBeGreaterThan(pending[0].requestId);
     finishDrag();
     await act(async () => pending[1].resolve(result(pending[1].id, pending[1].requestId)));
@@ -239,18 +299,18 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     await readyThumbnail('02 second.rvg');
     setSlider('Gamma', .72); setSlider('Sharpness strength', 9);
     fireEvent.click(screen.getByRole('button', { name: '02 second.rvg' }));
-    expect(slider('Gamma').value).toBe('0.22');
+    expect(actualValue('Gamma')).toBe('0.5');
     fireEvent.click(screen.getByRole('button', { name: '01 first.rvg' }));
-    expect(slider('Gamma').value).toBe('0.72');
+    expect(actualValue('Gamma')).toBe('0.72');
     fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
-    expect(slider('Gamma').value).toBe('0.22'); expect(slider('Sharpness strength').value).toBe('6');
+    expect(actualValue('Gamma')).toBe('0.5'); expect(actualValue('Sharpness strength')).toBe('3');
   });
   it('toggles false color without changing tone/detail and keeps a linear monochrome histogram', async () => {
     render(<App />); await open(); setSlider('Gamma', .33); setSlider('Tone', 30);
     fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
     expect(screen.getByLabelText('Local contrast color legend')).toBeTruthy();
-    expect(slider('Gamma').value).toBe('0.33'); expect(Number(slider('Tone').value)).toBeCloseTo(30); expect(slider('Sharpness strength').value).toBe('6');
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, gamma: .33, sharpen: 6 }) })));
+    expect(actualValue('Gamma')).toBe('0.33'); expect(Number(actualValue('Tone'))).toBeCloseTo(30); expect(actualValue('Sharpness strength')).toBe('3');
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, gamma: .33, sharpen: 3 }) })));
     const histogram = screen.getByRole('img', { name: /Monochrome intensity histogram.*linear count/ });
     expect(histogram.querySelector('path')?.getAttribute('d')).toContain('L85.33333333333333,59');
     expect(screen.getByText('Midtones')).toBeTruthy();
@@ -263,8 +323,8 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     render(<App />); await open();
     fireEvent.change(screen.getByLabelText('Apply saved preset'), { target: { value: 'Legacy' } });
     expect(screen.getByText(/Stored value 1.20 is outside 0.1–0.9/)).toBeTruthy();
-    expect(screen.getByText(/Stored value 0.70 is outside 5–10/)).toBeTruthy();
-    expect(slider('Gamma').max).toBe('0.9'); expect(slider('Sharpness strength').min).toBe('5');
+    expect(screen.getByText(/Stored value 0.70 is outside 1–10/)).toBeTruthy();
+    expect(slider('Gamma').getAttribute('aria-valuemax')).toBe('0.9'); expect(slider('Sharpness strength').getAttribute('aria-valuemin')).toBe('1');
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: legacy })));
     setSlider('Sharpness strength', 7);
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ version: 2, gamma: 1.2, sharpen: 7 }) })));
@@ -331,14 +391,14 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     expect(slider('Feature size').min).toBe('2'); expect(slider('Feature size').max).toBe('24');
     expect(screen.getByText('Color emphasizes local midtone differences. Flat areas and extremes stay grayscale.')).toBeTruthy();
     setSlider('Color amount', .42); setSlider('Feature size', 17);
-    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Bitewing');
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Med');
     fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
     expect(slider('Feature size').value).toBe('8'); expect(slider('Color amount').value).toBe('0.42');
     fireEvent.click(screen.getByRole('button', { name: '↷ Redo' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Detail' }));
+    fireEvent.click(screen.getByRole('button', { name: 'High' }));
     expect(slider('Feature size').value).toBe('17'); expect(slider('Color amount').value).toBe('0.42');
-    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Detail');
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, colorStrength: .42, colorScale: 17, sharpen: 8 }) })));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('High');
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, colorStrength: .42, colorScale: 17, sharpen: 6 }) })));
     fireEvent.click(screen.getByRole('button', { name: 'Export PNG' }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('export_image', expect.objectContaining({ recipe: expect.objectContaining({ colorStrength: .42, colorScale: 17 }) })));
     fireEvent.change(screen.getByLabelText('New preset name'), { target: { value: 'Local overlay' } });
@@ -368,18 +428,18 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     render(<App />); await open(); await readyThumbnail('02 second.rvg');
     fireEvent.change(screen.getByLabelText('Apply saved preset'), { target: { value: 'Legacy color' } });
     expect(slider('Color amount').value).toBe('0.8'); expect(slider('Feature size').value).toBe('8');
-    expect(slider('Gamma').value).toBe('0.55');
+    expect(actualValue('Gamma')).toBe('0.55');
     setSlider('Color amount', .37); setSlider('Feature size', 20);
     fireEvent.click(screen.getByRole('button', { name: '02 second.rvg' }));
     expect(screen.queryByRole('slider', { name: 'Color amount' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '01 first.rvg' }));
     expect(slider('Color amount').value).toBe('0.37'); expect(slider('Feature size').value).toBe('20');
-    expect(slider('Gamma').value).toBe('0.55');
+    expect(actualValue('Gamma')).toBe('0.55');
   });
   it('saves the visible recipe including false color', async () => {
     render(<App />); await open(); fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_review', expect.objectContaining({ review: expect.objectContaining({ images: [expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, gamma: .22, sharpen: 6 }) })] }) })));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_review', expect.objectContaining({ review: expect.objectContaining({ images: [expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, gamma: .5, sharpen: 3 }) })] }) })));
   });
 });
 
@@ -446,18 +506,18 @@ describe('pinned panes', () => {
   });
   it('activates passive panes without changing either recipe and isolates rotation/adjustments', async () => {
     openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg');
-    await pin('first.rvg'); selectThumbnail(2, 'second.rvg'); await pin('second.rvg'); setSlider('Gamma', .5);
+    await pin('first.rvg'); selectThumbnail(2, 'second.rvg'); await pin('second.rvg'); setSlider('Gamma', .65);
     const firstViewport = within(pane('first.rvg')).getByTestId('image-viewport');
     fireEvent.pointerDown(firstViewport, { button: 0, clientX: 100, clientY: 100, pointerId: 1 });
     fireEvent.pointerMove(firstViewport, { clientX: 200, clientY: 20, pointerId: 1 });
     fireEvent.pointerUp(firstViewport, { pointerId: 1 });
-    expect(slider('Gamma').value).toBe('0.22');
+    expect(actualValue('Gamma')).toBe('0.5');
     expect((screen.getByRole('button', { name: '↶ Undo' }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: 'Rotate 90 degrees clockwise' }));
     expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).toContain('rotate(90deg)');
     expect(screen.getByAltText('Enhanced: second.rvg').getAttribute('style')).toContain('rotate(0deg)');
     fireEvent.click(screen.getByRole('button', { name: 'Select image second.rvg' }));
-    expect(slider('Gamma').value).toBe('0.5');
+    expect(actualValue('Gamma')).toBe('0.65');
   });
   it('keeps pinned views beside a failed selected image and clears pins on patient replacement', async () => {
     openPaths = ['first.rvg', 'broken.rvg'];
@@ -526,5 +586,32 @@ describe('pending pin UI', () => {
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_review', expect.objectContaining({ review: expect.objectContaining({ images: [expect.objectContaining({ source: 'first.rvg', pinned: true, view: expect.objectContaining({ fit: true }) }), expect.objectContaining({ source: 'second.rvg', pinned: true, view: expect.objectContaining({ fit: false, scale: 1 }) })] }) })));
     const saved = mocks.invoke.mock.calls.find(([command]) => command === 'save_review')?.[1];
     expect(JSON.stringify(saved)).not.toContain('data:image');
+  });
+});
+
+describe('pane context gesture integration', () => {
+  it('rotates the clicked pane after the delay even if selection changes', async () => {
+    openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg'); await pin('first.rvg');
+    selectThumbnail(2, 'second.rvg'); await pin('second.rvg');
+    const viewport = within(pane('first.rvg')).getByTestId('image-viewport');
+    fireEvent.pointerDown(viewport, { button: 2, pointerId: 2, clientX: 60, clientY: 60 });
+    fireEvent.pointerUp(viewport, { button: 2, pointerId: 2, clientX: 60, clientY: 60 });
+    expect(pane('first.rvg').getAttribute('data-selected')).toBe('true');
+    fireEvent.click(screen.getByRole('button', { name: 'Select image second.rvg' }));
+    await waitFor(() => expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).toContain('rotate(90deg)'));
+    expect(screen.getByAltText('Enhanced: second.rvg').getAttribute('style')).toContain('rotate(0deg)');
+    expect(pane('second.rvg').getAttribute('data-selected')).toBe('true');
+  });
+  it('double right-click toggles the pin with no intermediate or delayed rotation', async () => {
+    render(<App />); await open();
+    const viewport = screen.getByTestId('image-viewport');
+    for (let i = 0; i < 2; i++) {
+      fireEvent.pointerDown(viewport, { button: 2, pointerId: 2, clientX: 60, clientY: 60 });
+      fireEvent.pointerUp(viewport, { button: 2, pointerId: 2, clientX: 60, clientY: 60 });
+    }
+    await screen.findByRole('button', { name: 'Unpin image first.rvg' });
+    await act(async () => new Promise(resolve => setTimeout(resolve, 450)));
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).toContain('rotate(0deg)');
+    expect(actualValue('Gamma')).toBe('0.5');
   });
 });

@@ -1,8 +1,75 @@
 import { describe, expect, it } from 'vitest';
-import { commit, contrastValue, dragAdjustment, experimentalPreset, formatImageDate, dateSourceLabel, orientedDimensions, redo, sameRecipe, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
+import { commit, contrastValue, dragAdjustment, experimentalPreset, formatImageDate, dateSourceLabel, orientedDimensions, redo, sameRecipe, sliderPosition, sliderValue, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
 import type { Recipe } from './model';
 
 const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, localContrast: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false, colorize: false };
+
+describe('Low, Med, and High adjustment presets', () => {
+  it('sets true relative tone and contrast from either the neutral or suggested base', () => {
+    const suggested = { ...neutral, windowCenter: 2800, windowWidth: 1400, gamma: .38 };
+    for (const base of [neutral, suggested]) {
+      const original = { ...base };
+      for (const [name, gamma, sharpen] of [['low', .3, 1], ['med', .5, 3], ['high', .7, 6]] as const) {
+        const preset = experimentalPreset(name, neutral, base);
+        expect(preset).toMatchObject({ version: 2, gamma, sharpen, localContrast: .4, radius: 2.2, threshold: .0015, halo: .35, denoise: 0, clahe: 0, detailMode: 'radiograph', colorize: false, colorStrength: .8, colorScale: 8 });
+        expect(toneValue(preset, base)).toBeCloseTo(35, 12);
+        expect(contrastValue(preset, base)).toBeCloseTo(-50, 12);
+        expect(preset.windowCenter).toBeCloseTo(base.windowCenter - base.windowWidth * .0875, 12);
+        expect(preset.windowWidth).toBeCloseTo(base.windowWidth * Math.SQRT2, 12);
+      }
+      expect(base).toEqual(original);
+    }
+    expect(experimentalPreset('med', neutral)).toEqual(experimentalPreset('med', neutral, neutral));
+    expect(experimentalPreset('neutral', neutral, suggested)).toEqual(neutral);
+  });
+  it('uses the supplied photometric polarity and inversion for the same positive tone', () => {
+    for (const photometric of ['MONOCHROME1', 'MONOCHROME2']) {
+      for (const invert of [false, true]) {
+        const base = { ...neutral, invert };
+        const preset = experimentalPreset('med', neutral, base, photometric);
+        const direction = (photometric === 'MONOCHROME1' ? -1 : 1) * (invert ? -1 : 1);
+        expect(toneValue(preset, base, photometric)).toBeCloseTo(35, 12);
+        expect(contrastValue(preset, base)).toBeCloseTo(-50, 12);
+        expect(Math.sign(base.windowCenter - preset.windowCenter)).toBe(direction);
+        expect(preset.invert).toBe(invert);
+      }
+    }
+  });
+});
+
+describe('slider positions centered on adjustment defaults', () => {
+  const ranges = [[.1, .5, .9], [-100, 35, 100], [-100, -50, 100], [1, 3, 10]] as const;
+  it('places each actual default at the center and preserves endpoints and bounds', () => {
+    for (const [min, middle, max] of ranges) {
+      expect(sliderPosition(min, min, middle, max)).toBe(0);
+      expect(sliderPosition(middle, min, middle, max)).toBe(50);
+      expect(sliderPosition(max, min, middle, max)).toBe(100);
+      expect(sliderValue(0, min, middle, max)).toBe(min);
+      expect(sliderValue(50, min, middle, max)).toBe(middle);
+      expect(sliderValue(100, min, middle, max)).toBe(max);
+      expect(sliderPosition(min - 100, min, middle, max)).toBe(0);
+      expect(sliderPosition(max + 100, min, middle, max)).toBe(100);
+      expect(sliderValue(-10, min, middle, max)).toBe(min);
+      expect(sliderValue(110, min, middle, max)).toBe(max);
+    }
+  });
+  it('is strictly monotonic and round-trips fractional values without quantizing', () => {
+    for (const [min, middle, max] of ranges) {
+      let previousPosition = -1, previousValue = min - 1;
+      for (let index = 0; index <= 1000; index++) {
+        const value = min + (max - min) * index / 1000;
+        const position = sliderPosition(value, min, middle, max);
+        expect(position).toBeGreaterThan(previousPosition);
+        expect(sliderValue(position, min, middle, max)).toBeCloseTo(value, 11);
+        const controlPosition = index / 10;
+        const actual = sliderValue(controlPosition, min, middle, max);
+        expect(actual).toBeGreaterThan(previousValue);
+        expect(sliderPosition(actual, min, middle, max)).toBeCloseTo(controlPosition, 11);
+        previousPosition = position; previousValue = actual;
+      }
+    }
+  });
+});
 describe('non-destructive per-image adjustment history', () => {
   it('maps source pixels to physical display pixels on HiDPI displays', () => {
     expect(sourcePixelScale(2)).toBe(.5);

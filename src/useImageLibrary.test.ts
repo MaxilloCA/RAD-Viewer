@@ -65,7 +65,7 @@ describe('bounded patient image library', () => {
     const lastRender = mocks.invoke.mock.calls.filter(([command]) => command === 'render_image').at(-1);
     expect(lastRender?.[1].recipe.gamma).toBe(.44);
     act(() => result.current.changeHistory(undo));
-    expect(result.current.entries[0].history!.present.gamma).toBe(.22);
+    expect(result.current.entries[0].history!.present.gamma).toBe(.5);
   });
   it('prioritizes a newly selected path after the in-flight background preview completes', async () => {
     let finish!: (value: ImageInfo) => void;
@@ -192,6 +192,17 @@ describe('bounded patient image library', () => {
     expect(result.current.entries[1].pinOrder).toBeUndefined();
     await act(async () => result.current.togglePin(later.key));
     expect(result.current.entries[1].pinOrder).toBeGreaterThan(order[0]);
+  });
+
+  it('rotates a specified pane independently of selection and defaults to the selected pane', async () => {
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    act(() => result.current.append(['first.rvg', 'second.rvg']));
+    await waitFor(() => expect(result.current.entries.every(entry => entry.image)).toBe(true));
+    act(() => result.current.rotate(result.current.entries[1].key));
+    expect(result.current.entries.map(entry => entry.rotationQuarterTurns)).toEqual([0, 1]);
+    act(() => result.current.rotate());
+    expect(result.current.entries.map(entry => entry.rotationQuarterTurns)).toEqual([1, 1]);
+    expect(result.current.entries[0].defaultRecipe).toMatchObject({ gamma: .5, sharpen: 3 });
   });
 
   it('rejects cancelled pin generations when the same entry is pinned again', async () => {

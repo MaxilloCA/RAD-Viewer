@@ -147,7 +147,7 @@ export function useImageLibrary(onError: (error: string) => void) {
           const info = await invoke<ImageInfo>('import_image', { path: target.path });
           importedId = info.id;
           if (!current()) { await release(info.id); continue; }
-          const defaultRecipe = target.defaultRecipe ?? experimentalPreset('bitewing', info.neutral, info.suggested);
+          const defaultRecipe = target.defaultRecipe ?? experimentalPreset('med', info.neutral, info.suggested, info.metadata.photometric);
           const history = target.history ?? { past: [], present: defaultRecipe, future: [] };
           const initial = await invoke<RenderInfo>('render_image', { id: info.id, recipe: history.present, requestId: nextRequest() });
           if (!current()) { await release(info.id); continue; }
@@ -208,8 +208,8 @@ export function useImageLibrary(onError: (error: string) => void) {
     select(entriesRef.current[0]?.key ?? null);
     await released;
   }, [cancelPin, release, select, update]);
-  const rotate = useCallback(() => {
-    update(previous => previous.map(entry => entry.key === selectedRef.current ? { ...entry, rotationQuarterTurns: (entry.rotationQuarterTurns + 1) % 4 } : entry));
+  const rotate = useCallback((key: string | null = selectedRef.current) => {
+    update(previous => previous.map(entry => entry.key === key ? { ...entry, rotationQuarterTurns: (entry.rotationQuarterTurns + 1) % 4 } : entry));
   }, [update]);
   useEffect(() => {
     alive.current = true;

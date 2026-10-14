@@ -20,10 +20,10 @@ export function paneGrid(count: number, width: number, height: number) {
   return best;
 }
 
-export default function ImagePane({ entry, render, view, setView, processing, onSize, pixelRatio, onAdjustStart, onAdjustMove, onAdjustEnd, badge, active, onSelect, onPin }: {
+export default function ImagePane({ entry, render, view, setView, processing, onSize, pixelRatio, onAdjustStart, onAdjustMove, onAdjustEnd, badge, active, onSelect, onPin, onRotate }: {
   entry: ImageEntry; render?: RenderInfo | null; view: PaneView; setView: Dispatch<SetStateAction<PaneView>>; processing: boolean;
   onSize: (key: string, width: number, height: number) => void; pixelRatio: number; badge: string; active: boolean;
-  onSelect: () => void; onPin: () => void;
+  onSelect: () => void; onPin: () => void; onRotate: () => void;
   onAdjustStart: () => void; onAdjustMove: (dx: number, dy: number) => void; onAdjustEnd: () => void;
 }) {
   const viewport = useRef<HTMLDivElement>(null);
@@ -31,6 +31,17 @@ export default function ImagePane({ entry, render, view, setView, processing, on
   const info = entry.details;
   const rotationQuarterTurns = entry.rotationQuarterTurns;
   const drag = useRef<{ pointerId: number; x: number; y: number; originalX: number; originalY: number; scale: number; mode: 'pan' | 'adjust' } | null>(null);
+  const rightPress = useRef<{ pointerId: number; x: number; y: number; moved: boolean } | null>(null);
+  const rightClick = useRef<{ timer: ReturnType<typeof setTimeout>; at: number; x: number; y: number; key: string } | null>(null);
+  const callbacks = useRef({ onSelect, onPin, onRotate });
+  callbacks.current = { onSelect, onPin, onRotate };
+  const cancelRightClick = () => {
+    if (rightClick.current) clearTimeout(rightClick.current.timer);
+    rightClick.current = null;
+  };
+  useEffect(() => () => {
+    cancelRightClick(); rightPress.current = null; drag.current = null;
+  }, [entry.key]);
   useEffect(() => {
     const element = viewport.current;
     if (!element) return;
@@ -45,6 +56,14 @@ export default function ImagePane({ entry, render, view, setView, processing, on
     <div ref={viewport} className="image-viewport enhanced-viewport" data-testid="image-viewport" tabIndex={active ? -1 : 0} aria-label={active ? undefined : `Activate ${entry.name}`} onKeyDown={event => { if (!active && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); onSelect(); } }}
       onContextMenu={event => event.preventDefault()} onWheel={event => { if (!active) { onSelect(); return; } setView(previous => ({ ...previous, fit: false, scale: clamp(previous.scale * Math.exp(-event.deltaY * .0015), .025, 8) })); }}
       onPointerDown={event => {
+        if (event.button === 2) {
+          event.preventDefault();
+          if (unavailable) return;
+          rightPress.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+          event.currentTarget.setPointerCapture(event.pointerId);
+          if (!active) callbacks.current.onSelect();
+          return;
+        }
         if (event.button !== 0 && event.button !== 1) return;
         event.preventDefault();
         if (!active) { onSelect(); return; }
@@ -54,12 +73,46 @@ export default function ImagePane({ entry, render, view, setView, processing, on
         drag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, originalX: view.x, originalY: view.y, scale: view.scale, mode };
         if (mode === 'adjust') onAdjustStart();
       }} onPointerMove={event => {
+        const right = rightPress.current;
+        if (right && event.pointerId === right.pointerId) {
+          if (Math.hypot(event.clientX - right.x, event.clientY - right.y) > 5) {
+            right.moved = true; cancelRightClick();
+          }
+          return;
+        }
         const origin = drag.current;
         if (!active || !origin || event.pointerId !== origin.pointerId) return;
         const dx = event.clientX - origin.x; const dy = event.clientY - origin.y;
         if (origin.mode === 'adjust') onAdjustMove(dx, dy);
         else setView(previous => ({ ...previous, fit: false, x: origin.originalX + dx / origin.scale, y: origin.originalY + dy / origin.scale }));
-      }} onPointerUp={finish} onPointerCancel={finish} onLostPointerCapture={finish} onDoubleClick={() => { if (!active) { onSelect(); return; } setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); }}>
+      }} onPointerUp={event => {
+        const right = rightPress.current;
+        if (right && event.pointerId === right.pointerId && event.button === 2) {
+          event.preventDefault(); rightPress.current = null;
+          if (right.moved || Math.hypot(event.clientX - right.x, event.clientY - right.y) > 5) { cancelRightClick(); return; }
+          const previous = rightClick.current;
+          if (previous && previous.key === entry.key && Date.now() - previous.at <= 400 && Math.hypot(event.clientX - previous.x, event.clientY - previous.y) <= 8) {
+            cancelRightClick(); callbacks.current.onPin();
+          } else {
+            // A distinct click does not silently replace an earlier single click.
+            if (previous) { cancelRightClick(); callbacks.current.onRotate(); }
+            const click = { at: Date.now(), x: event.clientX, y: event.clientY, key: entry.key, timer: setTimeout(() => {
+              if (rightClick.current !== click) return;
+              rightClick.current = null; callbacks.current.onRotate();
+            }, 400) };
+            rightClick.current = click;
+          }
+          return;
+        }
+        if (drag.current?.pointerId === event.pointerId) finish();
+      }} onPointerCancel={event => {
+        if (rightPress.current?.pointerId === event.pointerId) { rightPress.current = null; cancelRightClick(); }
+        if (drag.current?.pointerId === event.pointerId) finish();
+      }} onLostPointerCapture={event => {
+        // Normal capture release follows pointerup; keep its deferred click.
+        if (rightPress.current?.pointerId === event.pointerId) { rightPress.current = null; cancelRightClick(); }
+        if (drag.current?.pointerId === event.pointerId) finish();
+      }} onDoubleClick={event => { if (event.button !== 0) return; if (!active) { onSelect(); return; } setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); }}>
       {info && render ? <img src={render.url} alt={`Enhanced: ${info.metadata.name}`} draggable={false} onError={() => setFailedUrl(render.url)} style={{ width: info.width, height: info.height, visibility: failedUrl === render.url ? 'hidden' : 'visible', imageRendering: view.scale * pixelRatio >= 1 ? 'pixelated' : 'auto', transform: `translate(-50%, -50%) translate(${view.x * view.scale}px, ${view.y * view.scale}px) scale(${view.scale}) rotate(${rotationQuarterTurns * 90}deg)` }} /> : <div className="pane-placeholder"><strong>{entry.error ? 'Image unavailable' : 'Preparing your image…'}</strong>{entry.error && <><span>{entry.error}</span><button onClick={onSelect}>Retry image</button></>}</div>}
       {render && failedUrl === render.url && <div className="image-load-error" role="alert"><strong>Image display failed</strong><span>The rendered image could not be loaded. Try reopening this image.</span></div>}
       {entry.pinError && <div className="pin-error" role="status" title={entry.pinError}>{active ? 'Pinned copy update failed' : 'Pinned image update failed · showing previous settings'}</div>}

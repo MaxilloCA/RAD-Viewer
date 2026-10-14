@@ -55,6 +55,16 @@ export const dateSourceLabel = (source?: string | null): string => ({ Acquisitio
 const recipeKeys: (keyof Recipe)[] = ['version', 'windowCenter', 'windowWidth', 'gamma', 'denoise', 'localContrast', 'clahe', 'sharpen', 'radius', 'threshold', 'halo', 'detailMode', 'invert'];
 export const sameRecipe = (a: Recipe, b: Recipe) => recipeKeys.every(key => a[key] === b[key]) && Boolean(a.colorize) === Boolean(b.colorize) && (a.colorStrength ?? .8) === (b.colorStrength ?? .8) && (a.colorScale ?? 8) === (b.colorScale ?? 8);
 export const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+/** Map actual values to slider positions, with the chosen default at the center. */
+export function sliderPosition(value: number, min: number, middle: number, max: number): number {
+  const bounded = clamp(value, min, max);
+  return bounded <= middle ? 50 * (bounded - min) / (middle - min) : 50 + 50 * (bounded - middle) / (max - middle);
+}
+/** Preserve actual-value precision; any input step rounding belongs to the control. */
+export function sliderValue(position: number, min: number, middle: number, max: number): number {
+  const bounded = clamp(position, 0, 100);
+  return bounded <= 50 ? min + bounded / 50 * (middle - min) : middle + (bounded - 50) / 50 * (max - middle);
+}
 const toneDirection = (recipe: Recipe, photometric: string) => (photometric === 'MONOCHROME1' ? -1 : 1) * (recipe.invert ? -1 : 1);
 export const toneValue = (recipe: Recipe, base: Recipe, photometric = 'MONOCHROME2') => (base.windowCenter - recipe.windowCenter) / (base.windowWidth * .25) * 100 * toneDirection(recipe, photometric);
 export const contrastValue = (recipe: Recipe, base: Recipe) => 100 * Math.log2(base.windowWidth / recipe.windowWidth);
@@ -81,9 +91,18 @@ export function redo(history: History): History {
   if (!history.future.length) return history;
   return { past: [...history.past, history.present], present: history.future[0], future: history.future.slice(1) };
 }
-export function experimentalPreset(name: string, neutral: Recipe, suggested: Recipe = neutral): Recipe {
+export function experimentalPreset(name: string, neutral: Recipe, suggested: Recipe = neutral, photometric = 'MONOCHROME2'): Recipe {
   const enhanced = { ...suggested, version: 2, detailMode: 'radiograph', denoise: 0, clahe: 0, colorize: false, colorStrength: .8, colorScale: 8 };
   switch (name) {
+    case 'low':
+    case 'med':
+    case 'high': {
+      const gamma = name === 'low' ? .3 : name === 'high' ? .7 : .5;
+      const sharpen = name === 'low' ? 1 : name === 'high' ? 6 : 3;
+      const preset = { ...enhanced, gamma, localContrast: .4, sharpen, radius: 2.2, threshold: .0015, halo: .35 };
+      return withTone(withContrast(preset, suggested, -50), suggested, 35, photometric);
+    }
+    // Retain the previous helper names for callers restoring earlier presets.
     case 'bitewing': return { ...enhanced, gamma: .22, localContrast: 0.4, sharpen: 6, radius: 2.2, threshold: 0.0015, halo: 0.35 };
     case 'detail': return { ...enhanced, gamma: .22, localContrast: 0.35, sharpen: 8, radius: 2.5, threshold: 0.001, halo: 0.35 };
     default: return { ...neutral };

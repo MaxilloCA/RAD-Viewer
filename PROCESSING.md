@@ -1,5 +1,13 @@
 # Versioned radiograph processing
 
+## 0.3.7 defaults and centered controls
+
+The user's new import/Reset default is Gamma0.5, relative Tone35, relative Contrast−50 and Sharpness3. Tone remains a center offset against the original base window; Contrast remains a logarithmic width adjustment. Thus for non-inverted MONOCHROME2, the initial center is `baseCenter − 0.0875 × baseWidth` and width is `sqrt(2) × baseWidth` (subject to the existing minimum width1). MONOCHROME1 reverses the center-offset direction. Displayed Tone/Contrast values retain their old meaning.
+
+Low, Med and High use gamma/sharpness pairs 0.3/1, 0.5/3 and 0.7/6. All share Tone35, Contrast−50, localContrast0.4, radiograph detail, radius2.2, threshold0.0015 and halo0.35, with denoise/CLAHE disabled. Preset selection preserves current Colorize settings; import/Reset defaults Colorize off. No core processing algorithm or saved recipe is changed.
+
+The slider coordinate is separate from the recipe value: minimum→default occupies the left half, default→maximum the right half. This places each requested default in the middle while preserving gamma0.1–0.9, tone/contrast−100…100 and sharpness1–10. Keyboard steps and readouts remain in actual control units. The historical defaults below are superseded.
+
 ## 0.3.5 selective local Colorize
 
 The global intensity palette described in historical sections below is replaced by a spatial color overlay. It selects coherent local differences within displayed midtones rather than assigning color to every pixel with the same brightness. Original grayscale processing, histogram, clipping and source data are unchanged. This is an experimental viewing aid, not tissue segmentation or a validated diagnostic map.

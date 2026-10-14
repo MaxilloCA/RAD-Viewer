@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
-import { clamp, commit, contrastValue, dateSourceLabel, dragAdjustment, experimentalPreset, formatImageDate, orientedDimensions, redo, sameRecipe, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
+import { clamp, commit, contrastValue, dateSourceLabel, dragAdjustment, experimentalPreset, formatImageDate, orientedDimensions, redo, sameRecipe, sliderPosition, sliderValue, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
 import type { CustomPreset, History, ImageEntry, PatientDiscovery, Recipe, RenderInfo } from './model';
 import { useRenderedImage } from './useRenderedImage';
 import { useImageLibrary } from './useImageLibrary';
@@ -11,7 +11,7 @@ import type { PaneView } from './ImagePane';
 
 const desktop = isTauri();
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
-const presetOptions = [['bitewing', 'Bitewing'], ['detail', 'Detail']] as const;
+const presetOptions = [['low', 'Low'], ['med', 'Med'], ['high', 'High']] as const;
 type View = PaneView;
 
 function PatientOpenDialog({ onClose, onOpen }: { onClose: () => void; onOpen: (patient: PatientDiscovery) => Promise<void> }) {
@@ -72,13 +72,28 @@ function Histogram({ render, pixels }: { render: RenderInfo; pixels: number }) {
 }
 
 
-function Slider({ label, value, min, max, step = .01, onChange, onCommit, endpoints, formatValue }: {
-  label: string; value: number; min: number; max: number; step?: number;
+function Slider({ label, value, min, max, step = .01, center, onChange, onCommit, endpoints, formatValue }: {
+  label: string; value: number; min: number; max: number; step?: number; center?: number;
   onChange: (value: number) => void; onCommit: () => void; endpoints?: [string, string]; formatValue?: (value: number) => string;
 }) {
   const decimals = step >= 1 ? 0 : step >= .01 ? 2 : step >= .001 ? 3 : 4;
-  return <label className="slider-control"><span>{label}<output>{formatValue ? formatValue(value) : value.toFixed(decimals)}</output></span>
-    <input type="range" min={min} max={max} step={step} value={clamp(value, min, max)} aria-label={label} aria-valuetext={formatValue?.(value)} onChange={event => onChange(Number(event.target.value))} onPointerUp={onCommit} onPointerCancel={onCommit} onKeyUp={onCommit} onBlur={onCommit} />
+  const display = formatValue ? formatValue(value) : value.toFixed(decimals);
+  const snap = (actual: number) => Number(clamp(min + Math.round((actual - min) / step) * step, min, max).toFixed(decimals));
+  const centered = center !== undefined;
+  return <label className="slider-control"><span>{label}<output>{display}</output></span>
+    <span className={`slider-track ${centered ? 'centered' : ''}`}>
+      {centered && <span className="slider-center-tick" aria-hidden="true" />}
+      <input type="range" min={centered ? 0 : min} max={centered ? 100 : max} step={centered ? 'any' : step} value={centered ? sliderPosition(value, min, center, max) : clamp(value, min, max)} aria-label={label}
+        aria-valuemin={min} aria-valuemax={max} aria-valuenow={value} aria-valuetext={display}
+        onChange={event => onChange(centered ? snap(sliderValue(Number(event.target.value), min, center, max)) : Number(event.target.value))}
+        onKeyDown={event => {
+          if (!centered) return;
+          const changes: Record<string, number> = { ArrowRight: step, ArrowUp: step, ArrowLeft: -step, ArrowDown: -step, PageUp: step * 10, PageDown: -step * 10 };
+          if (event.key === 'Home' || event.key === 'End' || event.key in changes) {
+            event.preventDefault(); onChange(event.key === 'Home' ? min : event.key === 'End' ? max : snap(value + changes[event.key]));
+          }
+        }} onPointerUp={onCommit} onPointerCancel={onCommit} onKeyUp={onCommit} onBlur={onCommit} />
+    </span>
     {endpoints && <span className="slider-endpoints"><span>{endpoints[0]}</span><span>{endpoints[1]}</span></span>}
     {(value < min || value > max) && <span className="stored-value-note">Stored value {value.toFixed(decimals)} is outside {min}–{max}. Adjusting this slider selects a new value in that range.</span>}
   </label>;
@@ -110,7 +125,7 @@ export default function App() {
   const recipeRef = useRef(recipe); recipeRef.current = recipe;
   const dragRecipe = useRef<{ id: string; start: Recipe; base: Recipe; photometric: string } | null>(null);
   const { rendered, processing } = useRenderedImage(active, recipe, setError);
-  const currentPreset = active && recipe ? presetOptions.find(([key]) => sameRecipe({ ...recipe, colorize: false, colorStrength: .8, colorScale: 8 }, experimentalPreset(key, active.info.neutral, active.info.suggested)))?.[1]
+  const currentPreset = active && recipe ? presetOptions.find(([key]) => sameRecipe({ ...recipe, colorize: false, colorStrength: .8, colorScale: 8 }, experimentalPreset(key, active.info.neutral, active.info.suggested, active.info.metadata.photometric)))?.[1]
     ?? presets.find(preset => sameRecipe(recipe, preset.recipe))?.name ?? 'Custom adjustments' : null;
   const onPaneSize = useCallback((key: string, width: number, height: number) => setPaneSizes(previous => previous[key]?.width === width && previous[key]?.height === height ? previous : { ...previous, [key]: { width, height } }), []);
   const viewFor = (entry: ImageEntry): View => {
@@ -228,7 +243,7 @@ export default function App() {
     setDraft(null); draftRef.current = null; dragRecipe.current = null;
     await closeLibraryImage();
   };
-  const range = (key: keyof Recipe, label: string, min: number, max: number, step?: number) => recipe && <Slider label={label} value={recipe[key] as number} min={min} max={max} step={step} onChange={value => changeValue(key, value)} onCommit={commitDraft} />;
+  const range = (key: keyof Recipe, label: string, min: number, max: number, step?: number, center?: number) => recipe && <Slider label={label} center={center} value={recipe[key] as number} min={min} max={max} step={step} onChange={value => changeValue(key, value)} onCommit={commitDraft} />;
 
   return <main className="app-shell"><header className="app-header">
     <div className="brand"><span className="brand-symbol" aria-hidden="true">R</span><div><strong>RAD <span>Viewer</span></strong><small>RADIOGRAPH VIEWER</small></div></div>
@@ -246,22 +261,22 @@ export default function App() {
           const paneRender = isActive ? rendered ?? entry.pinnedRender : entry.pinnedRender;
           return <ImagePane key={entry.key} entry={entry} render={paneRender} active={isActive} view={viewFor(entry)} setView={update => updatePaneView(entry, update)} processing={(isActive && processing) || Boolean(entry.pinPending)} onSize={onPaneSize} pixelRatio={pixelRatio}
             badge={isActive ? `${currentPreset ?? 'Enhanced'}${recipe?.colorize ? ' · Local color' : ''}` : 'Enhanced'}
-            onSelect={() => activateImage(entry.key)} onPin={() => { if (isActive) commitDraft(); void togglePin(entry.key); }}
+            onSelect={() => activateImage(entry.key)} onRotate={() => { if (isActive) commitDraft(); rotateImage(entry.key); updatePaneView(entry, previous => ({ ...previous, fit: true, x: 0, y: 0 })); }} onPin={() => { if (isActive) commitDraft(); void togglePin(entry.key); }}
             onAdjustStart={() => { if (isActive && activeRef.current && recipeRef.current) dragRecipe.current = { id: activeRef.current.info.id, start: recipeRef.current, base: activeRef.current.info.suggested ?? activeRef.current.info.neutral, photometric: activeRef.current.info.metadata.photometric }; }}
             onAdjustMove={(dx, dy) => { const snapshot = dragRecipe.current; if (isActive && snapshot && snapshot.id === activeRef.current?.info.id) updateDraft(dragAdjustment(snapshot.start, snapshot.base, dx, dy, snapshot.photometric)); }}
             onAdjustEnd={() => { const snapshot = dragRecipe.current; dragRecipe.current = null; if (isActive && snapshot?.id === activeRef.current?.info.id) commitDraft(); }} />;
         })}
       </div> : <div className="empty-workspace"><div className="empty-frame"><span /><span /><span /><span /><svg width="64" height="64" viewBox="0 0 64 64" aria-hidden="true"><path d="M17 13h30v38H17zM25 24h14M25 32h14M25 40h8" /></svg></div><h1>Open a radiograph.</h1><p>Review enhanced images with responsive tone and detail controls, processed on this computer.</p><button className="primary" onClick={() => void chooseImages()} disabled={!desktop}>Open radiographs</button><span className="supported-formats">RVG · PANO · SC · DICOM · PNG · JPEG</span></div>}
-      <div className="workspace-help"><span>{loading ? <><span className="spinner" /> {loading}</> : active ? 'Drag ↑↓ gamma · Drag ←→ tone · Shift-drag or middle-drag to pan · Scroll to zoom' : 'Drop radiographs anywhere in the desktop window'}</span>{activeEntry && <button className="text-button" onClick={() => void closeImage()}>Close selected</button>}</div>
+      <div className="workspace-help"><span>{loading ? <><span className="spinner" /> {loading}</> : active ? 'Drag ↑↓ gamma · Drag ←→ tone · Shift/middle drag pans · Scroll zooms · Right-click rotates · Double right-click pins' : 'Drop radiographs anywhere in the desktop window'}</span>{activeEntry && <button className="text-button" onClick={() => void closeImage()}>Close selected</button>}</div>
       <div className="filmstrip" aria-label="Open images">{images.map((image, index) => <button key={image.key} aria-label={`${String(index + 1).padStart(2, '0')} ${image.name}`} aria-describedby={`date-${image.key}`} className={`thumbnail ${selected === image.key ? 'selected' : ''}`} title={image.error ?? image.path} onClick={() => activateImage(image.key)} aria-pressed={selected === image.key}>{image.thumbnail ? <span className={`thumbnail-image ${image.rotationQuarterTurns % 2 ? 'quarter-turned' : ''}`}><img src={image.thumbnail} alt="" style={{ transform: `translate(-50%, -50%) rotate(${image.rotationQuarterTurns * 90}deg)` }} /></span> : <span className="thumbnail-placeholder" aria-hidden="true">{image.error ? 'Unavailable' : 'Loading…'}</span>}<span className="thumbnail-number">{String(index + 1).padStart(2, '0')}</span>{image.pinned && <span className="thumbnail-pin" aria-label="Pinned">◆</span>}<span className="thumbnail-name">{image.name}</span><time id={`date-${image.key}`} className="thumbnail-date" title={dateSourceLabel(image.details?.metadata.dateSource)}>{formatImageDate(image.details?.metadata.imageDate)}</time></button>)}<button className="add-thumbnail" onClick={() => void chooseImages()} disabled={!desktop}><span>＋</span>{images.length ? 'Add images' : 'Open images'}</button></div>
     </div><aside className="adjustments"><div className="panel-title"><h2>Adjustments</h2><span>NON-DESTRUCTIVE</span></div><fieldset disabled={!active} className="adjustment-fields">
       <div className="history-tools"><button disabled={!active?.history.past.length} title="Undo (Ctrl+Z)" onClick={() => changeHistory(undo)}>↶ Undo</button><button disabled={!active?.history.future.length} title="Redo (Ctrl+Y)" onClick={() => changeHistory(redo)}>↷ Redo</button><button onClick={() => active && applyRecipe(active.defaultRecipe)}>Reset</button></div>
-      <div className="section-label">PROCESSING PRESET <span>Experimental</span></div><div className="preset-grid">{presetOptions.map(([key, label]) => <button key={key} className={currentPreset === label ? 'active' : ''} onClick={() => active && applyRecipe({ ...experimentalPreset(key, active.info.neutral, active.info.suggested), colorize: Boolean(recipe?.colorize), colorStrength: recipe?.colorStrength ?? .8, colorScale: recipe?.colorScale ?? 8 })}>{label}</button>)}</div>
+      <div className="section-label">PROCESSING PRESET <span>Experimental</span></div><div className="preset-grid">{presetOptions.map(([key, label]) => <button key={key} className={currentPreset === label ? 'active' : ''} onClick={() => active && applyRecipe({ ...experimentalPreset(key, active.info.neutral, active.info.suggested, active.info.metadata.photometric), colorize: Boolean(recipe?.colorize), colorStrength: recipe?.colorStrength ?? .8, colorScale: recipe?.colorScale ?? 8 })}>{label}</button>)}</div>
       {currentPreset && <div className="current-recipe" aria-label="Current processing preset"><span>Current: <strong>{currentPreset}</strong></span><span>v{recipe?.version}</span></div>}
-      {recipe && base ? <><div className="section-label">TONE & CONTRAST</div>{range('gamma', 'Gamma', .1, .9)}
-        <Slider label="Tone" value={toneValue(recipe, base, photometric)} min={-100} max={100} step={1} endpoints={['Darker', 'Lighter']} onChange={value => updateDraft(withTone(recipe, base, value, photometric))} onCommit={commitDraft} />
-        <Slider label="Contrast" value={contrastValue(recipe, base)} min={-100} max={100} step={1} endpoints={['Softer', 'Stronger']} onChange={value => updateDraft(withContrast(recipe, base, value))} onCommit={commitDraft} />
-        <div className="section-label">DETAIL</div>{range('sharpen', 'Sharpness strength', 5, 10, .1)}
+      {recipe && base ? <><div className="section-label">TONE & CONTRAST</div>{range('gamma', 'Gamma', .1, .9, .01, .5)}
+        <Slider label="Tone" center={35} value={toneValue(recipe, base, photometric)} min={-100} max={100} step={1} endpoints={['Darker', 'Lighter']} onChange={value => updateDraft(withTone(recipe, base, value, photometric))} onCommit={commitDraft} />
+        <Slider label="Contrast" center={-50} value={contrastValue(recipe, base)} min={-100} max={100} step={1} endpoints={['Softer', 'Stronger']} onChange={value => updateDraft(withContrast(recipe, base, value))} onCommit={commitDraft} />
+        <div className="section-label">DETAIL</div>{range('sharpen', 'Sharpness strength', 1, 10, .1, 3)}
         <button className={`colorize-button ${recipe.colorize ? 'active' : ''}`} aria-pressed={Boolean(recipe.colorize)} onClick={() => applyRecipe({ ...recipe, colorize: !recipe.colorize, colorStrength: recipe.colorStrength ?? .8, colorScale: recipe.colorScale ?? 8, version: 2 })}>Colorize <span>{recipe.colorize ? 'On' : 'Off'}</span></button>
         {recipe.colorize && <div className="local-color-controls">
           <Slider label="Color amount" formatValue={value => `${Math.round(value * 100)}%`} value={recipe.colorStrength ?? .8} min={0} max={1} step={.01} onChange={value => changeValue('colorStrength', value)} onCommit={commitDraft} />
