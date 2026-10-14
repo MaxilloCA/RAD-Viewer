@@ -1,0 +1,21 @@
+[package]
+name = "rad-viewer"
+version = "0.1.0"
+edition = "2021"
+description = "Local radiograph comparison viewer"
+
+[build-dependencies]
+tauri-build = { version = "=2.7.2", features = [] }
+
+[dependencies]
+tauri = { version = "=2.12.3", features = [] }
+rad-core = { path = "../crates/rad-core" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+image = { version = "=0.25.8", default-features = false, features = ["png"] }
+rfd = "=0.15.4"
+tokio = { version = "=1.53.3", features = ["sync"] }
+uuid = { version = "=1.28.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "=3.23.0"
