@@ -2,6 +2,29 @@
 
 Offline Windows radiograph viewer built with Rust, Tauri 2, React and TypeScript.
 
+## Processing levels and Open Dental launch
+
+Processing level has seven discrete stops, from least to most sharpening, contrast, local contrast and adaptive contrast. New images and Reset start at level 4 (gamma 0.5, tone 35, contrast -50, sharpness 6). Changing levels preserves tone, gamma, inversion, noise reduction and Colorize settings. Drag up/down on an image for gamma and left/right for tone. Manual processing adjustments show Custom with the nearest slider stop.
+
+During adjustment, the viewer uses a small, explicitly labeled interactive preview for faster feedback. Releasing the mouse restores full-resolution detail with the final settings. Pins and PNG exports always use the full-resolution source.
+
+In Open Dental, use **Setup → Program Links → Add** for a custom bridge:
+
+- Description / button text: `RAD Viewer`
+- Path of file to open: `\\server\APPS\RAD-Viewer\rad-viewer.exe`
+- Optional command line arguments: `--patnum [PatNum]`
+- Enable the bridge and select its toolbar.
+
+The executable path must match the actual Windows share. The supplied patient number must match the ABELDent patient folder ID. A complete Windows command is:
+
+```text
+"\\server\APPS\RAD-Viewer\rad-viewer.exe" --patnum 67751
+```
+
+Local equivalent: `"D:\APPS\RAD-Viewer\rad-viewer.exe" --patnum 67751`. Do not append `?patnum=` directly to the executable filename. `--patnum=67751` also works. No arguments opens an empty viewer; invalid arguments show an error. Every launch creates a separate process/window. Launching with an ID uses the same XML lookup and automatic latest-two display as Open patient. Patient name and ID appear beside RAD Viewer in the top bar.
+
+Sources: [Open Dental Program Links](https://www.opendental.com/manual/programlinks.html), [Custom Bridges](https://www.opendental.com/manual/bridgecustom.html). Configuration within Open Dental and execution from another LAN workstation require verification on that workstation.
+
 This delivery is the **Phase A image-quality comparison prototype**. The project handoff requires the user's Carestream comparison approval before implementing the mounting workspace, annotations, session relinking and printing. The experimental presets are independently implemented and are not replicas of Carestream filters. No image-quality acceptance is inferred from automated tests.
 
 ## Build and run (Windows x64)
@@ -36,9 +59,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ## View and adjust images
 
-New imports and **Reset** use **Med**: Gamma **0.50**, Tone **35**, Contrast **−50**, Sharpness **6**. Each default sits at the midpoint of its slider. Gamma spans 0.1–0.9, Tone and Contrast retain their existing −100…100 scales, and Sharpness spans 1–10. The two halves of each slider are scaled separately where needed; displayed values and saved recipes retain their actual meaning. Arrow keys adjust by the displayed control's step.
+New imports and **Reset** use **level 4**: Gamma **0.50**, Tone **35**, Contrast **−50**, Sharpness **6**. Each default sits at the midpoint of its slider. Gamma spans 0.1–0.9, Tone and Contrast retain their existing −100…100 scales, and Sharpness spans 1–10. The two halves of each slider are scaled separately where needed; displayed values and saved recipes retain their actual meaning. Arrow keys adjust by the displayed control's step.
 
-The **Low / Med / High** buttons increase enhancement: Low uses gamma 0.70, Tone 45, Contrast -75 and sharpness 3; Med uses gamma 0.50, Tone 35, Contrast -50 and sharpness 6; High uses gamma 0.22, Tone 0, Contrast 0 and sharpness 8. Lower gamma darkens the image in this pipeline. High has the strongest global/local contrast and sharpening; Low is the mildest. Med restores the earlier sharpening parameters. Colorize settings are retained when choosing a preset. Existing saved recipes keep their exact values until edited.
+The **Processing level** slider replaces Low / Med / High. Its seven stops change detail and contrast without changing tone or gamma. Colorize settings are retained when changing levels. Existing saved recipes keep their exact values until edited.
 
 **Right-click an image** to rotate it 90° clockwise. **Double-right-click** to toggle its thumbtack hold without rotating it. Single-right-click rotation waits briefly to distinguish the double-click gesture. The Rotate and thumbtack buttons remain available. Left-double-click still fits the image.
 

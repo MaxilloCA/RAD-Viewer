@@ -12,7 +12,15 @@ use std::{
 };
 use tauri::{Manager, State};
 use tokio::sync::Semaphore;
+mod launch;
 mod patient;
+
+struct LaunchPatientNumber(Result<Option<String>, String>);
+
+#[tauri::command]
+fn launch_patient_number(state: State<'_, LaunchPatientNumber>) -> Result<Option<String>, String> {
+    state.0.clone()
+}
 
 struct Entry {
     source: Arc<SourceImage>,
@@ -64,6 +72,7 @@ struct RenderInfo {
     clipped_low: u32,
     clipped_high: u32,
     render_ms: f64,
+    preview: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct CustomPreset {
@@ -139,10 +148,7 @@ fn pick_radiographs(directory: Option<&Path>) -> Vec<String> {
 }
 
 fn patient_directory(root: &Path, patient_number: &str) -> Result<PathBuf, String> {
-    let number = patient_number.trim();
-    if !(2..=64).contains(&number.len()) || !number.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("Enter a patient number containing 2–64 digits only.".into());
-    }
+    let number = launch::validate_patient_number(patient_number)?;
     // Keep the identifier as text so leading zeros are preserved. ASCII-only
     // validation also prevents separators or traversal from becoming path parts.
     Ok(root.join(&number[number.len() - 2..]).join(number))
@@ -267,6 +273,7 @@ async fn render_image(
     id: String,
     recipe: Recipe,
     request_id: u64,
+    preview: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<RenderInfo, String> {
     let (source, processor) = {
@@ -279,17 +286,23 @@ async fn render_image(
         (entry.source.clone(), entry.processor.clone())
     };
     let recipe_key = serde_json::to_string(&recipe).map_err(|e| e.to_string())?;
-    let key = format!("{id}:{recipe_key}");
+    let preview = preview.unwrap_or(false);
+    let key = format!("{id}:{preview}:{recipe_key}");
     if let Some(cached) = state.renders.lock().unwrap().get_mut(&key) {
         cached.info.request_id = request_id;
         return Ok(cached.info.clone());
     }
     let (mut processor, permit) = processing_slot(&state, &id, request_id, processor).await?;
-    let neutral = serde_json::to_string(&Recipe::neutral(&source)).unwrap() == recipe_key;
+    let neutral =
+        !preview && serde_json::to_string(&Recipe::neutral(&source)).unwrap() == recipe_key;
     let (bytes, render, elapsed) = tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
         let start = Instant::now();
-        let render = processor.process(&recipe)?;
+        let render = if preview {
+            processor.process_preview(&recipe)?
+        } else {
+            processor.process(&recipe)?
+        };
         let bytes = png(&render)?;
         Ok::<_, String>((bytes, render, start.elapsed().as_secs_f64() * 1000.0))
     })
@@ -308,19 +321,10 @@ async fn render_image(
         clipped_low: render.clipped_low,
         clipped_high: render.clipped_high,
         render_ms: elapsed,
+        preview,
     };
     let mut cache = state.renders.lock().unwrap();
-    // Keep a pinned neutral baseline and the two most recent adjusted versions per source.
-    let mut old: Vec<_> = cache
-        .iter()
-        .filter(|(_, c)| c.image_id == id && !c.neutral)
-        .map(|(k, c)| (k.clone(), c.info.request_id))
-        .collect();
-    old.sort_by_key(|(_, r)| *r);
-    let remove_count = old.len().saturating_sub(1);
-    for (k, _) in old.into_iter().take(remove_count) {
-        cache.remove(&k);
-    }
+    prune_render_cache(&mut cache, &id, preview);
     cache.insert(
         key,
         Cached {
@@ -331,6 +335,21 @@ async fn render_image(
         },
     );
     Ok(info)
+}
+
+/// Preview frames cannot evict a full-resolution URL still displayed by the UI.
+/// Retain the previous and current frame in each tier while browsers fetch PNGs.
+fn prune_render_cache(cache: &mut HashMap<String, Cached>, id: &str, preview: bool) {
+    let mut old: Vec<_> = cache
+        .iter()
+        .filter(|(_, c)| c.image_id == id && !c.neutral && c.info.preview == preview)
+        .map(|(k, c)| (k.clone(), c.info.request_id))
+        .collect();
+    old.sort_by_key(|(_, r)| *r);
+    let remove_count = old.len().saturating_sub(1);
+    for (k, _) in old.into_iter().take(remove_count) {
+        cache.remove(&k);
+    }
 }
 
 async fn processing_slot(
@@ -397,6 +416,7 @@ async fn render_snapshot(
             clipped_low: render.clipped_low,
             clipped_high: render.clipped_high,
             render_ms: start.elapsed().as_secs_f64() * 1000.0,
+            preview: false,
         })
     })
     .await
@@ -598,6 +618,9 @@ async fn save_review(
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .manage(LaunchPatientNumber(launch::parse_patient_number(
+            std::env::args_os().skip(1),
+        )))
         .register_uri_scheme_protocol("rad", |context, request| {
             let token = request.uri().path().trim_start_matches('/');
             let state = context.app_handle().state::<AppState>();
@@ -619,6 +642,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             choose_images,
+            launch_patient_number,
             open_patient,
             choose_reference,
             import_image,
@@ -798,6 +822,51 @@ mod tests {
         let result = image::load_from_memory(&bytes).unwrap();
         assert_eq!((result.width(), result.height()), (120, 60));
     }
+    #[test]
+    fn repeated_previews_retain_full_resolution_and_other_image_urls() {
+        let mut cache = HashMap::new();
+        let add = |cache: &mut HashMap<String, Cached>, id: &str, request_id, preview, neutral| {
+            prune_render_cache(cache, id, preview);
+            let key = format!("{id}:{request_id}");
+            cache.insert(
+                key.clone(),
+                Cached {
+                    bytes: vec![1],
+                    info: RenderInfo {
+                        id: id.into(),
+                        request_id,
+                        url: key,
+                        histogram: vec![1],
+                        clipped_low: 0,
+                        clipped_high: 0,
+                        render_ms: 1.0,
+                        preview,
+                    },
+                    image_id: id.into(),
+                    neutral,
+                },
+            );
+        };
+        add(&mut cache, "one", 0, false, true);
+        add(&mut cache, "one", 1, false, false);
+        add(&mut cache, "other", 2, false, false);
+        for request in 3..20 {
+            add(&mut cache, "one", request, true, false);
+        }
+        assert!(cache.contains_key("one:0"));
+        assert!(cache.contains_key("one:1"));
+        assert!(cache.contains_key("other:2"));
+        assert_eq!(cache.values().filter(|c| c.info.preview).count(), 2);
+        add(&mut cache, "one", 20, false, false);
+        assert!(cache.contains_key("one:1"));
+        assert!(cache.contains_key("one:19"));
+        add(&mut cache, "one", 21, false, false);
+        assert!(!cache.contains_key("one:1"));
+        assert!(cache.contains_key("one:0"));
+        assert!(cache.contains_key("one:20"));
+        assert!(cache.contains_key("one:21"));
+    }
+
     #[test]
     fn encoded_png_preserves_final_pixels() {
         let render = rad_core::RenderedImage {

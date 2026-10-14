@@ -1,5 +1,12 @@
 # Phase A integration contract
 
+## Version 0.3.10 additions
+
+- Processing levels 1–7 change sharpness, window width (contrast), local contrast and CLAHE, with fixed radiograph detail scale 2.2, threshold 0.0015 and halo suppression 0.35. They preserve window center (tone), gamma, inversion, denoise and Colorize parameters. New imports/Reset use level 4; manual processing changes show Custom with the nearest stop. Adjustment history remains per-image.
+- Launch arguments are separate from the executable path: `--patnum 67751` or `--patnum=67751`. IDs remain strings, preserve leading zeros and must contain 2–64 ASCII digits. Duplicate, missing and unrecognized arguments fail visibly. Each process has independent image/recipe state; no singleton forwarding. Launch lookup follows the same XML discovery and latest-pair behavior as manual Open patient. Delayed startup lookup cannot override a manual selection.
+- Draft adjustments request explicitly approximate previews bounded to 384 pixels on the longest edge. Samples are averaged in floating point; reduced previews never replace original pixels or full-resolution pin/export renders. Releasing the adjustment requests the exact final recipe at original resolution. A single in-flight frontend render coalesces pending changes; no fixed 100 ms delay. Preview labels identify the temporary image and histogram percentages use its sample count.
+
+
 ## 0.3.9 color DICOM import as grayscale
 
 Supported single-frame unsigned 8-bit color DICOM is decoded to display RGB and converted to Rec.709-weighted floating-point grayscale during import. The resulting SourceImage has color=None, photometric MONOCHROME2, identity modality and explicit full-range neutral VOI center128/width256. File name, image date and DICOM format identity remain available. IPC shapes and processing recipes are unchanged; patient scanning, thumbnails, pins, controls and export use the existing grayscale pipeline. Original files are never rewritten. See verification/DECODING.md for supported transfer syntaxes and restrictions.

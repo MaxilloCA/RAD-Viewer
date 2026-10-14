@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "rad-viewer"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "base64 0.22.1",
  "chrono",

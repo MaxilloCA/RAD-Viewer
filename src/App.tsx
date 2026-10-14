@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
-import { clamp, commit, contrastValue, dateSourceLabel, dragAdjustment, experimentalPreset, formatImageDate, orientedDimensions, redo, sameRecipe, sliderPosition, sliderValue, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
+import { clamp, commit, contrastValue, dateSourceLabel, dragAdjustment, processingLevel, withProcessingLevel, formatImageDate, orientedDimensions, redo, sameRecipe, sliderPosition, sliderValue, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
 import type { CustomPreset, History, ImageEntry, PatientDiscovery, Recipe, RenderInfo } from './model';
 import { useRenderedImage } from './useRenderedImage';
 import { useImageLibrary } from './useImageLibrary';
@@ -11,7 +11,6 @@ import type { PaneView } from './ImagePane';
 
 const desktop = isTauri();
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
-const presetOptions = [['low', 'Low'], ['med', 'Med'], ['high', 'High']] as const;
 type View = PaneView;
 
 function PatientOpenDialog({ onClose, onOpen }: { onClose: () => void; onOpen: (patient: PatientDiscovery) => Promise<void> }) {
@@ -66,6 +65,7 @@ function PatientOpenDialog({ onClose, onOpen }: { onClose: () => void; onOpen: (
 }
 
 function Histogram({ render, pixels }: { render: RenderInfo; pixels: number }) {
+  if (render.preview) pixels = Math.max(1, render.histogram.reduce((sum, value) => sum + value, 0));
   const maximum = Math.max(1, ...render.histogram);
   const path = render.histogram.map((value, index) => `${index === 0 ? 'M' : 'L'}${index / Math.max(1, render.histogram.length - 1) * 256},${78 - value / maximum * 76}`).join(' ');
   return <div className="histogram"><svg viewBox="0 0 256 80" preserveAspectRatio="none" role="img" aria-label="Monochrome intensity histogram before false color, linear count scale"><path d={`${path} L256,80 L0,80 Z`} /></svg><div className="histogram-tonal-strip" /><div className="histogram-scale"><span>Black</span><span>Midtones</span><span>White</span></div><div className="clipping"><span>Black <b>{(render.clippedLow / pixels * 100).toFixed(2)}%</b></span><span>White <b>{(render.clippedHigh / pixels * 100).toFixed(2)}%</b></span></div></div>;
@@ -110,12 +110,16 @@ export default function App() {
   const [advanced, setAdvanced] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [patientDialogOpen, setPatientDialogOpen] = useState(false);
+  const [currentPatient, setCurrentPatient] = useState<PatientDiscovery | null>(null);
+  const [launchBusy, setLaunchBusy] = useState(false);
+  const startupCancelled = useRef(false);
   const [paneViews, setPaneViews] = useState<Record<string, View>>({});
   const gridRef = useRef<HTMLDivElement>(null);
   const [gridSize, setGridSize] = useState({ width: 1000, height: 600 });
   const [pixelRatio, setPixelRatio] = useState(window.devicePixelRatio || 1);
   const [paneSizes, setPaneSizes] = useState<Record<string, { width: number; height: number }>>({});
   const activeEntry = images.find(image => image.key === selected);
+  const headerPatient = activeEntry?.patient ?? (images.length === 0 ? currentPatient : null);
   const active = activeEntry?.image;
   const rotationQuarterTurns = activeEntry?.rotationQuarterTurns ?? 0;
   const recipe = draft ?? active?.history.present;
@@ -124,9 +128,9 @@ export default function App() {
   const activeRef = useRef(active); activeRef.current = active;
   const recipeRef = useRef(recipe); recipeRef.current = recipe;
   const dragRecipe = useRef<{ id: string; start: Recipe; base: Recipe; photometric: string } | null>(null);
-  const { rendered, processing } = useRenderedImage(active, recipe, setError);
-  const currentPreset = active && recipe ? presetOptions.find(([key]) => sameRecipe({ ...recipe, colorize: false, colorStrength: .8, colorScale: 8 }, experimentalPreset(key, active.info.neutral, active.info.suggested, active.info.metadata.photometric)))?.[1]
-    ?? presets.find(preset => sameRecipe(recipe, preset.recipe))?.name ?? 'Custom adjustments' : null;
+  const { rendered, processing } = useRenderedImage(active, recipe, setError, Boolean(draft));
+  const level = recipe && base ? processingLevel(recipe, base) : null;
+  const currentPreset = level ? (level.exact ? `Level ${level.level}` : presets.find(preset => sameRecipe(recipe!, preset.recipe))?.name ?? 'Custom adjustments') : null;
   const onPaneSize = useCallback((key: string, width: number, height: number) => setPaneSizes(previous => previous[key]?.width === width && previous[key]?.height === height ? previous : { ...previous, [key]: { width, height } }), []);
   const viewFor = (entry: ImageEntry): View => {
     const stored = paneViews[entry.key] ?? defaultPaneView;
@@ -177,16 +181,36 @@ export default function App() {
 
   const importPaths = useCallback(async (paths: string[]) => {
     if (!paths.length) return;
+    startupCancelled.current = true; setCurrentPatient(null);
     if (draftRef.current) { const value = draftRef.current; updateHistory(history => commit(history, value)); }
     setError(null); setDraft(null); draftRef.current = null; dragRecipe.current = null;
     appendImages(paths);
   }, [appendImages, updateHistory]);
-  const openPatient = async (patient: PatientDiscovery) => {
+  const openPatient = useCallback(async (patient: PatientDiscovery) => {
+    setCurrentPatient(patient);
     setError(null); setDraft(null); draftRef.current = null; dragRecipe.current = null;
     setPaneViews({}); setPaneSizes({});
     await replaceImages(patient.paths, { patientNumber: patient.patientNumber, patientName: patient.patientName, directory: patient.directory });
     setNotice(patient.warnings.length ? patient.warnings.join('\n') : null);
-  };
+  }, [replaceImages]);
+  useEffect(() => {
+    if (!desktop) return;
+    let cancelled = false;
+    const available = () => !cancelled && !startupCancelled.current;
+    void (async () => {
+      try {
+        const number = await invoke<string | null>('launch_patient_number');
+        if (!number || !available()) return;
+        setLaunchBusy(true);
+        setCurrentPatient({ patientNumber: number, patientName: null, directory: '', paths: [], warnings: [] });
+        const patient = await invoke<PatientDiscovery>('open_patient', { patientNumber: number });
+        if (!available()) return;
+        await openPatient(patient);
+      } catch (problem) { if (available()) setError(`Could not open launch patient: ${message(problem)}`); }
+      finally { if (!cancelled) setLaunchBusy(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [openPatient]);
   useEffect(() => {
     if (!desktop) return;
     let stop: (() => void) | undefined; let cancelled = false;
@@ -247,9 +271,9 @@ export default function App() {
   };
   const range = (key: keyof Recipe, label: string, min: number, max: number, step?: number, center?: number) => recipe && <Slider label={label} center={center} value={recipe[key] as number} min={min} max={max} step={step} onChange={value => changeValue(key, value)} onCommit={commitDraft} />;
 
-  return <main className="app-shell" onPointerDownCapture={event => { if (!(event.target as HTMLElement).closest('.pin-button')) cancelAutoPair(); }} onKeyDownCapture={event => { if (!(event.target as HTMLElement).closest('.pin-button')) cancelAutoPair(); }} onWheelCapture={cancelAutoPair}><header className="app-header">
+  return <main className="app-shell" onPointerDownCapture={event => { startupCancelled.current = true; if (!(event.target as HTMLElement).closest('.pin-button')) cancelAutoPair(); }} onKeyDownCapture={event => { startupCancelled.current = true; if (!(event.target as HTMLElement).closest('.pin-button')) cancelAutoPair(); }} onWheelCapture={cancelAutoPair}><header className="app-header">
     <div className="brand"><span className="brand-symbol" aria-hidden="true">R</span><div><strong>RAD <span>Viewer</span></strong><small>RADIOGRAPH VIEWER</small></div></div>
-    <div className="header-divider" />{activeEntry?.patient ? <div className="patient-identity" aria-label="Current patient"><strong>{activeEntry.patient.patientName || 'Name unavailable'}</strong><small>Patient {activeEntry.patient.patientNumber}</small></div> : <div className="header-context"><span className="status-dot" />Local processing<small>Original files preserved</small></div>}
+    <div className="header-divider" />{headerPatient ? <div className="patient-identity" aria-label="Current patient"><strong title={headerPatient.patientName || 'Name unavailable'}>{headerPatient.patientName || (launchBusy ? 'Loading patient…' : 'Name unavailable')}</strong><small>Patient ID <b>{headerPatient.patientNumber}</b></small></div> : <div className="header-context"><span className="status-dot" />Local processing<small>Original files preserved</small></div>}
     <div className="header-actions"><button onClick={() => void saveReview()} disabled={!active}>Save settings</button><button onClick={() => void exportImage()} disabled={!active}>Export PNG</button><button onClick={() => setPatientDialogOpen(true)} disabled={!desktop}>Open patient</button><button className="primary" onClick={() => void chooseImages()} disabled={!desktop}>＋ Open images</button></div></header>
     {!desktop && <div className="browser-banner"><strong>Desktop application required.</strong> Open RAD Viewer to import local radiographs and use the Rust processing engine. This browser view is the interface only.</div>}
     {error && <div role="alert" className="notice error"><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
@@ -269,11 +293,16 @@ export default function App() {
             onAdjustEnd={() => { const snapshot = dragRecipe.current; dragRecipe.current = null; if (isActive && snapshot?.id === activeRef.current?.info.id) commitDraft(); }} />;
         })}
       </div> : <div className="empty-workspace"><div className="empty-frame"><span /><span /><span /><span /><svg width="64" height="64" viewBox="0 0 64 64" aria-hidden="true"><path d="M17 13h30v38H17zM25 24h14M25 32h14M25 40h8" /></svg></div><h1>Open a radiograph.</h1><p>Review enhanced images with responsive tone and detail controls, processed on this computer.</p><button className="primary" onClick={() => void chooseImages()} disabled={!desktop}>Open radiographs</button><span className="supported-formats">RVG · PANO · SC · DICOM · PNG · JPEG</span></div>}
-      <div className="workspace-help"><span>{loading ? <><span className="spinner" /> {loading}</> : active ? 'Drag ↑↓ gamma · Drag ←→ tone · Shift/middle drag pans · Scroll zooms · Right-click rotates · Double right-click pins' : 'Drop radiographs anywhere in the desktop window'}</span>{activeEntry && <button className="text-button" onClick={() => void closeImage()}>Close selected</button>}</div>
+      <div className="workspace-help"><span>{launchBusy ? <><span className="spinner" /> Finding patient radiographs…</> : loading ? <><span className="spinner" /> {loading}</> : active ? 'Drag ↑↓ gamma · Drag ←→ tone · Shift/middle drag pans · Scroll zooms · Right-click rotates · Double right-click pins' : 'Drop radiographs anywhere in the desktop window'}</span>{activeEntry && <button className="text-button" onClick={() => void closeImage()}>Close selected</button>}</div>
       <div className="filmstrip" aria-label="Open images">{images.map((image, index) => <button key={image.key} aria-label={`${String(index + 1).padStart(2, '0')} ${image.name}`} aria-describedby={`date-${image.key}`} className={`thumbnail ${selected === image.key ? 'selected' : ''}`} title={image.error ?? image.path} onClick={() => activateImage(image.key)} aria-pressed={selected === image.key}>{image.thumbnail ? <span className={`thumbnail-image ${image.rotationQuarterTurns % 2 ? 'quarter-turned' : ''}`}><img src={image.thumbnail} alt="" style={{ transform: `translate(-50%, -50%) rotate(${image.rotationQuarterTurns * 90}deg)` }} /></span> : <span className="thumbnail-placeholder" aria-hidden="true">{image.error ? 'Unavailable' : 'Loading…'}</span>}<span className="thumbnail-number">{String(index + 1).padStart(2, '0')}</span>{image.pinned && <span className="thumbnail-pin" aria-label="Pinned">◆</span>}<span className="thumbnail-name">{image.name}</span><time id={`date-${image.key}`} className="thumbnail-date" title={dateSourceLabel(image.details?.metadata.dateSource)}>{formatImageDate(image.details?.metadata.imageDate)}</time></button>)}<button className="add-thumbnail" onClick={() => void chooseImages()} disabled={!desktop}><span>＋</span>{images.length ? 'Add images' : 'Open images'}</button></div>
     </div><aside className="adjustments"><div className="panel-title"><h2>Adjustments</h2><span>NON-DESTRUCTIVE</span></div><fieldset disabled={!active} className="adjustment-fields">
       <div className="history-tools"><button disabled={!active?.history.past.length} title="Undo (Ctrl+Z)" onClick={() => changeHistory(undo)}>↶ Undo</button><button disabled={!active?.history.future.length} title="Redo (Ctrl+Y)" onClick={() => changeHistory(redo)}>↷ Redo</button><button onClick={() => active && applyRecipe(active.defaultRecipe)}>Reset</button></div>
-      <div className="section-label">PROCESSING PRESET <span>Experimental</span></div><div className="preset-grid">{presetOptions.map(([key, label]) => <button key={key} className={currentPreset === label ? 'active' : ''} onClick={() => active && applyRecipe({ ...experimentalPreset(key, active.info.neutral, active.info.suggested, active.info.metadata.photometric), colorize: Boolean(recipe?.colorize), colorStrength: recipe?.colorStrength ?? .8, colorScale: recipe?.colorScale ?? 8 })}>{label}</button>)}</div>
+      <div className="section-label">PROCESSING LEVEL</div>
+      {recipe && base && level && <div className="processing-level">
+        <Slider label="Processing level" value={level.level} min={1} max={7} step={1} formatValue={value => level.exact ? `${value} / 7` : `Custom · near ${value}`} endpoints={['Least processing', 'Most processing']} onChange={value => updateDraft(withProcessingLevel(recipe, base, value))} onCommit={commitDraft} />
+        <div className="processing-stops" aria-hidden="true">{[1, 2, 3, 4, 5, 6, 7].map(stop => <span key={stop} className={level.exact && level.level === stop ? 'active' : ''}>{stop}</span>)}</div>
+        <p className="control-note">Sharpness, contrast and adaptive contrast. Drag each image to adjust tone and gamma independently.</p>
+      </div>}
       {currentPreset && <div className="current-recipe" aria-label="Current processing preset"><span>Current: <strong>{currentPreset}</strong></span><span>v{recipe?.version}</span></div>}
       {recipe && base ? <><div className="section-label">TONE & CONTRAST</div>{range('gamma', 'Gamma', .1, .9, .01, .5)}
         <Slider label="Tone" center={35} value={toneValue(recipe, base, photometric)} min={-100} max={100} step={1} endpoints={['Darker', 'Lighter']} onChange={value => updateDraft(withTone(recipe, base, value, photometric))} onCommit={commitDraft} />

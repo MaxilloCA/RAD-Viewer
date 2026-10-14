@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { StrictMode } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { sliderPosition } from './model';
@@ -75,6 +76,37 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     expect(screen.getByLabelText('Current patient').textContent).toContain('Example Person');
     expect(screen.getByLabelText('Current patient').textContent).toContain('0067589');
     expect(mocks.invoke).toHaveBeenCalledWith('release_image', { id: 'first.rvg' });
+  });
+  it('opens a launch patient once under StrictMode and automatically shows the latest pair', async () => {
+    customInvoke = command => command === 'launch_patient_number' ? Promise.resolve('0067589') : command === 'open_patient' ? Promise.resolve(patient(['new.rvg', 'older.rvg'], '0067589')) : undefined;
+    render(<StrictMode><App /></StrictMode>);
+    await screen.findByAltText('Enhanced: older.rvg');
+    expect(screen.getByAltText('Enhanced: new.rvg')).toBeTruthy();
+    expect(screen.getByLabelText('Current patient').textContent).toContain('Patient ID 0067589');
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === 'open_patient')).toHaveLength(1);
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+  it('reports bad launch arguments and missing patients without opening a picker', async () => {
+    customInvoke = command => command === 'launch_patient_number' ? Promise.reject('Invalid patient number') : undefined;
+    render(<App />);
+    await screen.findByText('Could not open launch patient: Invalid patient number');
+    expect(mocks.invoke.mock.calls.some(([command]) => command === 'choose_images')).toBe(false);
+  });
+  it('keeps the launch patient identity visible when no radiographs are found', async () => {
+    customInvoke = command => command === 'launch_patient_number' ? Promise.resolve('0067589') : command === 'open_patient' ? Promise.resolve(patient([], '0067589')) : undefined;
+    render(<App />);
+    await screen.findByText('Could not open launch patient: No radiographs were found for this patient.');
+    expect(screen.getByLabelText('Current patient').textContent).toContain('Example Person');
+    expect(screen.getByLabelText('Current patient').textContent).toContain('0067589');
+  });
+  it('does not let delayed launch discovery replace manually selected images', async () => {
+    let finish!: (value: PatientDiscovery) => void;
+    customInvoke = command => command === 'launch_patient_number' ? Promise.resolve('0067589') : command === 'open_patient' ? new Promise(resolve => { finish = resolve; }) : undefined;
+    render(<App />); await waitFor(() => expect(finish).toBeTruthy());
+    await open();
+    await act(async () => finish(patient(['late.rvg'])));
+    expect(screen.getByAltText('Enhanced: first.rvg')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '01 late.rvg' })).toBeNull();
   });
   it('rejects invalid patient numbers without calling patient discovery', () => {
     render(<App />); fireEvent.click(screen.getByRole('button', { name: 'Open patient' }));
@@ -159,25 +191,28 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     expect(actualValue('Tone')).toBe('35'); expect(actualValue('Contrast')).toBe('-50');
     expect(screen.queryByRole('slider', { name: 'Window center' })).toBeNull();
   });
-  it('centers the main controls at their actual defaults and applies Low, Med, High presets', async () => {
+  it('uses seven processing stops without changing tone, gamma or color and groups undo', async () => {
     render(<App />); await open();
     for (const [label, middle] of Object.entries(centers)) {
       expect(Number(slider(label).value)).toBeCloseTo(50);
       expect(Number(slider(label).getAttribute('aria-valuenow'))).toBeCloseTo(middle);
-      expect(slider(label).closest('label')?.querySelector('.slider-center-tick')).toBeTruthy();
     }
-    expect(screen.queryByRole('button', { name: 'Bitewing' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Detail' })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'Low' }));
-    expect(actualValue('Gamma')).toBe('0.7'); expect(actualValue('Sharpness strength')).toBe('3');
-    expect(actualValue('Tone')).toBe('45'); expect(actualValue('Contrast')).toBe('-75');
-    expect(Number(slider('Gamma').value)).toBeCloseTo(75); expect(Number(slider('Sharpness strength').value)).toBe(20);
-    fireEvent.click(screen.getByRole('button', { name: 'High' }));
-    expect(actualValue('Gamma')).toBe('0.22'); expect(actualValue('Sharpness strength')).toBe('8');
-    expect(actualValue('Tone')).toBe('0'); expect(actualValue('Contrast')).toBe('0');
-    fireEvent.click(screen.getByRole('button', { name: 'Med' }));
-    for (const label of Object.keys(centers)) expect(Number(slider(label).value)).toBeCloseTo(50);
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ gamma: .5, sharpen: 6, windowCenter: neutral.windowCenter - neutral.windowWidth * .25 * .35, windowWidth: neutral.windowWidth * Math.SQRT2 }) })));
+    for (const name of ['Low', 'Med', 'High']) expect(screen.queryByRole('button', { name })).toBeNull();
+    expect(slider('Processing level').min).toBe('1'); expect(slider('Processing level').max).toBe('7'); expect(slider('Processing level').step).toBe('1');
+    expect(actualValue('Processing level')).toBe('4');
+    setSlider('Gamma', .63); setSlider('Tone', -24);
+    const level = slider('Processing level');
+    for (const stop of [1, 2, 3, 5, 6, 7]) fireEvent.change(level, { target: { value: String(stop) } });
+    fireEvent.pointerUp(level); fireEvent.blur(level);
+    expect(actualValue('Gamma')).toBe('0.63'); expect(actualValue('Tone')).toBe('-24');
+    expect(actualValue('Sharpness strength')).toBe('10'); expect(actualValue('Contrast')).toBe('15');
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Level 7');
+    fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
+    expect(actualValue('Processing level')).toBe('4'); expect(actualValue('Gamma')).toBe('0.63'); expect(actualValue('Tone')).toBe('-24');
+    startDrag(); moveDrag(120, 80); finishDrag();
+    expect(actualValue('Processing level')).toBe('4');
+    setSlider('Sharpness strength', 9.1);
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Custom adjustments');
   });
   it('maps pointer slider positions back to real tone and contrast values', async () => {
     render(<App />); await open();
@@ -208,9 +243,9 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     customInvoke = (command, args) => command === 'import_image' ? Promise.resolve({ ...info(String(args.path)), metadata: { ...info(String(args.path)).metadata, photometric: 'MONOCHROME1' } }) : undefined;
     render(<App />); await open();
     expect(actualValue('Tone')).toBe('35');
-    fireEvent.click(screen.getByRole('button', { name: 'High' }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ gamma: .22, sharpen: 8, windowCenter: neutral.windowCenter }) })));
-    expect(screen.getByLabelText('Current processing preset').textContent).toContain('High');
+    setSlider('Processing level', 7);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ gamma: .5, sharpen: 10, windowCenter: neutral.windowCenter + neutral.windowWidth * .25 * .35 }) })));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Level 7');
   });
   it('shows the first enhanced image while subsequent imports are pending', async () => {
     openPaths = ['first.rvg', 'second.rvg'];
@@ -259,22 +294,25 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     expect(actualValue('Gamma')).toBe('0.5');
     expect((screen.getByRole('button', { name: '↶ Undo' }) as HTMLButtonElement).disabled).toBe(true);
   });
-  it('updates during continuous adjustment and coalesces pending work behind a slow render', async () => {
-    const pending: { recipe: Recipe; id: string; requestId: number; resolve: (value: RenderInfo) => void }[] = [];
+  it('uses preview during continuous adjustment, coalesces work and refines on release', async () => {
+    const pending: { recipe: Recipe; id: string; requestId: number; preview: boolean; resolve: (value: RenderInfo) => void }[] = [];
     render(<App />); await open();
-    customInvoke = (command, args) => command === 'render_image' ? new Promise(resolve => pending.push({ recipe: args.recipe as Recipe, id: String(args.id), requestId: Number(args.requestId), resolve })) : undefined;
+    customInvoke = (command, args) => command === 'render_image' ? new Promise(resolve => pending.push({ recipe: args.recipe as Recipe, id: String(args.id), requestId: Number(args.requestId), preview: Boolean(args.preview), resolve })) : undefined;
+    const complete = async (index: number) => act(async () => { const work = pending[index]; work.resolve({ ...result(work.id, work.requestId), preview: work.preview }); });
     startDrag(); moveDrag(100, 60); await waitFor(() => expect(pending).toHaveLength(1));
     moveDrag(100, 20); moveDrag(100, -20);
-    expect(pending).toHaveLength(1);
-    await act(async () => pending[0].resolve(result(pending[0].id, pending[0].requestId)));
+    expect(pending).toHaveLength(1); expect(pending[0].preview).toBe(true);
+    await complete(0);
     expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('src')).toBe(result(pending[0].id, pending[0].requestId).url);
-    expect(screen.getByText(/Updating · last completed image/)).toBeTruthy();
+    expect(screen.getByText(/Interactive preview/)).toBeTruthy();
     await waitFor(() => expect(pending).toHaveLength(2));
     expect(pending[1].recipe.gamma).toBeCloseTo(.8);
-    expect(pending[1].requestId).toBeGreaterThan(pending[0].requestId);
-    finishDrag();
-    await act(async () => pending[1].resolve(result(pending[1].id, pending[1].requestId)));
-    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('src')).toBe(result(pending[1].id, pending[1].requestId).url);
+    finishDrag(); await complete(1);
+    await waitFor(() => expect(pending).toHaveLength(3));
+    expect(pending[2].preview).toBe(false); expect(pending[2].recipe.gamma).toBeCloseTo(.8);
+    await complete(2);
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('src')).toBe(result(pending[2].id, pending[2].requestId).url);
+    expect(screen.queryByText(/Interactive preview/)).toBeNull();
     expect(screen.queryByText(/Updating · last completed image/)).toBeNull();
   });
   it('never displays an old source completion after switching or closing', async () => {
@@ -391,14 +429,14 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     expect(slider('Feature size').min).toBe('2'); expect(slider('Feature size').max).toBe('24');
     expect(screen.getByText('Color emphasizes local midtone differences. Flat areas and extremes stay grayscale.')).toBeTruthy();
     setSlider('Color amount', .42); setSlider('Feature size', 17);
-    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Med');
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Level 4');
     fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
     expect(slider('Feature size').value).toBe('8'); expect(slider('Color amount').value).toBe('0.42');
     fireEvent.click(screen.getByRole('button', { name: '↷ Redo' }));
-    fireEvent.click(screen.getByRole('button', { name: 'High' }));
+    setSlider('Processing level', 7);
     expect(slider('Feature size').value).toBe('17'); expect(slider('Color amount').value).toBe('0.42');
-    expect(screen.getByLabelText('Current processing preset').textContent).toContain('High');
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, colorStrength: .42, colorScale: 17, sharpen: 8 }) })));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Level 7');
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, colorStrength: .42, colorScale: 17, sharpen: 10 }) })));
     fireEvent.click(screen.getByRole('button', { name: 'Export PNG' }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('export_image', expect.objectContaining({ recipe: expect.objectContaining({ colorStrength: .42, colorScale: 17 }) })));
     fireEvent.change(screen.getByLabelText('New preset name'), { target: { value: 'Local overlay' } });

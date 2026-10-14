@@ -27,7 +27,7 @@ export interface ImageInfo {
 }
 export interface RenderInfo {
   id: string; requestId: number; url: string; histogram: number[];
-  clippedLow: number; clippedHigh: number; renderMs: number;
+  clippedLow: number; clippedHigh: number; renderMs: number; preview?: boolean;
 }
 export interface History { past: Recipe[]; present: Recipe; future: Recipe[] }
 export interface OpenImage { info: ImageInfo; path: string; initial: RenderInfo; defaultRecipe: Recipe; history: History }
@@ -70,6 +70,31 @@ export const toneValue = (recipe: Recipe, base: Recipe, photometric = 'MONOCHROM
 export const contrastValue = (recipe: Recipe, base: Recipe) => 100 * Math.log2(base.windowWidth / recipe.windowWidth);
 export const withTone = (recipe: Recipe, base: Recipe, tone: number, photometric = 'MONOCHROME2'): Recipe => ({ ...recipe, windowCenter: base.windowCenter - clamp(tone, -100, 100) / 100 * base.windowWidth * .25 * toneDirection(recipe, photometric) });
 export const withContrast = (recipe: Recipe, base: Recipe, contrast: number): Recipe => ({ ...recipe, windowWidth: Math.max(1, base.windowWidth * 2 ** (-clamp(contrast, -100, 100) / 100)) });
+/** Discrete processing only: never change the per-image tone, gamma or color settings. */
+export const processingLevels = [
+  { sharpen: 1, contrast: -85, localContrast: 0, clahe: 0 },
+  { sharpen: 2.5, contrast: -75, localContrast: .12, clahe: .04 },
+  { sharpen: 4, contrast: -62.5, localContrast: .26, clahe: .08 },
+  { sharpen: 6, contrast: -50, localContrast: .4, clahe: .12 },
+  { sharpen: 7, contrast: -30, localContrast: .5, clahe: .18 },
+  { sharpen: 8.5, contrast: -10, localContrast: .6, clahe: .24 },
+  { sharpen: 10, contrast: 15, localContrast: .7, clahe: .3 },
+] as const;
+export function withProcessingLevel(recipe: Recipe, base: Recipe, level: number): Recipe {
+  const { contrast, ...detail } = processingLevels[clamp(Math.round(level), 1, 7) - 1];
+  return withContrast({ ...recipe, ...detail, version: 2, detailMode: 'radiograph', radius: 2.2, threshold: .0015, halo: .35 }, base, contrast);
+}
+export function processingLevel(recipe: Recipe, base: Recipe): { level: number; exact: boolean } {
+  const distances = processingLevels.map((_, index) => {
+    const candidate = withProcessingLevel(recipe, base, index + 1);
+    return Math.abs(contrastValue(recipe, base) - contrastValue(candidate, base)) / 100
+      + Math.abs(recipe.sharpen - candidate.sharpen) / 10
+      + Math.abs(recipe.localContrast - candidate.localContrast) + Math.abs(recipe.clahe - candidate.clahe);
+  });
+  const closest = distances.indexOf(Math.min(...distances));
+  const candidate = withProcessingLevel(recipe, base, closest + 1);
+  return { level: closest + 1, exact: distances[closest] < 1e-8 && recipe.version === 2 && recipe.detailMode === candidate.detailMode && recipe.radius === candidate.radius && recipe.threshold === candidate.threshold && recipe.halo === candidate.halo };
+}
 /** Drag starts from a captured recipe; CSS-pixel distances do not depend on image zoom. */
 export function dragAdjustment(start: Recipe, base: Recipe, dx: number, dy: number, photometric = 'MONOCHROME2'): Recipe {
   const toned = dx === 0 ? start : withTone(start, base, toneValue(start, base, photometric) + dx * .5, photometric);

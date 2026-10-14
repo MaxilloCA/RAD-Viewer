@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { experimentalPreset, sameRecipe } from './model';
+import { experimentalPreset, sameRecipe, withProcessingLevel } from './model';
 import type { History, ImageEntry, ImageInfo, PatientIdentity, Recipe, RenderInfo } from './model';
 import { nextRequest } from './useRenderedImage';
 
@@ -182,7 +182,7 @@ export function useImageLibrary(onError: (error: string) => void) {
           const info = await invoke<ImageInfo>('import_image', { path: target.path });
           importedId = info.id;
           if (!current()) { await release(info.id); continue; }
-          const defaultRecipe = target.defaultRecipe ?? experimentalPreset('med', info.neutral, info.suggested, info.metadata.photometric);
+          const defaultRecipe = target.defaultRecipe ?? withProcessingLevel(experimentalPreset('med', info.neutral, info.suggested, info.metadata.photometric), info.suggested ?? info.neutral, 4);
           const history = target.history ?? { past: [], present: defaultRecipe, future: [] };
           const initial = await invoke<RenderInfo>('render_image', { id: info.id, recipe: history.present, requestId: nextRequest() });
           if (!current()) { await release(info.id); continue; }

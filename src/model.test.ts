@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { commit, contrastValue, dragAdjustment, experimentalPreset, formatImageDate, dateSourceLabel, orientedDimensions, redo, sameRecipe, sliderPosition, sliderValue, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
+import { commit, processingLevels, processingLevel, withProcessingLevel, contrastValue, dragAdjustment, experimentalPreset, formatImageDate, dateSourceLabel, orientedDimensions, redo, sameRecipe, sliderPosition, sliderValue, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
 import type { Recipe } from './model';
 
 const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, localContrast: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false, colorize: false };
@@ -188,5 +188,33 @@ describe('local color recipe compatibility', () => {
     expect(experimentalPreset('bitewing', neutral)).toMatchObject({ colorStrength: .8, colorScale: 8 });
     const legacy = { past: [], present: neutral, future: [] };
     expect(commit(legacy, { ...neutral, colorStrength: .8, colorScale: 8 })).toBe(legacy);
+  });
+});
+
+
+describe('seven processing levels', () => {
+  it('progresses processing monotonically and preserves all independent settings at every stop', () => {
+    for (const photometric of ['MONOCHROME1', 'MONOCHROME2']) {
+      const source = { ...neutral, gamma: .62, windowCenter: 1812, colorize: true, colorStrength: .31, colorScale: 17, invert: true, denoise: .3 };
+      let previous = withProcessingLevel(source, neutral, 1);
+      for (let level = 1; level <= 7; level++) {
+        const next = withProcessingLevel(source, neutral, level);
+        expect(next.gamma).toBe(source.gamma); expect(next.windowCenter).toBe(source.windowCenter);
+        expect(toneValue(next, neutral, photometric)).toBe(toneValue(source, neutral, photometric));
+        expect(next).toMatchObject({ colorize: true, colorStrength: .31, colorScale: 17, invert: true, denoise: .3 });
+        expect(processingLevel(next, neutral)).toEqual({ level, exact: true });
+        for (const key of ['sharpen', 'clahe', 'localContrast'] as const) expect(next[key]).toBeGreaterThanOrEqual(previous[key]);
+        expect(contrastValue(next, neutral)).toBeGreaterThanOrEqual(contrastValue(previous, neutral));
+        previous = next;
+      }
+      expect(source.windowCenter).toBe(1812);
+    }
+    expect(processingLevels).toHaveLength(7);
+  });
+  it('keeps the stop after tone/gamma drags and recognizes manually customized processing', () => {
+    const level = withProcessingLevel(neutral, neutral, 4);
+    expect(processingLevel(dragAdjustment(level, neutral, 40, -60), neutral)).toEqual({ level: 4, exact: true });
+    expect(processingLevel({ ...level, sharpen: 6.1 }, neutral).exact).toBe(false);
+    expect(withProcessingLevel(neutral, neutral, 999)).toEqual(withProcessingLevel(neutral, neutral, 7));
   });
 });

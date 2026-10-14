@@ -129,6 +129,7 @@ pub struct RenderedImage {
 pub struct ProcessingSession {
     source: Arc<SourceImage>,
     prepared: Option<([u32; 9], Vec<f32>)>,
+    preview: Option<SourceImage>,
 }
 
 impl ProcessingSession {
@@ -136,7 +137,29 @@ impl ProcessingSession {
         Self {
             source,
             prepared: None,
+            preview: None,
         }
+    }
+
+    /// Bounded, explicitly approximate feedback during adjustment. The immutable
+    /// full-resolution source and its exact-render cache are never replaced.
+    pub fn process_preview(&mut self, recipe: &Recipe) -> Result<RenderedImage, String> {
+        recipe.validate()?;
+        if self.source.width.max(self.source.height) <= 384 {
+            return self.process(recipe);
+        }
+        if self.preview.is_none() {
+            validate_source(&self.source, recipe)?;
+            self.preview = Some(preview_source(&self.source, 384));
+        }
+        let source = self.preview.as_ref().unwrap();
+        let scale = source.width.max(source.height) as f32
+            / self.source.width.max(self.source.height) as f32;
+        let mut preview_recipe = recipe.clone();
+        preview_recipe.radius = (recipe.radius * scale).max(0.35);
+        preview_recipe.color_scale = (recipe.color_scale * scale).max(2.0);
+        let values = prepare_scaled(source, &preview_recipe, scale)?;
+        Ok(finish_render(source, &preview_recipe, values))
     }
 
     pub fn process(&mut self, recipe: &Recipe) -> Result<RenderedImage, String> {
@@ -172,6 +195,52 @@ impl ProcessingSession {
     }
 }
 
+/// Average every source sample into a bounded floating-point preview. Integer
+/// partitions cover the full image once, without display quantization or clipping.
+fn preview_source(source: &SourceImage, longest: u32) -> SourceImage {
+    let ratio = longest as f64 / source.width.max(source.height) as f64;
+    let width = ((source.width as f64 * ratio).round() as u32).max(1);
+    let height = ((source.height as f64 * ratio).round() as u32).max(1);
+    let mut samples = Vec::with_capacity((width * height) as usize);
+    let mut color = source
+        .color
+        .as_ref()
+        .map(|_| Vec::with_capacity(samples.capacity()));
+    for y in 0..height {
+        let y0 = y as usize * source.height as usize / height as usize;
+        let y1 = (y + 1) as usize * source.height as usize / height as usize;
+        for x in 0..width {
+            let x0 = x as usize * source.width as usize / width as usize;
+            let x1 = (x + 1) as usize * source.width as usize / width as usize;
+            let count = ((x1 - x0) * (y1 - y0)) as f64;
+            let mut sum = 0.0f64;
+            let mut rgb = [0.0f64; 3];
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let i = sy * source.width as usize + sx;
+                    sum += source.samples[i] as f64;
+                    if let Some(colors) = &source.color {
+                        for (total, value) in rgb.iter_mut().zip(colors[i]) {
+                            *total += value as f64;
+                        }
+                    }
+                }
+            }
+            samples.push((sum / count) as f32);
+            if let Some(colors) = &mut color {
+                colors.push(rgb.map(|v| (v / count) as f32));
+            }
+        }
+    }
+    SourceImage {
+        width,
+        height,
+        samples,
+        color,
+        metadata: source.metadata.clone(),
+    }
+}
+
 pub fn process(source: &SourceImage, recipe: &Recipe) -> Result<RenderedImage, String> {
     validate_source(source, recipe)?;
     let values = prepare(source, recipe)?;
@@ -199,6 +268,14 @@ fn validate_source(source: &SourceImage, recipe: &Recipe) -> Result<(), String> 
 }
 
 fn prepare(source: &SourceImage, recipe: &Recipe) -> Result<Vec<f32>, String> {
+    prepare_scaled(source, recipe, 1.0)
+}
+
+fn prepare_scaled(
+    source: &SourceImage,
+    recipe: &Recipe,
+    spatial_scale: f32,
+) -> Result<Vec<f32>, String> {
     let (w, h) = (source.width as usize, source.height as usize);
     let m = &source.metadata;
     // Normalize modality values into window-relative units before filtering. This
@@ -239,10 +316,10 @@ fn prepare(source: &SourceImage, recipe: &Recipe) -> Result<Vec<f32>, String> {
         }
     }
     if recipe.clahe > 0.0 {
-        values = clahe(&values, w, h, recipe.clahe);
+        values = clahe_scaled(&values, w, h, recipe.clahe, spatial_scale);
     }
     if recipe.version == 2 && recipe.local_contrast > 0.0 {
-        values = radiograph_bands(&values, w, h, recipe, true);
+        values = radiograph_bands_scaled(&values, w, h, recipe, true, spatial_scale);
     }
     Ok(values)
 }
@@ -464,11 +541,17 @@ fn guided_denoise(input: &[f32], w: usize, h: usize, strength: f32) -> Vec<f32> 
         .collect()
 }
 
+#[cfg(test)]
 fn clahe(input: &[f32], w: usize, h: usize, strength: f32) -> Vec<f32> {
+    clahe_scaled(input, w, h, strength, 1.0)
+}
+
+fn clahe_scaled(input: &[f32], w: usize, h: usize, strength: f32, spatial_scale: f32) -> Vec<f32> {
     const BINS: usize = 256;
     // Uniform partitions avoid a tiny partial tile at right/bottom edges.
-    let nx = w.div_ceil(128);
-    let ny = h.div_ceil(128);
+    let tile = (128.0 * spatial_scale).round().max(8.0) as usize;
+    let nx = w.div_ceil(tile);
+    let ny = h.div_ceil(tile);
     let mut tables = vec![[0.0f32; BINS + 1]; nx * ny];
     for ty in 0..ny {
         for tx in 0..nx {
@@ -610,13 +693,21 @@ fn gaussian(input: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
 /// and neighborhoods containing strong edges get less gain, instead of clipping
 /// every local extremum to its 3x3 range and thereby suppressing subtle detail.
 fn radiograph_bands(input: &[f32], w: usize, h: usize, recipe: &Recipe, broad: bool) -> Vec<f32> {
+    radiograph_bands_scaled(input, w, h, recipe, broad, 1.0)
+}
+
+fn radiograph_bands_scaled(
+    input: &[f32],
+    w: usize,
+    h: usize,
+    recipe: &Recipe,
+    broad: bool,
+    spatial_scale: f32,
+) -> Vec<f32> {
     let fine_scales = [recipe.radius, recipe.radius * 2.0, recipe.radius * 4.0];
+    let broad_scales = [4.0, 8.0, 16.0, 32.0, 64.0].map(|v| (v * spatial_scale).max(0.35));
     let (scales, weights, strength): (&[f32], &[f32], f32) = if broad {
-        (
-            &[4.0, 8.0, 16.0, 32.0, 64.0],
-            &[0.9, 1.2, 1.0, 0.6],
-            recipe.local_contrast,
-        )
+        (&broad_scales, &[0.9, 1.2, 1.0, 0.6], recipe.local_contrast)
     } else {
         (&fine_scales, &[0.5, 0.35, 0.15], recipe.sharpen)
     };
@@ -630,7 +721,7 @@ fn radiograph_bands(input: &[f32], w: usize, h: usize, recipe: &Recipe, broad: b
     // halo control, then protect the entire support of every broad-band filter.
     // Smoothing first limits sensitivity to isolated pixel-scale detector noise.
     let sharp_edges = broad.then(|| {
-        let smooth = gaussian(input, w, h, 2.0);
+        let smooth = gaussian(input, w, h, (2.0 * spatial_scale).max(0.35));
         let mut weights = vec![0.0; input.len()];
         for y in 0..h {
             for x in 0..w {
@@ -1644,6 +1735,141 @@ mod tests {
         r.version = 1;
         s.samples.pop();
         assert!(process(&s, &r).is_err());
+    }
+
+    #[test]
+    fn interaction_preview_is_bounded_float_averaging_and_preserves_source() {
+        let mut s = source(
+            1024,
+            4,
+            (0..4096).map(|i| (i % 1024) as f32 + 0.25).collect(),
+        );
+        s.color = Some(s.samples.iter().map(|v| [*v, *v * 0.5, 0.25]).collect());
+        let original = s.samples.clone();
+        let preview = preview_source(&s, 512);
+        assert_eq!((preview.width, preview.height), (512, 2));
+        assert_eq!(preview.samples[0], 0.75);
+        assert_eq!(preview.samples[511], 1022.75);
+        assert_eq!(preview.color.as_ref().unwrap()[0], [0.75, 0.375, 0.25]);
+        assert_eq!(s.samples, original);
+        assert_eq!(preview.metadata.bits_stored, s.metadata.bits_stored);
+        let narrow = preview_source(&source(1, 1025, vec![17.125; 1025]), 512);
+        assert_eq!((narrow.width, narrow.height), (1, 512));
+        assert!(narrow.samples.iter().all(|v| *v == 17.125));
+    }
+
+    #[test]
+    fn previews_never_contaminate_full_resolution_cache_or_final_pixels() {
+        let s = Arc::new(source(
+            769,
+            257,
+            (0..769 * 257).map(|i| (i * 37 % 4096) as f32).collect(),
+        ));
+        let original = s.samples.clone();
+        let mut session = ProcessingSession::new(s.clone());
+        let mut recipe = Recipe::neutral(&s);
+        recipe.version = 2;
+        recipe.gamma = 0.5;
+        recipe.sharpen = 6.0;
+        recipe.local_contrast = 0.4;
+        recipe.clahe = 0.12;
+        recipe.detail_mode = "radiograph".into();
+        let full = session.process(&recipe).unwrap();
+        let cached = session.prepared.as_ref().unwrap().1.as_ptr();
+        for gamma in [0.1, 0.22, 0.5, 0.9] {
+            recipe.gamma = gamma;
+            let preview = session.process_preview(&recipe).unwrap();
+            assert_eq!(preview.width, 384);
+            assert_eq!(
+                preview.histogram.iter().sum::<u32>(),
+                preview.width * preview.height
+            );
+            assert_eq!(cached, session.prepared.as_ref().unwrap().1.as_ptr());
+            assert!(preview
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[0] == p[1] && p[1] == p[2] && p[3] == 255));
+        }
+        recipe.gamma = 0.5;
+        let final_render = session.process(&recipe).unwrap();
+        assert_eq!(full.rgba, final_render.rgba);
+        assert_eq!(full.histogram, final_render.histogram);
+        assert_eq!(final_render.rgba, process(&s, &recipe).unwrap().rgba);
+        assert_eq!(s.samples, original);
+    }
+
+    #[test]
+    fn small_interaction_previews_use_exact_pipeline_and_validate_recipes() {
+        let s = Arc::new(source(11, 7, (0..77).map(|v| v as f32 * 53.0).collect()));
+        let mut recipe = Recipe::neutral(&s);
+        let mut session = ProcessingSession::new(s.clone());
+        recipe.gamma = 0.5;
+        assert_eq!(
+            session.process_preview(&recipe).unwrap().rgba,
+            process(&s, &recipe).unwrap().rgba
+        );
+        recipe.gamma = f32::NAN;
+        assert!(session.process_preview(&recipe).is_err());
+    }
+
+    #[test]
+    #[ignore = "manual local-sample interaction performance comparison"]
+    fn benchmark_interaction_preview() {
+        use image::ImageEncoder;
+        let encode = |render: &RenderedImage| {
+            let mut bytes = Vec::new();
+            image::codecs::png::PngEncoder::new_with_quality(
+                &mut bytes,
+                image::codecs::png::CompressionType::Fast,
+                image::codecs::png::FilterType::Sub,
+            )
+            .write_image(
+                &render.rgba,
+                render.width,
+                render.height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+            std::hint::black_box(bytes);
+        };
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Sample RAD Files");
+        for name in ["R1.rvg", "P2.pano"] {
+            let source = Arc::new(crate::decode(&directory.join(name)).unwrap());
+            let mut recipe = crate::suggested_recipe(&source);
+            recipe.version = 2;
+            recipe.detail_mode = "radiograph".into();
+            recipe.gamma = 0.5;
+            recipe.sharpen = 6.0;
+            recipe.local_contrast = 0.4;
+            recipe.clahe = 0.12;
+            recipe.radius = 2.2;
+            recipe.threshold = 0.0015;
+            recipe.halo = 0.35;
+            let mut session = ProcessingSession::new(source.clone());
+            let baseline = process(&source, &recipe).unwrap();
+            let start = std::time::Instant::now();
+            let preview = session.process_preview(&recipe).unwrap();
+            encode(&preview);
+            let first = start.elapsed().as_secs_f64() * 1000.0;
+            let mut full = Vec::new();
+            let mut reduced = Vec::new();
+            for i in 0..7 {
+                recipe.gamma = 0.4 + i as f32 * 0.025;
+                recipe.window_center += 3.0;
+                let start = std::time::Instant::now();
+                encode(&session.process(&recipe).unwrap());
+                full.push(start.elapsed().as_secs_f64() * 1000.0);
+                let start = std::time::Instant::now();
+                encode(&session.process_preview(&recipe).unwrap());
+                reduced.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            full.sort_by(f64::total_cmp);
+            reduced.sort_by(f64::total_cmp);
+            eprintln!("INTERACTION+PNG {name} {}x{} -> {}x{}: full median {:.2} ms; preview median {:.2} ms; first {:.2} ms; {:.1}x speedup", baseline.width, baseline.height, preview.width, preview.height, full[3], reduced[3], first, full[3] / reduced[3]);
+        }
     }
 
     #[test]
