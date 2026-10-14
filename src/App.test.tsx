@@ -615,3 +615,33 @@ describe('pane context gesture integration', () => {
     expect(actualValue('Gamma')).toBe('0.5');
   });
 });
+
+describe('automatic newest patient pair', () => {
+  it('opens the newest two patient radiographs as a pinned first pane and selected second pane', async () => {
+    customInvoke = command => command === 'open_patient' ? Promise.resolve(patient(['newest.rvg', 'previous.rvg', 'older.rvg'])) : undefined;
+    render(<App />); submitPatient();
+    await screen.findByRole('button', { name: 'Unpin image newest.rvg' });
+    await screen.findByAltText('Enhanced: previous.rvg');
+    expect(paneNames()).toEqual(['Image: newest.rvg', 'Image: previous.rvg']);
+    expect(pane('previous.rvg').getAttribute('data-selected')).toBe('true');
+    expect(screen.getByRole('button', { name: '03 older.rvg' })).toBeTruthy();
+    expect(screen.queryByRole('region', { name: 'Image: older.rvg' })).toBeNull();
+    selectThumbnail(3, 'older.rvg');
+    await screen.findByAltText('Enhanced: older.rvg');
+    expect(paneNames()).toEqual(['Image: newest.rvg', 'Image: older.rvg']);
+  });
+  it('does not replace the image after a viewing gesture during progressive patient loading', async () => {
+    let finish!: (value: ImageInfo) => void;
+    customInvoke = (command, args) => command === 'open_patient' ? Promise.resolve(patient(['newest.rvg', 'previous.rvg'])) : command === 'import_image' && args.path === 'previous.rvg' ? new Promise(resolve => { finish = resolve; }) : undefined;
+    render(<App />); submitPatient();
+    await screen.findByAltText('Enhanced: newest.rvg');
+    await waitFor(() => expect(finish).toBeTruthy());
+    fireEvent.wheel(screen.getByTestId('image-viewport'), { deltaY: -80 });
+    const afterZoom = screen.getByAltText('Enhanced: newest.rvg').getAttribute('style');
+    await act(async () => finish(info('previous.rvg')));
+    await readyThumbnail('02 previous.rvg');
+    expect(paneNames()).toEqual(['Image: newest.rvg']);
+    expect(screen.getByAltText('Enhanced: newest.rvg').getAttribute('style')).toBe(afterZoom);
+    expect(screen.queryByRole('button', { name: /Unpin image/ })).toBeNull();
+  });
+});

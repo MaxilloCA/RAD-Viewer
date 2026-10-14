@@ -1,6 +1,6 @@
 [package]
 name = "rad-viewer"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 description = "Local radiograph viewer"
 
@@ -13,6 +13,7 @@ rad-core = { path = "../crates/rad-core" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
 quick-xml = "=0.42.0"
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 base64 = "=0.22.1"
 image = { version = "=0.25.8", default-features = false, features = ["png"] }
 rfd = "=0.15.4"

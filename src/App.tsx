@@ -104,7 +104,7 @@ export default function App() {
   const draftRef = useRef<Recipe | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const { entries: images, selectedKey: selected, loading, select: selectImage, append: appendImages, replace: replaceImages, changeHistory: updateHistory, close: closeLibraryImage, rotate: rotateImage, togglePin } = useImageLibrary(setError);
+  const { entries: images, selectedKey: selected, loading, select: selectImage, append: appendImages, replace: replaceImages, changeHistory: updateHistory, close: closeLibraryImage, rotate: rotateImage, togglePin, cancelAutoPair } = useImageLibrary(setError);
   const [presets, setPresets] = useState<CustomPreset[]>([]);
   const [presetName, setPresetName] = useState('');
   const [advanced, setAdvanced] = useState(false);
@@ -138,10 +138,12 @@ export default function App() {
   const view = selected ? paneViews[selected] ?? defaultPaneView : defaultPaneView;
   const effectiveView = activeEntry ? viewFor(activeEntry) : defaultPaneView;
   const setView: Dispatch<SetStateAction<View>> = update => {
+    cancelAutoPair();
     if (!selected) return;
     setPaneViews(previous => ({ ...previous, [selected]: typeof update === 'function' ? update(previous[selected] ?? defaultPaneView) : update }));
   };
   const updatePaneView = (entry: ImageEntry, update: SetStateAction<View>) => {
+    cancelAutoPair();
     const current = viewFor(entry);
     setPaneViews(previous => ({ ...previous, [entry.key]: typeof update === 'function' ? update(current) : update }));
   };
@@ -204,7 +206,7 @@ export default function App() {
   const activateImage = (key: string) => {
     commitDraft(); dragRecipe.current = null; selectImage(key); setDraft(null); draftRef.current = null; setError(null);
   };
-  const updateDraft = (value: Recipe) => { draftRef.current = value; setDraft(value); };
+  const updateDraft = (value: Recipe) => { cancelAutoPair(); draftRef.current = value; setDraft(value); };
   const changeValue = (key: keyof Recipe, value: number | string | boolean) => {
     if (recipe) updateDraft({ ...recipe, [key]: value, version: key === 'localContrast' || key === 'sharpen' || key === 'colorStrength' || key === 'colorScale' ? 2 : recipe.version });
   };
@@ -245,7 +247,7 @@ export default function App() {
   };
   const range = (key: keyof Recipe, label: string, min: number, max: number, step?: number, center?: number) => recipe && <Slider label={label} center={center} value={recipe[key] as number} min={min} max={max} step={step} onChange={value => changeValue(key, value)} onCommit={commitDraft} />;
 
-  return <main className="app-shell"><header className="app-header">
+  return <main className="app-shell" onPointerDownCapture={event => { if (!(event.target as HTMLElement).closest('.pin-button')) cancelAutoPair(); }} onKeyDownCapture={event => { if (!(event.target as HTMLElement).closest('.pin-button')) cancelAutoPair(); }} onWheelCapture={cancelAutoPair}><header className="app-header">
     <div className="brand"><span className="brand-symbol" aria-hidden="true">R</span><div><strong>RAD <span>Viewer</span></strong><small>RADIOGRAPH VIEWER</small></div></div>
     <div className="header-divider" />{activeEntry?.patient ? <div className="patient-identity" aria-label="Current patient"><strong>{activeEntry.patient.patientName || 'Name unavailable'}</strong><small>Patient {activeEntry.patient.patientNumber}</small></div> : <div className="header-context"><span className="status-dot" />Local processing<small>Original files preserved</small></div>}
     <div className="header-actions"><button onClick={() => void saveReview()} disabled={!active}>Save settings</button><button onClick={() => void exportImage()} disabled={!active}>Export PNG</button><button onClick={() => setPatientDialogOpen(true)} disabled={!desktop}>Open patient</button><button className="primary" onClick={() => void chooseImages()} disabled={!desktop}>＋ Open images</button></div></header>

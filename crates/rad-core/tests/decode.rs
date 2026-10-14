@@ -21,6 +21,7 @@ fn png_8_and_16_bit_values_are_preserved_without_normalization() {
     assert_eq!(decoded.metadata.bits_stored, 16);
     assert_eq!(decoded.metadata.image_date, None);
     assert_eq!(decoded.metadata.date_source, None);
+    assert_eq!(rad_core::decode::read_image_date(&p16), None);
 }
 
 #[test]
@@ -217,6 +218,10 @@ fn dicom_dates_follow_priority_and_skip_invalid_or_missing_values() {
         let metadata = decode(&path).unwrap().metadata;
         let expected = candidates.get(first_valid);
         assert_eq!(metadata.image_date.as_deref(), expected.map(|c| c.4));
+        assert_eq!(
+            rad_core::decode::read_image_date(&path),
+            metadata.image_date
+        );
         assert_eq!(metadata.date_source.as_deref(), expected.map(|c| c.3));
         let json = serde_json::to_value(&metadata).unwrap();
         assert_eq!(
@@ -358,6 +363,270 @@ fn jpeg_extended_secondary_capture_decodes_without_external_codec_software() {
         }
         assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
+}
+
+// Synthetic colour Secondary Capture fixture. JPEG data is generated in memory;
+// no clinical files or external codec installations are needed by these tests.
+fn colour_dicom(
+    path: &Path,
+    photo: &str,
+    planar: u16,
+    width: u16,
+    height: u16,
+    pixels: &[u8],
+    jpeg: bool,
+) {
+    let sop = b"1.2.840.10008.5.1.4.1.1.7\0";
+    let mut syntax = if jpeg {
+        b"1.2.840.10008.1.2.4.51".to_vec()
+    } else {
+        b"1.2.840.10008.1.2.1".to_vec()
+    };
+    if !syntax.len().is_multiple_of(2) {
+        syntax.push(0);
+    }
+    let mut meta = Vec::new();
+    element(&mut meta, 2, 2, b"UI", sop, false);
+    element(&mut meta, 2, 0x10, b"UI", &syntax, false);
+    let mut bytes = vec![0; 128];
+    bytes.extend(b"DICM");
+    element(
+        &mut bytes,
+        2,
+        0,
+        b"UL",
+        &(meta.len() as u32).to_le_bytes(),
+        false,
+    );
+    bytes.extend(meta);
+    element(&mut bytes, 8, 0x16, b"UI", sop, false);
+    element(&mut bytes, 8, 0x22, b"DA", b"20240229", false);
+    for (tag, value) in [
+        (2, 3),
+        (6, planar),
+        (0x10, height),
+        (0x11, width),
+        (0x100, 8),
+        (0x101, 8),
+        (0x102, 7),
+        (0x103, 0),
+    ] {
+        element(&mut bytes, 0x28, tag, b"US", &value.to_le_bytes(), false);
+    }
+    let mut photo = photo.as_bytes().to_vec();
+    if !photo.len().is_multiple_of(2) {
+        photo.push(b' ');
+    }
+    element(&mut bytes, 0x28, 4, b"CS", &photo, false);
+    let mut pixels = pixels.to_vec();
+    if !pixels.len().is_multiple_of(2) {
+        pixels.push(0);
+    }
+    if jpeg {
+        bytes.extend(b"\xe0\x7f\x10\x00OB\0\0\xff\xff\xff\xff");
+        bytes.extend(b"\xfe\xff\x00\xe0\0\0\0\0");
+        bytes.extend(b"\xfe\xff\x00\xe0");
+        bytes.extend((pixels.len() as u32).to_le_bytes());
+        bytes.extend(pixels);
+        bytes.extend(b"\xfe\xff\xdd\xe0\0\0\0\0");
+    } else {
+        element(&mut bytes, 0x7fe0, 0x10, b"OB", &pixels, false);
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn rgb_luminance([r, g, b]: [u8; 3]) -> f32 {
+    0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)
+}
+
+#[test]
+fn native_rgb_dicom_becomes_grayscale_without_stretching_and_handles_both_planar_layouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let pixels = [
+        [220, 40, 80],
+        [20, 190, 30],
+        [80, 90, 200],
+        [100; 3],
+        [150; 3],
+        [200; 3],
+    ];
+    for planar in [0, 1] {
+        let path = dir.path().join(format!("colour-{planar}.cs"));
+        let bytes: Vec<u8> = if planar == 0 {
+            pixels.into_iter().flatten().collect()
+        } else {
+            (0..3)
+                .flat_map(|channel| pixels.map(|p| p[channel]))
+                .collect()
+        };
+        colour_dicom(&path, "RGB", planar, 3, 2, &bytes, false);
+        let before = std::fs::read(&path).unwrap();
+        let source = decode(&path).unwrap();
+        assert!(source.color.is_none());
+        assert_eq!(source.samples, pixels.map(rgb_luminance));
+        assert_eq!(source.metadata.photometric, "MONOCHROME2");
+        assert_eq!(source.metadata.image_date.as_deref(), Some("2024-02-29"));
+        assert_eq!(
+            (source.metadata.window_center, source.metadata.window_width),
+            (Some(128.), Some(256.))
+        );
+        let rendered = rad_core::process(&source, &rad_core::Recipe::neutral(&source)).unwrap();
+        for (output, input) in rendered.rgba.as_chunks::<4>().0.iter().zip(pixels) {
+            let gray = rgb_luminance(input).round() as u8;
+            assert_eq!(output, &[gray, gray, gray, 255]);
+        }
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
+
+#[test]
+fn native_ybr_full_is_converted_once_before_grayscale() {
+    let dir = tempfile::tempdir().unwrap();
+    let pixels = [
+        [128, 128, 128],
+        [76, 85, 255],
+        [29, 255, 107],
+        [150, 44, 21],
+    ];
+    let expected = [[128; 3], [254, 0, 0], [0, 0, 254], [0, 255, 1]].map(rgb_luminance);
+    for planar in [0, 1] {
+        let path = dir.path().join(format!("ybr-{planar}.sc"));
+        let bytes: Vec<u8> = if planar == 0 {
+            pixels.into_iter().flatten().collect()
+        } else {
+            (0..3)
+                .flat_map(|channel| pixels.map(|p| p[channel]))
+                .collect()
+        };
+        colour_dicom(&path, "YBR_FULL", planar, 2, 2, &bytes, false);
+        let source = decode(&path).unwrap();
+        assert_eq!(source.samples, expected);
+        assert!(source.color.is_none());
+        assert_eq!(source.metadata.photometric, "MONOCHROME2");
+    }
+}
+
+#[test]
+fn jpeg_extended_rgb_and_ybr_tags_use_codec_rgb_once_then_grayscale() {
+    let dir = tempfile::tempdir().unwrap();
+    for input in [
+        [220, 45, 90].repeat(16 * 8),
+        (0..16 * 8)
+            .flat_map(|i| [((i * 13) % 256) as u8; 3])
+            .collect(),
+    ] {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode(&input, 16, 8, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        assert!(jpeg.windows(5).any(|v| v == b"JFIF\0"));
+        let expected = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        let marker = jpeg.windows(2).position(|v| v == [0xff, 0xc0]).unwrap();
+        jpeg[marker + 1] = 0xc1;
+        let mut previous = None;
+        for photo in ["RGB", "YBR_FULL", "YBR_FULL_422"] {
+            for planar in [0, 1] {
+                let path = dir.path().join("jpeg-colour.sc");
+                colour_dicom(&path, photo, planar, 16, 8, &jpeg, true);
+                let source = decode(&path).unwrap();
+                assert!(source.color.is_none());
+                assert_eq!(source.metadata.photometric, "MONOCHROME2");
+                for (actual, pixel) in source.samples.iter().zip(expected.pixels()) {
+                    assert!((actual - rgb_luminance(pixel.0)).abs() <= 1.01);
+                }
+                if let Some(previous) = previous.as_ref() {
+                    assert_eq!(&source.samples, previous);
+                }
+                previous = Some(source.samples.clone());
+                let rendered =
+                    rad_core::process(&source, &rad_core::Recipe::neutral(&source)).unwrap();
+                assert!(rendered
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| p[0] == p[1] && p[1] == p[2] && p[3] == 255));
+            }
+        }
+    }
+}
+
+#[test]
+fn unsupported_colour_layouts_and_jpeg_header_mismatch_fail_clearly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unsupported-colour.cs");
+    colour_dicom(&path, "RGB", 2, 2, 1, &[0; 6], false);
+    assert!(decode(&path).unwrap_err().contains("PlanarConfiguration"));
+    colour_dicom(&path, "YBR_FULL_422", 0, 2, 1, &[0; 4], false);
+    assert!(decode(&path)
+        .unwrap_err()
+        .contains("Unsupported colour DICOM encoding"));
+    colour_dicom(&path, "PALETTE COLOR", 0, 2, 1, &[0; 6], false);
+    assert!(decode(&path).unwrap_err().contains("photometric"));
+    colour_dicom(&path, "RGB", 0, 2, 1, &[0; 2], false);
+    assert!(decode(&path).unwrap_err().contains("truncated"));
+    colour_dicom(&path, "RGB", 0, 2, 1, &[0; 6], false);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let tag = bytes
+        .windows(6)
+        .position(|v| v == b"\x28\x00\x03\x01US")
+        .unwrap();
+    bytes[tag + 8..tag + 10].copy_from_slice(&1_u16.to_le_bytes());
+    std::fs::write(&path, bytes).unwrap();
+    assert!(decode(&path).unwrap_err().contains("unsigned 8-bit"));
+    for format in [image::ExtendedColorType::L8, image::ExtendedColorType::Rgb8] {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode(
+                &[0; 6][..if format == image::ExtendedColorType::L8 {
+                    2
+                } else {
+                    6
+                }],
+                2,
+                1,
+                format,
+            )
+            .unwrap();
+        let width = if format == image::ExtendedColorType::L8 {
+            2
+        } else {
+            3
+        };
+        colour_dicom(&path, "RGB", 0, width, 1, &jpeg, true);
+        assert!(decode(&path)
+            .unwrap_err()
+            .contains("dimensions or components"));
+    }
+    colour_dicom(&path, "RGB", 0, 2, 1, &[0; 6], false);
+    let mut bytes = std::fs::read(&path).unwrap();
+    element(&mut bytes, 0x28, 0x1053, b"DS", b"2 ", false);
+    std::fs::write(&path, bytes).unwrap();
+    assert!(decode(&path).unwrap_err().contains("modality rescaling"));
+}
+
+#[test]
+fn date_lookup_stops_before_malformed_patient_and_pixel_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("date-only.sc");
+    colour_dicom(&path, "RGB", 0, 2, 1, &[0; 6], false);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let start = bytes
+        .windows(6)
+        .position(|v| v == b"\x28\x00\x02\x00US")
+        .unwrap();
+    bytes.truncate(start);
+    // Invalid/truncated patient value followed by undecodable Pixel Data.
+    // Date-only scanning must not attempt to consume either value.
+    bytes.extend(b"\x10\x00\x10\x00PN\xfe\xff");
+    bytes.extend(b"\xe0\x7f\x10\x00OB\0\0\xff\xff\xff\xff");
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        rad_core::decode::read_image_date(&path).as_deref(),
+        Some("2024-02-29")
+    );
+    assert!(decode(&path).is_err());
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
 }
 
 #[test]

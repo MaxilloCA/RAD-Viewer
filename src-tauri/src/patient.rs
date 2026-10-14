@@ -2,6 +2,33 @@ use quick_xml::{events::Event, Reader, XmlVersion};
 use serde::Serialize;
 use std::{collections::HashMap, fs, io::Read, path::Path};
 
+// Embedded acquisition/content dates take precedence over copy timestamps.
+// Undated images use file modification day; modification time resolves same-day ties.
+fn recency_key(path: &Path) -> (i64, i64) {
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| time.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0);
+    let image_day = rad_core::decode::read_image_date(path)
+        .and_then(|date| chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok())
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|date| date.and_utc().timestamp().div_euclid(86_400))
+        .unwrap_or(modified.div_euclid(86_400));
+    (image_day, modified)
+}
+
+fn newest_first(paths: &mut [String]) {
+    // Cache each header read: sorting must not repeatedly access network files.
+    paths.sort_by_cached_key(|path| {
+        (
+            std::cmp::Reverse(recency_key(Path::new(path))),
+            path.to_lowercase(),
+        )
+    });
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatientStudy {
@@ -190,6 +217,7 @@ pub fn discover(local: &Path, number: &str) -> Result<PatientStudy, String> {
         paths.clear();
         scan(&directory, &mut paths, &mut warnings)?;
     }
+    newest_first(&mut paths);
     Ok(PatientStudy {
         patient_number: number.into(),
         patient_name: (!name.is_empty()).then_some(name),
@@ -202,6 +230,76 @@ pub fn discover(local: &Path, number: &str) -> Result<PatientStudy, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dated_header(path: &Path, date: &str) {
+        let mut bytes = vec![0; 128];
+        bytes.extend(b"DICM");
+        let syntax = b"1.2.840.10008.1.2.1\0";
+        bytes.extend(b"\x02\x00\x00\x00UL\x04\x00");
+        bytes.extend((8u32 + syntax.len() as u32).to_le_bytes());
+        bytes.extend(b"\x02\x00\x10\x00UI");
+        bytes.extend((syntax.len() as u16).to_le_bytes());
+        bytes.extend(syntax);
+        bytes.extend(b"\x08\x00\x22\x00DA\x08\x00");
+        bytes.extend(date.as_bytes());
+        // Stop before later metadata/pixel payload; no usable image is needed.
+        bytes.extend(b"\x10\x00\x10\x00PN\x00\x00");
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn modified_at(path: &Path, seconds: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn newest_images_use_embedded_dates_before_copy_timestamps() {
+        let root = tempfile::tempdir().unwrap();
+        let recent = root.path().join("C1.sc");
+        let older = root.path().join("R1.rvg");
+        let undated = root.path().join("photo.png");
+        dated_header(&recent, "20261014");
+        dated_header(&older, "20261013");
+        fs::write(&undated, []).unwrap();
+        modified_at(&recent, 1_000);
+        modified_at(&older, 2_000_000_000);
+        modified_at(&undated, 1_000_000_000);
+        assert_eq!(
+            rad_core::decode::read_image_date(&recent).as_deref(),
+            Some("2026-10-14")
+        );
+        let study = discover(root.path(), "12").unwrap();
+        let names: Vec<_> = study
+            .paths
+            .iter()
+            .map(|p| Path::new(p).file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["C1.sc", "R1.rvg", "photo.png"]);
+    }
+
+    #[test]
+    fn undated_images_use_modification_time_with_deterministic_name_ties() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, seconds) in [("a.png", 100), ("b.png", 200), ("c.png", 200)] {
+            let path = root.path().join(name);
+            fs::write(&path, []).unwrap();
+            modified_at(&path, seconds);
+        }
+        let study = discover(root.path(), "12").unwrap();
+        let names: Vec<_> = study
+            .paths
+            .iter()
+            .map(|p| Path::new(p).file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["b.png", "c.png", "a.png"]);
+    }
     #[test]
     fn xml_name_entities_and_directory() {
         let values = parameters(r#"<trophy><patient><parameter key="first_name" value="A &amp; B"/><parameter key="directory" value="images"/></patient></trophy>"#).unwrap();

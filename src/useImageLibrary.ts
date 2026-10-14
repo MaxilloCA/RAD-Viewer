@@ -24,6 +24,7 @@ export function useImageLibrary(onError: (error: string) => void) {
   const running = useRef(false);
   const alive = useRef(true);
   const pumpRef = useRef<() => void>(() => {});
+  const autoPair = useRef<{ epoch: number; first?: string; second?: string; pinStarted: boolean } | null>(null);
   const pinJobs = useRef(new Map<string, PinJob>());
   const pinRunning = useRef(false);
   const releasing = useRef(new Map<string, Promise<void>>());
@@ -97,7 +98,7 @@ export function useImageLibrary(onError: (error: string) => void) {
     const job = pinJobs.current.get(key);
     if (job) { job.desired = undefined; pinJobs.current.delete(key); settlePin(job); }
   }, []);
-  const togglePin = useCallback(async (key: string) => {
+  const togglePinEntry = useCallback(async (key: string) => {
     const entry = entriesRef.current.find(item => item.key === key);
     if (!entry || !alive.current) return;
     if (entry.pinned || entry.pinPending) {
@@ -111,6 +112,40 @@ export function useImageLibrary(onError: (error: string) => void) {
     pinJobs.current.set(key, { epoch: epoch.current, waiters: [] });
     await requestPinSnapshot(key);
   }, [cancelPin, requestPinSnapshot, update]);
+  const cancelAutoPair = useCallback(() => {
+    const pending = autoPair.current; autoPair.current = null;
+    if (pending?.pinStarted && pending.first) {
+      const first = entriesRef.current.find(entry => entry.key === pending.first);
+      if (first?.pinPending && !first.pinned) {
+        cancelPin(first.key);
+        update(previous => previous.map(entry => entry.key === first.key ? { ...entry, pinPending: false, pinOrder: undefined, pinError: undefined } : entry));
+      }
+    }
+  }, [cancelPin, update]);
+  const togglePin = useCallback(async (key: string) => {
+    const cancelledInitialPin = autoPair.current?.pinStarted && autoPair.current.first === key && entriesRef.current.some(entry => entry.key === key && entry.pinPending && !entry.pinned);
+    cancelAutoPair();
+    if (!cancelledInitialPin) await togglePinEntry(key);
+  }, [cancelAutoPair, togglePinEntry]);
+  const selectEntry = useCallback((key: string | null) => {
+    selectedRef.current = key; setSelectedKey(key);
+    update(previous => previous.map(entry => entry.key === key ? { ...entry, error: undefined, lastUsed: ++tick.current } : entry));
+    pumpRef.current();
+  }, [update]);
+  const advanceAutoPair = useCallback((key: string) => {
+    const pending = autoPair.current;
+    if (!pending || pending.epoch !== epoch.current || pending.pinStarted) return;
+    if (!pending.first) { pending.first = key; selectEntry(key); return; }
+    if (pending.first === key) return;
+    pending.second = key; pending.pinStarted = true;
+    void togglePinEntry(pending.first).then(() => {
+      if (!alive.current || autoPair.current !== pending || pending.epoch !== epoch.current) return;
+      autoPair.current = null;
+      const first = entriesRef.current.find(entry => entry.key === pending.first);
+      const second = entriesRef.current.find(entry => entry.key === pending.second);
+      if (first?.pinnedRender && second?.image) selectEntry(second.key);
+    });
+  }, [selectEntry, togglePinEntry]);
   const refreshPinned = useCallback((key: string): Promise<void> => {
     const entry = entriesRef.current.find(item => item.key === key);
     return entry?.pinned || entry?.pinPending ? requestPinSnapshot(key) : Promise.resolve();
@@ -122,7 +157,7 @@ export function useImageLibrary(onError: (error: string) => void) {
       while (alive.current) {
         const selected = entriesRef.current.find(entry => entry.key === selectedRef.current);
         const target = selected && !selected.image && !selected.error ? selected : entriesRef.current.find(entry => !entry.thumbnail && !entry.error);
-        if (!target) break;
+        if (!target) { if (autoPair.current && !autoPair.current.pinStarted) autoPair.current = null; break; }
         const operationEpoch = epoch.current;
         const current = () => alive.current && epoch.current === operationEpoch && entriesRef.current.some(entry => entry.key === target.key);
         setLoading(target.key === selectedRef.current ? `Opening ${target.name}…` : `Preparing previews · ${entriesRef.current.filter(entry => entry.thumbnail).length} of ${entriesRef.current.length}`);
@@ -134,7 +169,7 @@ export function useImageLibrary(onError: (error: string) => void) {
             continue;
           }
           if (decoded.length >= DECODED_IMAGE_LIMIT) {
-            const victim = decoded.filter(entry => entry.key !== selectedRef.current).sort((a, b) => Number(pinBusy(pinJobs.current.get(a.key))) - Number(pinBusy(pinJobs.current.get(b.key))) || a.lastUsed - b.lastUsed)[0];
+            const victim = decoded.filter(entry => entry.key !== selectedRef.current && entry.key !== autoPair.current?.second).sort((a, b) => Number(pinBusy(pinJobs.current.get(a.key))) - Number(pinBusy(pinJobs.current.get(b.key))) || a.lastUsed - b.lastUsed)[0];
             if (!victim?.image) throw new Error('No decoded-image cache slot is available.');
             const pinJob = pinJobs.current.get(victim.key);
             if (pinJob && pinBusy(pinJob)) { await waitForPin(pinJob); continue; }
@@ -158,6 +193,7 @@ export function useImageLibrary(onError: (error: string) => void) {
             ...entry, details: info, defaultRecipe, history, thumbnail, error: undefined,
             lastUsed: ++tick.current, image: { info, path: target.path, initial, defaultRecipe, history },
           } : entry));
+          advanceAutoPair(target.key);
         } catch (error) {
           if (importedId) await release(importedId);
           if (current()) {
@@ -168,29 +204,29 @@ export function useImageLibrary(onError: (error: string) => void) {
         }
       }
     } finally { running.current = false; if (alive.current) setLoading(null); }
-  }, [release, update]);
+  }, [advanceAutoPair, release, update]);
   pumpRef.current = () => { void pump(); };
-  const select = useCallback((key: string | null) => {
-    selectedRef.current = key; setSelectedKey(key);
-    update(previous => previous.map(entry => entry.key === key ? { ...entry, error: undefined, lastUsed: ++tick.current } : entry));
-    pumpRef.current();
-  }, [update]);
-  const append = useCallback((paths: string[], patient?: PatientIdentity) => {
+  const select = useCallback((key: string | null) => { cancelAutoPair(); selectEntry(key); }, [cancelAutoPair, selectEntry]);
+  const append = useCallback((paths: string[], patient?: PatientIdentity, pairLatest = false) => {
     if (!paths.length) return;
+    cancelAutoPair();
+    if (pairLatest) autoPair.current = { epoch: epoch.current, pinStarted: false };
     const added = paths.map(path => ({ key: `image-${++entrySerial}`, path, name: path.split(/[\\/]/).pop() ?? path, patient, lastUsed: ++tick.current, rotationQuarterTurns: 0 }));
-    update(previous => [...previous, ...added]); select(added[0].key);
-  }, [select, update]);
+    update(previous => [...previous, ...added]); selectEntry(added[0].key);
+  }, [cancelAutoPair, selectEntry, update]);
   const replace = useCallback(async (paths: string[], patient: PatientIdentity) => {
     if (!paths.length) throw new Error('No radiographs were found for this patient.');
+    cancelAutoPair();
     const replacementEpoch = ++epoch.current;
     const old = entriesRef.current;
     for (const key of pinJobs.current.keys()) cancelPin(key);
     update(() => []); selectedRef.current = null; setSelectedKey(null);
     await Promise.all(old.flatMap(entry => entry.image ? [release(entry.image.info.id)] : []));
     if (!alive.current || epoch.current !== replacementEpoch) return;
-    append(paths, patient);
-  }, [append, cancelPin, release, update]);
+    append(paths, patient, true);
+  }, [append, cancelAutoPair, cancelPin, release, update]);
   const changeHistory = useCallback((operation: (history: History) => History) => {
+    cancelAutoPair();
     const key = selectedRef.current;
     update(previous => previous.map(entry => {
       if (entry.key !== key || !entry.history) return entry;
@@ -198,8 +234,9 @@ export function useImageLibrary(onError: (error: string) => void) {
       return { ...entry, history, image: entry.image ? { ...entry.image, history } : undefined };
     }));
     if (key && pinJobs.current.has(key)) void requestPinSnapshot(key);
-  }, [requestPinSnapshot, update]);
+  }, [cancelAutoPair, requestPinSnapshot, update]);
   const close = useCallback(async () => {
+    cancelAutoPair();
     const current = entriesRef.current.find(entry => entry.key === selectedRef.current);
     if (!current) return;
     cancelPin(current.key);
@@ -207,18 +244,19 @@ export function useImageLibrary(onError: (error: string) => void) {
     const released = current.image ? release(current.image.info.id) : Promise.resolve();
     select(entriesRef.current[0]?.key ?? null);
     await released;
-  }, [cancelPin, release, select, update]);
+  }, [cancelAutoPair, cancelPin, release, select, update]);
   const rotate = useCallback((key: string | null = selectedRef.current) => {
+    cancelAutoPair();
     update(previous => previous.map(entry => entry.key === key ? { ...entry, rotationQuarterTurns: (entry.rotationQuarterTurns + 1) % 4 } : entry));
-  }, [update]);
+  }, [cancelAutoPair, update]);
   useEffect(() => {
     alive.current = true;
     return () => {
-      alive.current = false; ++epoch.current;
+      alive.current = false; ++epoch.current; autoPair.current = null;
       for (const key of pinJobs.current.keys()) cancelPin(key);
       for (const entry of entriesRef.current) if (entry.image) void release(entry.image.info.id);
       entriesRef.current = [];
     };
   }, [cancelPin, release]);
-  return { entries, selectedKey, loading, select, append, replace, changeHistory, close, rotate, togglePin, refreshPinned };
+  return { entries, selectedKey, loading, select, append, replace, changeHistory, close, rotate, togglePin, refreshPinned, cancelAutoPair };
 }

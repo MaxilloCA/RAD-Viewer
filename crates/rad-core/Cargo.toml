@@ -7,6 +7,7 @@ edition = "2021"
 dicom-object = "=0.10.0"
 dicom-pixeldata = { version = "=0.10.0", default-features = false, features = ["native"] }
 image = { version = "=0.25.8", default-features = false, features = ["png", "jpeg"] }
+jpeg-decoder = { version = "=0.3.2", default-features = false }
 serde = { version = "=1.0.228", features = ["derive"] }
 
 [dev-dependencies]

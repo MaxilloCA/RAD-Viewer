@@ -1,5 +1,11 @@
 # Phase A integration contract
 
+## 0.3.9 color DICOM import as grayscale
+
+Supported single-frame unsigned 8-bit color DICOM is decoded to display RGB and converted to Rec.709-weighted floating-point grayscale during import. The resulting SourceImage has color=None, photometric MONOCHROME2, identity modality and explicit full-range neutral VOI center128/width256. File name, image date and DICOM format identity remain available. IPC shapes and processing recipes are unchanged; patient scanning, thumbnails, pins, controls and export use the existing grayscale pipeline. Original files are never rewritten. See verification/DECODING.md for supported transfer syntaxes and restrictions.
+
+Patient discovery sorts paths newest first using a cached early DICOM date-header read (the same validated date priority as displayed labels), with file modification day as fallback and modification time/name for ties. No full pixel decoding is needed to sort. Patient replacement automatically pairs the first two successful imports: first stays selected until its full-resolution pin is ready, then second becomes the working pane. Failed imports are skipped; manual Add is unchanged. Generation checks and user-interaction cancellation prevent later imports/snapshots from overriding another patient or a user's selection/adjustment. The pending second image is protected from decoded-cache eviction.
+
 ## 0.3.8 ordered enhancement presets
 
 Med remains the import/Reset default: gamma 0.5, Tone 35, Contrast -50, with the earlier sharpness 6, radius 2.2, threshold 0.0015, halo 0.35 and local contrast 0.4 restored. Sharpness retains range 1-10; its midpoint is now 6. Existing saved recipes retain their values.

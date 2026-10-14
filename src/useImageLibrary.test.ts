@@ -315,3 +315,129 @@ describe('bounded patient image library', () => {
     expect(onError).not.toHaveBeenCalled();
   });
 });
+
+describe('newest patient pair', () => {
+  it('shows the first immediately and selects the second only after its first-image pin is ready', async () => {
+    let finishSecond!: (value: ImageInfo) => void;
+    let finishPin!: (value: RenderInfo) => void;
+    let pinArgs!: Record<string, unknown>;
+    customInvoke = (command, args) => command === 'import_image' && args.path === 'second.rvg' ? new Promise(resolve => { finishSecond = resolve; }) : command === 'render_snapshot' ? new Promise(resolve => { pinArgs = args; finishPin = resolve; }) : undefined;
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    await act(async () => result.current.replace(['first.rvg', 'second.rvg', 'third.rvg'], patient('00123')));
+    await waitFor(() => expect(finishSecond).toBeTruthy());
+    expect(result.current.selectedKey).toBe(result.current.entries[0].key);
+    expect(result.current.entries[0].image).toBeTruthy();
+    expect(result.current.entries[0].pinned).not.toBe(true);
+    await act(async () => finishSecond(allocate('second.rvg')));
+    await waitFor(() => expect(finishPin).toBeTruthy());
+    expect(result.current.selectedKey).toBe(result.current.entries[0].key);
+    expect(result.current.entries[0].pinPending).toBe(true);
+    await act(async () => finishPin(snapshot(pinArgs)));
+    expect(result.current.entries[0].pinned).toBe(true);
+    expect(result.current.selectedKey).toBe(result.current.entries[1].key);
+    expect(result.current.entries.filter(entry => entry.pinned)).toHaveLength(1);
+  });
+  it('uses the first two successful images after unsupported newest files', async () => {
+    customInvoke = (command, args) => command === 'import_image' && ['bad-first.rvg', 'bad-middle.rvg'].includes(String(args.path)) ? Promise.reject('Unsupported synthetic image') : undefined;
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    await act(async () => result.current.replace(['bad-first.rvg', 'good-first.rvg', 'bad-middle.rvg', 'good-second.rvg', 'older.rvg'], patient('00123')));
+    await waitFor(() => expect(result.current.entries[1].pinned).toBe(true));
+    expect(result.current.selectedKey).toBe(result.current.entries[3].key);
+    expect(result.current.entries.filter(entry => entry.pinned)).toHaveLength(1);
+  });
+  it('leaves a one-image patient and manual additions unpinned', async () => {
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    await act(async () => result.current.replace(['only.rvg'], patient('00123')));
+    await waitFor(() => expect(result.current.entries[0].image).toBeTruthy());
+    expect(result.current.entries[0].pinned).not.toBe(true);
+    act(() => result.current.append(['manual-one.rvg', 'manual-two.rvg']));
+    await waitFor(() => expect(result.current.entries.every(entry => entry.thumbnail)).toBe(true));
+    expect(result.current.selectedKey).toBe(result.current.entries[1].key);
+    expect(result.current.entries.every(entry => !entry.pinned && !entry.pinPending)).toBe(true);
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === 'render_snapshot')).toHaveLength(0);
+  });
+  it('honors selection or adjustment made before the second import completes', async () => {
+    for (const interaction of ['select', 'adjust']) {
+      let finish!: (value: ImageInfo) => void;
+      customInvoke = (command, args) => command === 'import_image' && args.path === `${interaction}-second.rvg` ? new Promise(resolve => { finish = resolve; }) : undefined;
+      const { result, unmount } = renderHook(() => useImageLibrary(vi.fn()));
+      await act(async () => result.current.replace([`${interaction}-first.rvg`, `${interaction}-second.rvg`, `${interaction}-third.rvg`], patient('00123')));
+      await waitFor(() => expect(finish).toBeTruthy());
+      if (interaction === 'select') act(() => result.current.select(result.current.entries[2].key));
+      else act(() => result.current.changeHistory(history => commit(history, { ...history.present, gamma: .63 })));
+      const selected = result.current.selectedKey;
+      await act(async () => finish(allocate(`${interaction}-second.rvg`)));
+      await waitFor(() => expect(result.current.entries.every(entry => entry.thumbnail)).toBe(true));
+      expect(result.current.selectedKey).toBe(selected);
+      expect(result.current.entries.every(entry => !entry.pinned && !entry.pinPending)).toBe(true);
+      if (interaction === 'adjust') expect(result.current.entries[0].history?.present.gamma).toBe(.63);
+      unmount();
+    }
+  });
+  it('cancels an unfinished automatic pin when the user interacts and rejects its late result', async () => {
+    let finish!: (value: RenderInfo) => void;
+    let args!: Record<string, unknown>;
+    customInvoke = (command, input) => command === 'render_snapshot' ? new Promise(resolve => { args = input; finish = resolve; }) : undefined;
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    await act(async () => result.current.replace(['first.rvg', 'second.rvg', 'third.rvg'], patient('00123')));
+    await waitFor(() => expect(finish).toBeTruthy());
+    act(() => result.current.select(result.current.entries[2].key));
+    await act(async () => finish(snapshot(args)));
+    expect(result.current.selectedKey).toBe(result.current.entries[2].key);
+    expect(result.current.entries.every(entry => !entry.pinned && !entry.pinPending)).toBe(true);
+  });
+  it('never moves selection when an old patient auto-pin finishes', async () => {
+    let finish!: (value: RenderInfo) => void;
+    let args!: Record<string, unknown>;
+    customInvoke = (command, input) => command === 'render_snapshot' ? new Promise(resolve => { args = input; finish = resolve; }) : undefined;
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    await act(async () => result.current.replace(['old-first.rvg', 'old-second.rvg'], patient('00123')));
+    await waitFor(() => expect(finish).toBeTruthy());
+    await act(async () => result.current.replace(['new.rvg'], patient('00456')));
+    await act(async () => finish(snapshot(args)));
+    await waitFor(() => expect(result.current.entries[0].image).toBeTruthy());
+    expect(result.current.entries.map(entry => entry.path)).toEqual(['new.rvg']);
+    expect(result.current.selectedKey).toBe(result.current.entries[0].key);
+    expect(result.current.entries[0].pinned).not.toBe(true);
+  });
+  it('retains the second candidate while a slow auto-pin runs beyond the decoded cache limit', async () => {
+    let finish!: (value: RenderInfo) => void;
+    let args!: Record<string, unknown>;
+    customInvoke = (command, input) => command === 'render_snapshot' ? new Promise(resolve => { args = input; finish = resolve; }) : undefined;
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    await act(async () => result.current.replace(Array.from({ length: 15 }, (_, i) => `newest-${i}.rvg`), patient('00123')));
+    await waitFor(() => expect(result.current.entries.every(entry => entry.thumbnail)).toBe(true));
+    expect(result.current.entries[1].image).toBeTruthy();
+    expect(maxLive).toBeLessThanOrEqual(DECODED_IMAGE_LIMIT);
+    await act(async () => finish(snapshot(args)));
+    expect(result.current.selectedKey).toBe(result.current.entries[1].key);
+    expect(result.current.entries[0].pinned).toBe(true);
+  });
+});
+
+describe('automatic pair cancellation boundaries', () => {
+  it('honors an explicit cancel of the automatic initial pin', async () => {
+    let finish!: (value: RenderInfo) => void;
+    let args!: Record<string, unknown>;
+    customInvoke = (command, input) => command === 'render_snapshot' ? new Promise(resolve => { args = input; finish = resolve; }) : undefined;
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    await act(async () => result.current.replace(['first.rvg', 'second.rvg'], patient('00123')));
+    await waitFor(() => expect(finish).toBeTruthy());
+    await act(async () => result.current.togglePin(result.current.entries[0].key));
+    await act(async () => finish(snapshot(args)));
+    expect(result.current.entries.every(entry => !entry.pinned && !entry.pinPending)).toBe(true);
+    expect(result.current.selectedKey).toBe(result.current.entries[0].key);
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === 'render_snapshot')).toHaveLength(1);
+  });
+  it('keeps the first usable image visible if its automatic pin fails', async () => {
+    customInvoke = command => command === 'render_snapshot' ? Promise.reject('Synthetic capture failure') : undefined;
+    const onError = vi.fn();
+    const { result } = renderHook(() => useImageLibrary(onError));
+    await act(async () => result.current.replace(['first.rvg', 'second.rvg'], patient('00123')));
+    await waitFor(() => expect(result.current.entries[0].pinError).toContain('Synthetic capture failure'));
+    expect(result.current.entries[0].image).toBeTruthy();
+    expect(result.current.selectedKey).toBe(result.current.entries[0].key);
+    expect(result.current.entries.every(entry => !entry.pinned && !entry.pinPending)).toBe(true);
+    expect(onError).toHaveBeenCalledOnce();
+  });
+});
