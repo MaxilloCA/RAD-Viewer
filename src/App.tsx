@@ -276,7 +276,7 @@ export default function App() {
       {recipe && base ? <><div className="section-label">TONE & CONTRAST</div>{range('gamma', 'Gamma', .1, .9, .01, .5)}
         <Slider label="Tone" center={35} value={toneValue(recipe, base, photometric)} min={-100} max={100} step={1} endpoints={['Darker', 'Lighter']} onChange={value => updateDraft(withTone(recipe, base, value, photometric))} onCommit={commitDraft} />
         <Slider label="Contrast" center={-50} value={contrastValue(recipe, base)} min={-100} max={100} step={1} endpoints={['Softer', 'Stronger']} onChange={value => updateDraft(withContrast(recipe, base, value))} onCommit={commitDraft} />
-        <div className="section-label">DETAIL</div>{range('sharpen', 'Sharpness strength', 1, 10, .1, 3)}
+        <div className="section-label">DETAIL</div>{range('sharpen', 'Sharpness strength', 1, 10, .1, 6)}
         <button className={`colorize-button ${recipe.colorize ? 'active' : ''}`} aria-pressed={Boolean(recipe.colorize)} onClick={() => applyRecipe({ ...recipe, colorize: !recipe.colorize, colorStrength: recipe.colorStrength ?? .8, colorScale: recipe.colorScale ?? 8, version: 2 })}>Colorize <span>{recipe.colorize ? 'On' : 'Off'}</span></button>
         {recipe.colorize && <div className="local-color-controls">
           <Slider label="Color amount" formatValue={value => `${Math.round(value * 100)}%`} value={recipe.colorStrength ?? .8} min={0} max={1} step={.01} onChange={value => changeValue('colorStrength', value)} onCommit={commitDraft} />

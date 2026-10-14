@@ -5,17 +5,31 @@ import type { Recipe } from './model';
 const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, localContrast: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false, colorize: false };
 
 describe('Low, Med, and High adjustment presets', () => {
+  it('increases enhancement while darkening midtones, and restores the earlier default sharpening', () => {
+    const low = experimentalPreset('low', neutral), med = experimentalPreset('med', neutral), high = experimentalPreset('high', neutral);
+    for (const key of ['sharpen', 'localContrast'] as const) {
+      expect(low[key]).toBeLessThan(med[key]); expect(med[key]).toBeLessThan(high[key]);
+    }
+    expect(contrastValue(low, neutral)).toBeLessThan(contrastValue(med, neutral));
+    expect(contrastValue(med, neutral)).toBeLessThan(contrastValue(high, neutral));
+    for (const intensity of [.25, .5, .75]) {
+      expect(intensity ** (1 / high.gamma)).toBeLessThan(intensity ** (1 / med.gamma));
+      expect(intensity ** (1 / med.gamma)).toBeLessThan(intensity ** (1 / low.gamma));
+    }
+    const earlier = experimentalPreset('bitewing', neutral);
+    for (const key of ['sharpen', 'radius', 'threshold', 'halo', 'localContrast', 'detailMode'] as const) expect(med[key]).toBe(earlier[key]);
+  });
   it('sets true relative tone and contrast from either the neutral or suggested base', () => {
     const suggested = { ...neutral, windowCenter: 2800, windowWidth: 1400, gamma: .38 };
     for (const base of [neutral, suggested]) {
       const original = { ...base };
-      for (const [name, gamma, sharpen] of [['low', .3, 1], ['med', .5, 3], ['high', .7, 6]] as const) {
+      for (const [name, gamma, sharpen, tone, contrast, localContrast, radius, threshold] of [['low', .7, 3, 45, -75, .2, 2.2, .0015], ['med', .5, 6, 35, -50, .4, 2.2, .0015], ['high', .22, 8, 0, 0, .5, 2.5, .001]] as const) {
         const preset = experimentalPreset(name, neutral, base);
-        expect(preset).toMatchObject({ version: 2, gamma, sharpen, localContrast: .4, radius: 2.2, threshold: .0015, halo: .35, denoise: 0, clahe: 0, detailMode: 'radiograph', colorize: false, colorStrength: .8, colorScale: 8 });
-        expect(toneValue(preset, base)).toBeCloseTo(35, 12);
-        expect(contrastValue(preset, base)).toBeCloseTo(-50, 12);
-        expect(preset.windowCenter).toBeCloseTo(base.windowCenter - base.windowWidth * .0875, 12);
-        expect(preset.windowWidth).toBeCloseTo(base.windowWidth * Math.SQRT2, 12);
+        expect(preset).toMatchObject({ version: 2, gamma, sharpen, localContrast, radius, threshold, halo: .35, denoise: 0, clahe: 0, detailMode: 'radiograph', colorize: false, colorStrength: .8, colorScale: 8 });
+        expect(toneValue(preset, base)).toBeCloseTo(tone, 12);
+        expect(contrastValue(preset, base)).toBeCloseTo(contrast, 12);
+        expect(preset.windowCenter).toBeCloseTo(base.windowCenter - base.windowWidth * .25 * tone / 100, 12);
+        expect(preset.windowWidth).toBeCloseTo(base.windowWidth * 2 ** (-contrast / 100), 12);
       }
       expect(base).toEqual(original);
     }
@@ -38,7 +52,7 @@ describe('Low, Med, and High adjustment presets', () => {
 });
 
 describe('slider positions centered on adjustment defaults', () => {
-  const ranges = [[.1, .5, .9], [-100, 35, 100], [-100, -50, 100], [1, 3, 10]] as const;
+  const ranges = [[.1, .5, .9], [-100, 35, 100], [-100, -50, 100], [1, 6, 10]] as const;
   it('places each actual default at the center and preserves endpoints and bounds', () => {
     for (const [min, middle, max] of ranges) {
       expect(sliderPosition(min, min, middle, max)).toBe(0);

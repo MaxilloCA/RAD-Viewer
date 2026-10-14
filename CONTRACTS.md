@@ -1,5 +1,18 @@
 # Phase A integration contract
 
+## 0.3.8 ordered enhancement presets
+
+Med remains the import/Reset default: gamma 0.5, Tone 35, Contrast -50, with the earlier sharpness 6, radius 2.2, threshold 0.0015, halo 0.35 and local contrast 0.4 restored. Sharpness retains range 1-10; its midpoint is now 6. Existing saved recipes retain their values.
+
+| Preset | Gamma | Tone | Contrast | Sharpness | Local contrast | Radius | Threshold |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Low | 0.70 | 45 | -75 | 3 | 0.2 | 2.2 | 0.0015 |
+| Med | 0.50 | 35 | -50 | 6 | 0.4 | 2.2 | 0.0015 |
+| High | 0.22 | 0 | 0 | 8 | 0.5 | 2.5 | 0.001 |
+
+This pipeline applies intensity^(1/gamma), so High uses the lowest gamma to darken midtones. Global and local contrast and sharpening increase from Low to High. All use radiograph detail, halo 0.35, denoise/CLAHE off, and preserve Colorize settings on preset selection. These settings supersede the 0.3.7 defaults below. No processing algorithm changes.
+
+
 ## 0.3.7 centered defaults and mouse shortcuts
 
 Imports and Reset use version-2 Med with Gamma 0.5, Tone 35, Contrast −50 and Sharpness 3. Tone/Contrast retain their existing calculations against the original suggested-or-neutral base window; they are not re-zeroed. MONOCHROME1 polarity is accounted for when building the initial recipe. Gamma stays 0.1–0.9, Tone/Contrast −100…100, and Sharpness is now 1–10. A piecewise linear thumb-position mapping places each requested default at 50% without changing the actual recipe values or engine validation. Sliders display/expose actual units and support actual-step keyboard changes and Home/End.

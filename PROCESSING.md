@@ -1,5 +1,18 @@
 # Versioned radiograph processing
 
+## 0.3.8 ordered enhancement presets
+
+Med remains the import/Reset default: gamma 0.5, Tone 35, Contrast -50, with the earlier sharpness 6, radius 2.2, threshold 0.0015, halo 0.35 and local contrast 0.4 restored. Sharpness retains range 1-10; its midpoint is now 6. Existing saved recipes retain their values.
+
+| Preset | Gamma | Tone | Contrast | Sharpness | Local contrast | Radius | Threshold |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Low | 0.70 | 45 | -75 | 3 | 0.2 | 2.2 | 0.0015 |
+| Med | 0.50 | 35 | -50 | 6 | 0.4 | 2.2 | 0.0015 |
+| High | 0.22 | 0 | 0 | 8 | 0.5 | 2.5 | 0.001 |
+
+This pipeline applies intensity^(1/gamma), so High uses the lowest gamma to darken midtones. Global and local contrast and sharpening increase from Low to High. All use radiograph detail, halo 0.35, denoise/CLAHE off, and preserve Colorize settings on preset selection. These settings supersede the 0.3.7 defaults below. No processing algorithm changes.
+
+
 ## 0.3.7 defaults and centered controls
 
 The user's new import/Reset default is Gamma0.5, relative Tone35, relative Contrast−50 and Sharpness3. Tone remains a center offset against the original base window; Contrast remains a logarithmic width adjustment. Thus for non-inverted MONOCHROME2, the initial center is `baseCenter − 0.0875 × baseWidth` and width is `sqrt(2) × baseWidth` (subject to the existing minimum width1). MONOCHROME1 reverses the center-offset direction. Displayed Tone/Contrast values retain their old meaning.

@@ -45,7 +45,7 @@ const submitPatient = (value = '00123') => {
 };
 const readyThumbnail = async (name: string) => waitFor(() => expect(screen.getByRole('button', { name }).querySelector('img')).toBeTruthy());
 const slider = (label: string) => screen.getByRole('slider', { name: label }) as HTMLInputElement;
-const centers: Record<string, number> = { Gamma: .5, Tone: 35, Contrast: -50, 'Sharpness strength': 3 };
+const centers: Record<string, number> = { Gamma: .5, Tone: 35, Contrast: -50, 'Sharpness strength': 6 };
 const actualValue = (label: string) => String(Number(Number(slider(label).getAttribute('aria-valuenow')).toFixed(6)));
 const setSlider = (label: string, value: number) => {
   const control = slider(label);
@@ -155,7 +155,7 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     expect(screen.queryByText(/Add reference/)).toBeNull();
     expect(screen.queryByAltText(/Original:/)).toBeNull();
     expect(actualValue('Gamma')).toBe('0.5'); expect(slider('Gamma').getAttribute('aria-valuemin')).toBe('0.1'); expect(slider('Gamma').getAttribute('aria-valuemax')).toBe('0.9');
-    expect(actualValue('Sharpness strength')).toBe('3'); expect(slider('Sharpness strength').getAttribute('aria-valuemin')).toBe('1'); expect(slider('Sharpness strength').getAttribute('aria-valuemax')).toBe('10');
+    expect(actualValue('Sharpness strength')).toBe('6'); expect(slider('Sharpness strength').getAttribute('aria-valuemin')).toBe('1'); expect(slider('Sharpness strength').getAttribute('aria-valuemax')).toBe('10');
     expect(actualValue('Tone')).toBe('35'); expect(actualValue('Contrast')).toBe('-50');
     expect(screen.queryByRole('slider', { name: 'Window center' })).toBeNull();
   });
@@ -169,15 +169,15 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     expect(screen.queryByRole('button', { name: 'Bitewing' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Detail' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Low' }));
-    expect(actualValue('Gamma')).toBe('0.3'); expect(actualValue('Sharpness strength')).toBe('1');
-    expect(actualValue('Tone')).toBe('35'); expect(actualValue('Contrast')).toBe('-50');
-    expect(Number(slider('Gamma').value)).toBeCloseTo(25); expect(Number(slider('Sharpness strength').value)).toBe(0);
+    expect(actualValue('Gamma')).toBe('0.7'); expect(actualValue('Sharpness strength')).toBe('3');
+    expect(actualValue('Tone')).toBe('45'); expect(actualValue('Contrast')).toBe('-75');
+    expect(Number(slider('Gamma').value)).toBeCloseTo(75); expect(Number(slider('Sharpness strength').value)).toBe(20);
     fireEvent.click(screen.getByRole('button', { name: 'High' }));
-    expect(actualValue('Gamma')).toBe('0.7'); expect(actualValue('Sharpness strength')).toBe('6');
-    expect(actualValue('Tone')).toBe('35'); expect(actualValue('Contrast')).toBe('-50');
+    expect(actualValue('Gamma')).toBe('0.22'); expect(actualValue('Sharpness strength')).toBe('8');
+    expect(actualValue('Tone')).toBe('0'); expect(actualValue('Contrast')).toBe('0');
     fireEvent.click(screen.getByRole('button', { name: 'Med' }));
     for (const label of Object.keys(centers)) expect(Number(slider(label).value)).toBeCloseTo(50);
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ gamma: .5, sharpen: 3, windowCenter: neutral.windowCenter - neutral.windowWidth * .25 * .35, windowWidth: neutral.windowWidth * Math.SQRT2 }) })));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ gamma: .5, sharpen: 6, windowCenter: neutral.windowCenter - neutral.windowWidth * .25 * .35, windowWidth: neutral.windowWidth * Math.SQRT2 }) })));
   });
   it('maps pointer slider positions back to real tone and contrast values', async () => {
     render(<App />); await open();
@@ -209,7 +209,7 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     render(<App />); await open();
     expect(actualValue('Tone')).toBe('35');
     fireEvent.click(screen.getByRole('button', { name: 'High' }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ gamma: .7, sharpen: 6, windowCenter: neutral.windowCenter + neutral.windowWidth * .25 * .35 }) })));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ gamma: .22, sharpen: 8, windowCenter: neutral.windowCenter }) })));
     expect(screen.getByLabelText('Current processing preset').textContent).toContain('High');
   });
   it('shows the first enhanced image while subsequent imports are pending', async () => {
@@ -303,14 +303,14 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     fireEvent.click(screen.getByRole('button', { name: '01 first.rvg' }));
     expect(actualValue('Gamma')).toBe('0.72');
     fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
-    expect(actualValue('Gamma')).toBe('0.5'); expect(actualValue('Sharpness strength')).toBe('3');
+    expect(actualValue('Gamma')).toBe('0.5'); expect(actualValue('Sharpness strength')).toBe('6');
   });
   it('toggles false color without changing tone/detail and keeps a linear monochrome histogram', async () => {
     render(<App />); await open(); setSlider('Gamma', .33); setSlider('Tone', 30);
     fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
     expect(screen.getByLabelText('Local contrast color legend')).toBeTruthy();
-    expect(actualValue('Gamma')).toBe('0.33'); expect(Number(actualValue('Tone'))).toBeCloseTo(30); expect(actualValue('Sharpness strength')).toBe('3');
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, gamma: .33, sharpen: 3 }) })));
+    expect(actualValue('Gamma')).toBe('0.33'); expect(Number(actualValue('Tone'))).toBeCloseTo(30); expect(actualValue('Sharpness strength')).toBe('6');
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, gamma: .33, sharpen: 6 }) })));
     const histogram = screen.getByRole('img', { name: /Monochrome intensity histogram.*linear count/ });
     expect(histogram.querySelector('path')?.getAttribute('d')).toContain('L85.33333333333333,59');
     expect(screen.getByText('Midtones')).toBeTruthy();
@@ -398,7 +398,7 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     fireEvent.click(screen.getByRole('button', { name: 'High' }));
     expect(slider('Feature size').value).toBe('17'); expect(slider('Color amount').value).toBe('0.42');
     expect(screen.getByLabelText('Current processing preset').textContent).toContain('High');
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, colorStrength: .42, colorScale: 17, sharpen: 6 }) })));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, colorStrength: .42, colorScale: 17, sharpen: 8 }) })));
     fireEvent.click(screen.getByRole('button', { name: 'Export PNG' }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('export_image', expect.objectContaining({ recipe: expect.objectContaining({ colorStrength: .42, colorScale: 17 }) })));
     fireEvent.change(screen.getByLabelText('New preset name'), { target: { value: 'Local overlay' } });
@@ -439,7 +439,7 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
   it('saves the visible recipe including false color', async () => {
     render(<App />); await open(); fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_review', expect.objectContaining({ review: expect.objectContaining({ images: [expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, gamma: .5, sharpen: 3 }) })] }) })));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_review', expect.objectContaining({ review: expect.objectContaining({ images: [expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, gamma: .5, sharpen: 6 }) })] }) })));
   });
 });
 

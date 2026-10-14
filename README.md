@@ -36,9 +36,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ## View and adjust images
 
-New imports and **Reset** use **Med**: Gamma **0.50**, Tone **35**, Contrast **−50**, Sharpness **3**. Each default sits at the midpoint of its slider. Gamma spans 0.1–0.9, Tone and Contrast retain their existing −100…100 scales, and Sharpness spans 1–10. The two halves of each slider are scaled separately where needed; displayed values and saved recipes retain their actual meaning. Arrow keys adjust by the displayed control's step.
+New imports and **Reset** use **Med**: Gamma **0.50**, Tone **35**, Contrast **−50**, Sharpness **6**. Each default sits at the midpoint of its slider. Gamma spans 0.1–0.9, Tone and Contrast retain their existing −100…100 scales, and Sharpness spans 1–10. The two halves of each slider are scaled separately where needed; displayed values and saved recipes retain their actual meaning. Arrow keys adjust by the displayed control's step.
 
-The **Low / Med / High** buttons use gamma/sharpness **0.30 / 1**, **0.50 / 3**, and **0.70 / 6**, respectively, with Tone 35 and Contrast −50. Colorize settings are retained when choosing a preset. Existing saved recipes keep their exact values until edited.
+The **Low / Med / High** buttons increase enhancement: Low uses gamma 0.70, Tone 45, Contrast -75 and sharpness 3; Med uses gamma 0.50, Tone 35, Contrast -50 and sharpness 6; High uses gamma 0.22, Tone 0, Contrast 0 and sharpness 8. Lower gamma darkens the image in this pipeline. High has the strongest global/local contrast and sharpening; Low is the mildest. Med restores the earlier sharpening parameters. Colorize settings are retained when choosing a preset. Existing saved recipes keep their exact values until edited.
 
 **Right-click an image** to rotate it 90° clockwise. **Double-right-click** to toggle its thumbtack hold without rotating it. Single-right-click rotation waits briefly to distinguish the double-click gesture. The Rotate and thumbtack buttons remain available. Left-double-click still fits the image.
 

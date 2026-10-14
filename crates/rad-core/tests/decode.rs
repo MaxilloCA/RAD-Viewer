@@ -294,6 +294,73 @@ fn secondary_capture_is_detected_by_content_with_sc_and_cs_extensions() {
 }
 
 #[test]
+fn jpeg_extended_secondary_capture_decodes_without_external_codec_software() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("synthetic.sc");
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+        .encode(&[0, 64, 192, 255], 4, 1, image::ExtendedColorType::L8)
+        .unwrap();
+    let expected = image::load_from_memory(&jpeg).unwrap().to_luma8();
+    // Eight-bit sequential Huffman JPEG is also valid under the Extended
+    // Sequential SOF1 process used by transfer syntax 1.2.840.10008.1.2.4.51.
+    let frame_marker = jpeg.windows(2).position(|v| v == [0xff, 0xc0]).unwrap();
+    jpeg[frame_marker + 1] = 0xc1;
+    if !jpeg.len().is_multiple_of(2) {
+        jpeg.push(0);
+    }
+    dicom(
+        &path,
+        false,
+        8,
+        "MONOCHROME2",
+        1,
+        false,
+        Some("1.2.840.10008.1.2.4.51"),
+    );
+    let mut bytes = std::fs::read(&path).unwrap();
+    let pixel_data = bytes
+        .windows(6)
+        .position(|v| v == b"\xe0\x7f\x10\x00OB")
+        .unwrap();
+    bytes.truncate(pixel_data);
+    let dataset = bytes
+        .windows(6)
+        .position(|v| v == b"\x28\x00\x02\x00US")
+        .unwrap();
+    let mut sop_class = Vec::new();
+    element(
+        &mut sop_class,
+        8,
+        0x16,
+        b"UI",
+        b"1.2.840.10008.5.1.4.1.1.7\0",
+        false,
+    );
+    bytes.splice(dataset..dataset, sop_class);
+    // Undefined-length encapsulated Pixel Data, empty offset table, one fragment.
+    bytes.extend(b"\xe0\x7f\x10\x00OB\0\0\xff\xff\xff\xff");
+    bytes.extend(b"\xfe\xff\x00\xe0\0\0\0\0");
+    bytes.extend(b"\xfe\xff\x00\xe0");
+    bytes.extend((jpeg.len() as u32).to_le_bytes());
+    bytes.extend(jpeg);
+    bytes.extend(b"\xfe\xff\xdd\xe0\0\0\0\0");
+    for extension in ["sc", "cs"] {
+        let path = path.with_extension(extension);
+        std::fs::write(&path, &bytes).unwrap();
+        let decoded = decode(&path).unwrap();
+        assert_eq!((decoded.width, decoded.height), (4, 1));
+        assert_eq!(decoded.metadata.bits_stored, 8);
+        assert_eq!(decoded.samples.len(), expected.len());
+        for (actual, expected) in decoded.samples.iter().zip(expected.as_raw()) {
+            // Distinct JPEG implementations may round inverse DCT by one level.
+            assert!((actual - f32::from(*expected)).abs() <= 1.0);
+        }
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn signed_dicom_preserves_samples_modality_voi_and_polarity_separately() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("signed.unknown");

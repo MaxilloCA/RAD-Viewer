@@ -202,7 +202,7 @@ describe('bounded patient image library', () => {
     expect(result.current.entries.map(entry => entry.rotationQuarterTurns)).toEqual([0, 1]);
     act(() => result.current.rotate());
     expect(result.current.entries.map(entry => entry.rotationQuarterTurns)).toEqual([1, 1]);
-    expect(result.current.entries[0].defaultRecipe).toMatchObject({ gamma: .5, sharpen: 3 });
+    expect(result.current.entries[0].defaultRecipe).toMatchObject({ gamma: .5, sharpen: 6 });
   });
 
   it('rejects cancelled pin generations when the same entry is pinned again', async () => {

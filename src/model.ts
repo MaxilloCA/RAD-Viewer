@@ -97,10 +97,14 @@ export function experimentalPreset(name: string, neutral: Recipe, suggested: Rec
     case 'low':
     case 'med':
     case 'high': {
-      const gamma = name === 'low' ? .3 : name === 'high' ? .7 : .5;
-      const sharpen = name === 'low' ? 1 : name === 'high' ? 6 : 3;
-      const preset = { ...enhanced, gamma, localContrast: .4, sharpen, radius: 2.2, threshold: .0015, halo: .35 };
-      return withTone(withContrast(preset, suggested, -50), suggested, 35, photometric);
+      // Lower gamma darkens this pipeline: enhancement increases from Low to High.
+      const settings = name === 'low'
+        ? { gamma: .7, sharpen: 3, localContrast: .2, radius: 2.2, threshold: .0015, tone: 45, contrast: -75 }
+        : name === 'high'
+          ? { gamma: .22, sharpen: 8, localContrast: .5, radius: 2.5, threshold: .001, tone: 0, contrast: 0 }
+          : { gamma: .5, sharpen: 6, localContrast: .4, radius: 2.2, threshold: .0015, tone: 35, contrast: -50 };
+      const { tone, contrast, ...detail } = settings;
+      return withTone(withContrast({ ...enhanced, ...detail, halo: .35 }, suggested, contrast), suggested, tone, photometric);
     }
     // Retain the previous helper names for callers restoring earlier presets.
     case 'bitewing': return { ...enhanced, gamma: .22, localContrast: 0.4, sharpen: 6, radius: 2.2, threshold: 0.0015, halo: 0.35 };
