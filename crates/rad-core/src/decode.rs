@@ -24,6 +24,8 @@ pub struct SourceImage {
 pub struct ImageMetadata {
     pub name: String,
     pub format: String,
+    pub image_date: Option<String>,
+    pub date_source: Option<String>,
     pub bits_stored: u16,
     pub signed: bool,
     pub photometric: String,
@@ -103,9 +105,56 @@ fn optional_float(obj: &DefaultDicomObject, name: &str) -> Result<Option<f32>, S
     }
 }
 
+// Keep the calendar date recorded by the device, without a timezone conversion.
+fn calendar_date(value: &str, datetime: bool) -> Option<String> {
+    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if (!datetime && value.len() != 8) || value.len() < 8 {
+        return None;
+    }
+    let date = value.as_bytes().get(..8)?;
+    if !date.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let number = |part: &[u8]| part.iter().fold(0_u32, |n, b| n * 10 + u32::from(b - b'0'));
+    let year = number(&date[..4]);
+    let month = number(&date[4..6]);
+    let day = number(&date[6..8]);
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if year == 0 || day == 0 || day > days {
+        return None;
+    }
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn dicom_image_date(obj: &DefaultDicomObject) -> (Option<String>, Option<String>) {
+    for name in [
+        "AcquisitionDateTime",
+        "AcquisitionDate",
+        "ContentDate",
+        "StudyDate",
+        "SeriesDate",
+    ] {
+        let Some(value) = obj.element_by_name(name).ok().and_then(|e| e.to_str().ok()) else {
+            continue;
+        };
+        if let Some(date) = calendar_date(&value, name == "AcquisitionDateTime") {
+            return (Some(date), Some(name.into()));
+        }
+    }
+    (None, None)
+}
+
 fn decode_dicom(path: &Path) -> Result<SourceImage, String> {
     // Error details deliberately exclude arbitrary DICOM values and patient tags.
     let obj = open_file(path).map_err(|_| "Cannot parse this file as DICOM, PNG or JPEG")?;
+    let (image_date, date_source) = dicom_image_date(&obj);
     let width = u32::from(required_u16(&obj, "Columns")?);
     let height = u32::from(required_u16(&obj, "Rows")?);
     check_dimensions(width, height)?;
@@ -230,6 +279,8 @@ fn decode_dicom(path: &Path) -> Result<SourceImage, String> {
         ImageMetadata {
             name: file_name(path),
             format: "DICOM".into(),
+            image_date,
+            date_source,
             bits_stored,
             signed,
             photometric,
@@ -323,6 +374,8 @@ fn decode_ordinary(path: &Path, file: File, format: ImageFormat) -> Result<Sourc
                 "JPEG"
             }
             .into(),
+            image_date: None,
+            date_source: None,
             bits_stored,
             signed: false,
             photometric,
@@ -374,6 +427,41 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn calendar_dates_validate_leap_years_and_keep_local_datetime_day() {
+        assert_eq!(
+            calendar_date("20240229", false).as_deref(),
+            Some("2024-02-29")
+        );
+        assert_eq!(
+            calendar_date("20000229", false).as_deref(),
+            Some("2000-02-29")
+        );
+        assert_eq!(
+            calendar_date("20241231235959.123-0500", true).as_deref(),
+            Some("2024-12-31")
+        );
+        assert_eq!(
+            calendar_date("20240101000100+1400", true).as_deref(),
+            Some("2024-01-01")
+        );
+        for invalid in [
+            "19000229",
+            "20230229",
+            "20240431",
+            "00000101",
+            "20241301",
+            "20240100",
+            "2024",
+            "202401",
+            "2024-01-01",
+            "2024010112",
+            "abcdefgh",
+            "",
+        ] {
+            assert_eq!(calendar_date(invalid, false), None, "{invalid}");
+        }
+    }
     #[test]
     fn stored_bits_sign_extension_and_unused_bits() {
         assert_eq!(stored_sample(0xffff, 12, false), 4095.0);

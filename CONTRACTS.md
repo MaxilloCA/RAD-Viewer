@@ -1,5 +1,13 @@
 # Phase A integration contract
 
+## 0.3.4 rotation, image dates and reversed color
+
+`ImageMetadata` adds nullable `imageDate` (validated calendar `YYYY-MM-DD`) and `dateSource` (DICOM keyword). Preference is AcquisitionDateTime, AcquisitionDate, ContentDate, StudyDate, SeriesDate. Missing or invalid values fall through; ordinary PNG/JPEG dates are unavailable. The interface formats calendar components as `DD-MMM-YYYY` without timezone conversion.
+
+Frontend entries retain `rotationQuarterTurns` in 0–3 independently of processing recipes. The main image and thumbnail rotate clockwise, fit swaps dimensions for odd turns, and review JSON includes this field. `export_image` accepts optional `rotationQuarterTurns` (default 0); it rotates the full-resolution final RGBA output by exact pixel permutation before PNG encoding. Original source pixels and processing histograms are unchanged.
+
+Colorize now reverses the existing sampled Viridis lookup: zero maps to RGB (253,231,37), one to (68,1,84). This intentionally updates the appearance of existing version-2 Colorize recipes. The upstream grayscale stages and histogram remain unchanged.
+
 ## 0.3.3 Carestream Secondary Capture and LAN lookup
 
 The picker and patient discovery recognize `.sc`/`.cs` case-insensitively; decoding still identifies content rather than assuming every file with that suffix is DICOM. The supplied `.sc` files are single-frame DICOM Secondary Capture with JPEG Extended compressed unsigned 8-bit MONOCHROME2 data. No decoder conversion or invented bit depth is introduced. Edits remain processing recipes and separate PNG exports.

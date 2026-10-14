@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { commit, contrastValue, dragAdjustment, experimentalPreset, redo, sameRecipe, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
+import { commit, contrastValue, dragAdjustment, experimentalPreset, formatImageDate, dateSourceLabel, orientedDimensions, redo, sameRecipe, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
 import type { Recipe } from './model';
 
 const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, localContrast: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false, colorize: false };
@@ -79,5 +79,22 @@ describe('non-destructive per-image adjustment history', () => {
     const reordered = Object.fromEntries(Object.entries(neutral).reverse()) as unknown as Recipe;
     expect(sameRecipe(neutral, reordered)).toBe(true);
     expect(sameRecipe(neutral, { ...reordered, colorize: true })).toBe(false);
+  });
+});
+
+describe('calendar dates and quarter-turn orientation', () => {
+  it('formats strict calendar dates without timezones or inferred dates', () => {
+    expect(formatImageDate('2026-04-08')).toBe('08-Apr-2026');
+    expect(formatImageDate('2024-02-29')).toBe('29-Feb-2024');
+    for (const invalid of [undefined, null, '', '2026-02-29', '2026-04-31', '0000-01-01', '2026-1-02', '2026-01-02T00:00:00Z', '2026-13-01']) expect(formatImageDate(invalid)).toBe('Date unavailable');
+    expect(dateSourceLabel('ContentDate')).toBe('Image content date');
+    expect(dateSourceLabel('AcquisitionDate')).toBe('Acquisition date');
+    expect(dateSourceLabel(null)).toBe('No acquisition date metadata');
+  });
+  it('swaps fit dimensions only for odd quarter turns', () => {
+    expect(orientedDimensions(1200, 900, 0)).toEqual({ width: 1200, height: 900 });
+    expect(orientedDimensions(1200, 900, 1)).toEqual({ width: 900, height: 1200 });
+    expect(orientedDimensions(1200, 900, 2)).toEqual({ width: 1200, height: 900 });
+    expect(orientedDimensions(1200, 900, 3)).toEqual({ width: 900, height: 1200 });
   });
 });

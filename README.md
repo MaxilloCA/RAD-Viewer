@@ -23,6 +23,8 @@ npm.cmd run tauri -- build -- --locked
 Executable: `target\release\rad-viewer.exe`. Installer: `target\release\bundle\nsis\`.
 Dependency versions are pinned in manifests and resolved dependencies in `Cargo.lock` / `package-lock.json`.
 
+The user's shared deployment copy is **`D:\APPS\RAD-Viewer\rad-viewer.exe`**. Rebuilds are copied there after verification; the build output above remains in the project workspace.
+
 For LAN access, share `C:\CODEX\RAD-Viewer\target\release` on **SERVER**. If the share is named `RADViewer`, the executable is `\\SERVER\RADViewer\rad-viewer.exe`. It runs on the Windows PC opening it. Patient lookup tries the local `D:\ABELDent\DATA\NOTES` folder first, then `\\C04577\ABELDent\DATA\NOTES` when the local patient folder is unavailable. The remote PC needs access to that patient share. The installer in `target\release\bundle\nsis` can install the viewer and its WebView2 prerequisite on another PC.
 
 ```powershell
@@ -34,13 +36,17 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ## View and adjust images
 
+**Rotate 90° clockwise** turns the selected image and its preview by one quarter turn; four clicks return it to its original orientation. Fit accounts for the rotated dimensions. Rotation is kept separately for each image, survives decoded-image cache eviction, and is included in exported PNGs and saved review JSON. Source files remain unchanged.
+
+Each image and preview displays its embedded date as **DD-MMM-YYYY** (for example, `14-Oct-2026`). Date priority is Acquisition Date/Time, Acquisition Date, Content Date, Study Date, then Series Date. The tooltip identifies the source. Dates are validated without timezone conversion. Images without usable embedded date metadata show **Date unavailable**.
+
 Choose **Open patient** and enter the patient number. For example, `67589` resolves to `D:\ABELDent\DATA\NOTES\89\67589`. The viewer reads `PatientInfo.xml` for the patient's name and radiograph directory, follows that directory when available, and falls back to the local patient folder with a notice when unavailable. All supported radiographs in that directory and its subfolders appear in the bottom strip automatically, with previews generated progressively. Select a preview to view the full image. The top bar shows the patient name and entered ID; unavailable names are identified explicitly. Leading zeros are preserved. Opening another patient replaces the strip; failed lookup or an empty collection leaves the existing review intact. Only the requested patient's directory is scanned, and source files remain unchanged. Full-resolution images use a bounded cache so collections larger than 24 images remain available.
 
 Open local RVG, PANO, DICOM, JPEG or PNG files. DICOM is detected from content, independently of its extension. Select an image in the strip. Version 0.3.0 shows one enhanced image, with gamma **0.22** and sharpness **6** on every import and Reset. Gamma controls span **0.1–0.9** and sharpness **5–10**. Eligible high-depth intraoral DICOM also receives a source-aware starting window; other images use their supplied or neutral starting window.
 
 Hold the left mouse button on the image and drag **right/left to lighten/darken tone**, or **up/down to increase/decrease gamma**. Shift-drag or middle-drag pans; the wheel zooms; double-click fits. Choose 100% to inspect source pixels. A completed drag is one undo step. Tone and Contrast use short, labeled relative scales instead of raw detector values. The monochrome histogram uses linear pixel counts and a black-to-white intensity strip.
 
-**Colorize** toggles an ordered sampled Viridis false-color mapping of processed intensity, retaining current tone/detail settings. The legend runs from low to high intensity. Histogram and clipping describe intensity before the color mapping. Colorize is included in PNG exports and saved presets. Neutral and Endo preset buttons, the original/reference panes and bypass are removed. Source pixels remain immutable internally.
+**Colorize** toggles a reversed sampled Viridis false-color mapping of processed intensity, retaining current tone/detail settings. Darkest areas are yellow; lightest areas are dark purple. Histogram and clipping describe intensity before the color mapping. Colorize is included in PNG exports and saved presets; existing Colorize recipes use this updated direction. Neutral and Endo preset buttons, the original/reference panes and bypass are removed. Source pixels remain immutable internally.
 
 Expand advanced controls for local contrast, noise reduction and detail enhancement. Undo, redo and Reset affect the selected image. Old saved recipes retain their rendering, even when stored values fall outside the new slider ranges; the UI identifies those values. PNG export always processes the full source resolution. Save review JSON to record recipes; it is not a reopenable workspace session. See [processing details](PROCESSING.md) and [the earlier research and comparison report](verification/IMAGE_QUALITY_REVIEW.md). Matched-scale Carestream comparison remains part of the user's image-quality review.
 

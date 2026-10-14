@@ -279,8 +279,9 @@ fn quantize(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// Approximate sampled Viridis: linear RGB interpolation between nine fixed
-/// display-color stops. This remaps processed luminance only; it does not add
+/// Approximate reversed sampled Viridis: dark luminance maps to yellow and
+/// bright luminance to dark purple, interpolating nine fixed display-color stops.
+/// This remaps processed luminance only; it does not add
 /// image information, alter enhancement, or change luminance histogram counts.
 fn sampled_viridis(luminance: f32) -> [f32; 3] {
     const STOPS: [[f32; 3]; 9] = [
@@ -294,7 +295,7 @@ fn sampled_viridis(luminance: f32) -> [f32; 3] {
         [170.0, 220.0, 50.0],
         [253.0, 231.0, 37.0],
     ];
-    let position = luminance.clamp(0.0, 1.0) * 8.0;
+    let position = (1.0 - luminance.clamp(0.0, 1.0)) * 8.0;
     let index = (position as usize).min(STOPS.len() - 2);
     let fraction = position - index as f32;
     std::array::from_fn(|channel| {
@@ -728,6 +729,8 @@ mod tests {
             color: None,
             metadata: ImageMetadata {
                 name: "synthetic".into(),
+                image_date: None,
+                date_source: None,
                 format: "test".into(),
                 bits_stored: 12,
                 signed: false,
@@ -1142,27 +1145,27 @@ mod tests {
 
     #[test]
     fn sampled_viridis_endpoints_channels_and_luminance_order_are_stable() {
-        assert_eq!(sampled_viridis(0.0).map(quantize), [68, 1, 84]);
-        assert_eq!(sampled_viridis(1.0).map(quantize), [253, 231, 37]);
+        assert_eq!(sampled_viridis(0.0).map(quantize), [253, 231, 37]);
+        assert_eq!(sampled_viridis(1.0).map(quantize), [68, 1, 84]);
         assert_eq!(sampled_viridis(0.5).map(quantize), [33, 144, 141]);
         let luminance = |rgb: [f32; 3]| rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
-        let mut previous = -1.0;
+        let mut previous = f32::INFINITY;
         for i in 0..=4096 {
             let rgb = sampled_viridis(i as f32 / 4096.0);
             assert!(rgb.iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)));
             let current = luminance(rgb);
-            assert!(current >= previous);
+            assert!(current <= previous);
             previous = current;
         }
         // Verify actual rounded colors for every 8-bit display-luminance value,
         // not only the nine control points.
-        previous = -1.0;
+        previous = f32::INFINITY;
         for i in 0..=255 {
             let rgb = sampled_viridis(i as f32 / 255.0)
                 .map(quantize)
                 .map(f32::from);
             let current = luminance(rgb);
-            assert!(current >= previous);
+            assert!(current <= previous);
             previous = current;
         }
     }
@@ -1182,10 +1185,10 @@ mod tests {
         recipe.colorize = true;
         let colorized = session.process(&recipe).unwrap();
         assert_eq!(allocation, session.prepared.as_ref().unwrap().1.as_ptr());
-        assert_eq!(&colorized.rgba[..4], &[68, 1, 84, 255]);
+        assert_eq!(&colorized.rgba[..4], &[253, 231, 37, 255]);
         assert_eq!(
             &colorized.rgba[colorized.rgba.len() - 4..],
-            &[253, 231, 37, 255]
+            &[68, 1, 84, 255]
         );
         assert_ne!(colorized.rgba, grayscale.rgba);
         assert_eq!(colorized.histogram, grayscale.histogram);

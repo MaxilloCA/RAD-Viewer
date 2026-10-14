@@ -49,6 +49,7 @@ describe('bounded patient image library', () => {
     await waitFor(() => expect(result.current.entries[0].image).toBeTruthy());
     const editedKey = result.current.entries[0].key;
     const firstId = result.current.entries[0].image!.info.id;
+    act(() => result.current.rotate());
     act(() => result.current.changeHistory(history => commit(history, { ...history.present, gamma: .44 })));
     act(() => result.current.append(Array.from({ length: 12 }, (_, index) => `extra-${index}.rvg`)));
     await waitFor(() => expect(result.current.entries.every(entry => entry.thumbnail)).toBe(true));
@@ -58,6 +59,7 @@ describe('bounded patient image library', () => {
     await waitFor(() => expect(result.current.entries[0].image).toBeTruthy());
     expect(result.current.entries[0].image!.info.id).not.toBe(firstId);
     expect(result.current.entries[0].history!.present.gamma).toBe(.44);
+    expect(result.current.entries[0].rotationQuarterTurns).toBe(1);
     const lastRender = mocks.invoke.mock.calls.filter(([command]) => command === 'render_image').at(-1);
     expect(lastRender?.[1].recipe.gamma).toBe(.44);
     act(() => result.current.changeHistory(undo));

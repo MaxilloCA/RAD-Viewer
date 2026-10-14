@@ -87,6 +87,30 @@ fn png(render: &rad_core::RenderedImage) -> Result<Vec<u8>, String> {
     .map_err(|e| e.to_string())?;
     Ok(bytes)
 }
+
+fn export_png(render: &rad_core::RenderedImage, quarter_turns: u8) -> Result<Vec<u8>, String> {
+    if quarter_turns == 0 {
+        return png(render);
+    }
+    let image = image::RgbaImage::from_raw(render.width, render.height, render.rgba.clone())
+        .ok_or("Invalid rendered pixel dimensions")?;
+    let rotated = match quarter_turns {
+        1 => image::imageops::rotate90(&image),
+        2 => image::imageops::rotate180(&image),
+        3 => image::imageops::rotate270(&image),
+        _ => return Err("Rotation must be 0, 1, 2 or 3 clockwise quarter turns".into()),
+    };
+    let mut bytes = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut bytes)
+        .write_image(
+            rotated.as_raw(),
+            rotated.width(),
+            rotated.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
 #[tauri::command]
 async fn choose_images() -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(|| pick_radiographs(None))
@@ -448,8 +472,13 @@ fn protects_source(path: &Path, sources: &[PathBuf]) -> bool {
 async fn export_image(
     id: String,
     recipe: Recipe,
+    rotation_quarter_turns: Option<u8>,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
+    let quarter_turns = rotation_quarter_turns.unwrap_or(0);
+    if quarter_turns > 3 {
+        return Err("Rotation must be 0, 1, 2 or 3 clockwise quarter turns".into());
+    }
     let source = state
         .images
         .lock()
@@ -475,7 +504,7 @@ async fn export_image(
         else {
             return Ok(None);
         };
-        let bytes = png(&process(&source, &recipe)?)?;
+        let bytes = export_png(&process(&source, &recipe)?, quarter_turns)?;
         let sources = source_paths.lock().unwrap();
         if protects_source(&path, &sources) {
             return Err("Choose a new file. Original images cannot be overwritten.".into());
@@ -662,6 +691,40 @@ mod tests {
             &directory.path().join("export.png"),
             &[path]
         ));
+    }
+    #[test]
+    fn exported_rotations_are_lossless_clockwise_and_keep_source_unchanged() {
+        let rgba: Vec<u8> = (1..=6)
+            .flat_map(|value| [value, value + 10, value + 20, 255])
+            .collect();
+        let render = rad_core::RenderedImage {
+            width: 2,
+            height: 3,
+            rgba: rgba.clone(),
+            histogram: vec![0; 256],
+            clipped_low: 0,
+            clipped_high: 0,
+        };
+        for (turns, dimensions, expected) in [
+            (0, (2, 3), vec![1, 2, 3, 4, 5, 6]),
+            (1, (3, 2), vec![5, 3, 1, 6, 4, 2]),
+            (2, (2, 3), vec![6, 5, 4, 3, 2, 1]),
+            (3, (3, 2), vec![2, 4, 6, 1, 3, 5]),
+        ] {
+            let decoded = image::load_from_memory(&export_png(&render, turns).unwrap())
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(decoded.dimensions(), dimensions);
+            assert_eq!(
+                decoded.pixels().map(|p| p.0[0]).collect::<Vec<_>>(),
+                expected
+            );
+            assert!(decoded
+                .pixels()
+                .all(|p| p.0[1] == p.0[0] + 10 && p.0[2] == p.0[0] + 20 && p.0[3] == 255));
+        }
+        assert_eq!(render.rgba, rgba);
+        assert!(export_png(&render, 4).is_err());
     }
     #[test]
     fn thumbnail_is_bounded_and_preserves_aspect_ratio() {

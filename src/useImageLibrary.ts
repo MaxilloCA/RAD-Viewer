@@ -83,7 +83,7 @@ export function useImageLibrary(onError: (error: string) => void) {
   }, [update]);
   const append = useCallback((paths: string[], patient?: PatientIdentity) => {
     if (!paths.length) return;
-    const added = paths.map(path => ({ key: `image-${++entrySerial}`, path, name: path.split(/[\\/]/).pop() ?? path, patient, lastUsed: ++tick.current }));
+    const added = paths.map(path => ({ key: `image-${++entrySerial}`, path, name: path.split(/[\\/]/).pop() ?? path, patient, lastUsed: ++tick.current, rotationQuarterTurns: 0 }));
     update(previous => [...previous, ...added]); select(added[0].key);
   }, [select, update]);
   const replace = useCallback(async (paths: string[], patient: PatientIdentity) => {
@@ -110,6 +110,9 @@ export function useImageLibrary(onError: (error: string) => void) {
     if (current.image) await release(current.image.info.id);
     select(entriesRef.current[0]?.key ?? null);
   }, [release, select, update]);
+  const rotate = useCallback(() => {
+    update(previous => previous.map(entry => entry.key === selectedRef.current ? { ...entry, rotationQuarterTurns: (entry.rotationQuarterTurns + 1) % 4 } : entry));
+  }, [update]);
   useEffect(() => {
     alive.current = true;
     return () => {
@@ -117,5 +120,5 @@ export function useImageLibrary(onError: (error: string) => void) {
       for (const entry of entriesRef.current) if (entry.image) void release(entry.image.info.id);
     };
   }, [release]);
-  return { entries, selectedKey, loading, select, append, replace, changeHistory, close };
+  return { entries, selectedKey, loading, select, append, replace, changeHistory, close, rotate };
 }

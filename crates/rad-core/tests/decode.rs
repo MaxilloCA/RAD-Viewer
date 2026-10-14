@@ -19,6 +19,8 @@ fn png_8_and_16_bit_values_are_preserved_without_normalization() {
     let decoded = decode(&p16).unwrap();
     assert_eq!(decoded.samples, vec![0., 257., 4095., 65535.]);
     assert_eq!(decoded.metadata.bits_stored, 16);
+    assert_eq!(decoded.metadata.image_date, None);
+    assert_eq!(decoded.metadata.date_source, None);
 }
 
 #[test]
@@ -172,6 +174,65 @@ fn signed_eight_bit_dicom_does_not_become_unsigned() {
     let path = dir.path().join("signed-eight.dcm");
     dicom(&path, true, 8, "MONOCHROME2", 1, false, None);
     assert_eq!(decode(&path).unwrap().samples, vec![0., 127., -128., -1.]);
+}
+
+#[test]
+fn dicom_dates_follow_priority_and_skip_invalid_or_missing_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dated.sc");
+    let candidates: [(u16, &[u8; 2], &str, &str, &str); 5] = [
+        (
+            0x2a,
+            b"DT",
+            "20240229235959-0500",
+            "AcquisitionDateTime",
+            "2024-02-29",
+        ),
+        (0x22, b"DA", "20240301", "AcquisitionDate", "2024-03-01"),
+        (0x23, b"DA", "20240302", "ContentDate", "2024-03-02"),
+        (0x20, b"DA", "20240303", "StudyDate", "2024-03-03"),
+        (0x21, b"DA", "20240304", "SeriesDate", "2024-03-04"),
+    ];
+    for first_valid in 0..=candidates.len() {
+        dicom(&path, false, 8, "MONOCHROME2", 1, false, None);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mut dates = Vec::new();
+        // Insert group 0008 before the fixture's first group 0028 element.
+        let position = bytes
+            .windows(6)
+            .position(|v| v == b"\x28\x00\x02\x00US")
+            .unwrap();
+        let mut tags = candidates.iter().enumerate().collect::<Vec<_>>();
+        tags.sort_by_key(|(_, candidate)| candidate.0);
+        for (index, &(tag, vr, valid, _, _)) in tags {
+            let value = if index < first_valid {
+                "20230229"
+            } else {
+                valid
+            };
+            element(&mut dates, 8, tag, vr, value.as_bytes(), false);
+        }
+        bytes.splice(position..position, dates);
+        std::fs::write(&path, &bytes).unwrap();
+        let metadata = decode(&path).unwrap().metadata;
+        let expected = candidates.get(first_valid);
+        assert_eq!(metadata.image_date.as_deref(), expected.map(|c| c.4));
+        assert_eq!(metadata.date_source.as_deref(), expected.map(|c| c.3));
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(
+            json["imageDate"],
+            serde_json::to_value(&metadata.image_date).unwrap()
+        );
+        assert_eq!(
+            json["dateSource"],
+            serde_json::to_value(&metadata.date_source).unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+    dicom(&path, false, 8, "MONOCHROME2", 1, false, None);
+    let undated = decode(&path).unwrap().metadata;
+    assert_eq!(undated.image_date, None);
+    assert_eq!(undated.date_source, None);
 }
 
 #[test]

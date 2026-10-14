@@ -2,6 +2,14 @@
 
 Phase A comparison prototype, 2026-10-13 (America/Toronto).
 
+## 0.3.4 rotation, image dates and reversed Colorize — 2026-10-14
+
+- Added a selected-image 90° clockwise button. Rotation is retained per image independently from tone history; four clicks restore the starting orientation. Main view and previews rotate, fit accounts for swapped dimensions, saved review JSON records quarter turns, and PNG export performs exact full-resolution pixel permutation. Sources remain unchanged.
+- Added validated DICOM image dates with AcquisitionDateTime → AcquisitionDate → ContentDate → StudyDate → SeriesDate fallback, shown as `DD-MMM-YYYY` on the active image and each preview. Calendar components are preserved without timezone conversion. Tooltip identifies the date source; undated images show `Date unavailable`. The supplied RVGs contain acquisition date `20261014`; supplied SC files use content date `20260408` rather than their later study date.
+- Reversed the sampled Viridis Colorize lookup and legend: darkest is yellow (253,231,37), lightest dark purple (68,1,84). Histogram and grayscale stages are unchanged; existing Colorize recipes now use the reversed palette.
+- All 54 Rust workspace tests pass, with two manual performance tests ignored. Coverage includes real calendar/leap-year validation, DICOM date priority/fallback, exact clockwise export dimensions/pixels at all four orientations, source preservation, reversed palette endpoints and cached/direct colorized equality. Strict Clippy and rustfmt pass.
+- All 41 frontend tests and production build pass, including rotation per image/four-turn reset, orientation persistence through eviction, rotated fit/100% scaling, export/review payloads, date labels and reversed legend. Built Windows executable and `RAD Viewer_0.3.4_x64-setup.exe` using asset `index-CC9mTAmp.js`. Deployed a hash-verified copy to `D:\APPS\RAD-Viewer\rad-viewer.exe` (file version 0.3.4); previous executable retained as `rad-viewer-0.3.3.exe`. Native visual verification was blocked by Windows automation reporting `GetCursorPos failed: Access is denied (0x80070005)`; no claim of a completed on-screen check is made.
+
 ## 0.3.3 Secondary Capture and LAN access — 2026-10-14
 
 - The two supplied files are named `C1.sc` and `C2.sc` (not `.cs`). Both are DICOM Part 10, Secondary Capture Image Storage (`1.2.840.10008.5.1.4.1.1.7`), with JPEG Extended compression (`1.2.840.10008.1.2.4.51`), one 852 × 668 frame, unsigned 8-bit MONOCHROME2, and `LossyImageCompression=01`. These are image-header findings, not assumptions based on suffix. See [DICOM Secondary Capture](https://dicom.nema.org/medical/dicom/2026c/output/chtml/part03/sect_A.8.html) and [JPEG transfer syntaxes](https://dicom.nema.org/Medical/Dicom/current/output/chtml/part05/sect_A.4.html).

@@ -99,6 +99,8 @@ mod tests {
             samples,
             color: None,
             metadata: ImageMetadata {
+                image_date: None,
+                date_source: None,
                 name: "synthetic.rvg".into(),
                 format: "DICOM".into(),
                 bits_stored: 12,

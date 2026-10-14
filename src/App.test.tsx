@@ -277,6 +277,45 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     fireEvent.error(enhanced);
     expect(screen.getByRole('alert').textContent).toContain('Image display failed');
   });
+  it('rotates independently per image, exports orientation, and returns to zero after four turns', async () => {
+    openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg');
+    const rotate = () => fireEvent.click(screen.getByRole('button', { name: 'Rotate 90 degrees clockwise' }));
+    rotate();
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).toContain('rotate(90deg)');
+    expect(screen.getByRole('button', { name: '01 first.rvg' }).querySelector('img')?.getAttribute('style')).toContain('rotate(90deg)');
+    expect((screen.getByRole('button', { name: '↶ Undo' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Export PNG' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('export_image', expect.objectContaining({ id: 'first.rvg', rotationQuarterTurns: 1 })));
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_review', expect.objectContaining({ review: expect.objectContaining({ images: [expect.objectContaining({ rotationQuarterTurns: 1 }), expect.objectContaining({ rotationQuarterTurns: 0 })] }) })));
+    fireEvent.click(screen.getByRole('button', { name: '02 second.rvg' }));
+    expect(screen.getByAltText('Enhanced: second.rvg').getAttribute('style')).toContain('rotate(0deg)');
+    fireEvent.click(screen.getByRole('button', { name: '01 first.rvg' }));
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).toContain('rotate(90deg)');
+    rotate(); rotate(); rotate();
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).toContain('rotate(0deg)');
+  });
+  it('fits rotated dimensions and keeps physical pixel scaling unchanged', async () => {
+    vi.stubGlobal('ResizeObserver', class { constructor(private callback: ResizeObserverCallback) {} observe() { this.callback([{ contentRect: { width: 1000, height: 600 } } as ResizeObserverEntry], this as unknown as ResizeObserver); } disconnect() {} });
+    render(<App />); await open();
+    await waitFor(() => expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).toContain(`scale(${572 / 900})`));
+    fireEvent.click(screen.getByRole('button', { name: 'Rotate 90 degrees clockwise' }));
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).toContain(`scale(${572 / 1200})`);
+    fireEvent.click(screen.getByRole('button', { name: '100%' }));
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('style')).toContain('scale(1) rotate(90deg)');
+  });
+  it('shows acquisition dates on the active image and every thumbnail with readable source tooltips', async () => {
+    openPaths = ['first.rvg', 'second.rvg'];
+    customInvoke = (command, args) => command === 'import_image' && args.path === 'first.rvg' ? Promise.resolve({ ...info('first.rvg'), metadata: { ...info('first.rvg').metadata, imageDate: '2026-04-08', dateSource: 'ContentDate' } }) : undefined;
+    render(<App />); await open(); await readyThumbnail('02 second.rvg');
+    expect(screen.getAllByText('08-Apr-2026')).toHaveLength(2);
+    expect(screen.getAllByTitle('Image content date')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: '02 second.rvg' }).querySelector('time')?.textContent).toBe('Date unavailable');
+    fireEvent.click(screen.getByRole('button', { name: '02 second.rvg' }));
+    expect(screen.getAllByText('Date unavailable')).toHaveLength(2);
+    fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
+    expect(screen.getByLabelText('False-color intensity legend').textContent).toContain('Dark · YellowLight · Purple');
+  });
   it('saves the visible recipe including false color', async () => {
     render(<App />); await open(); fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
