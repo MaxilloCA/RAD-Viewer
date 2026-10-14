@@ -16,6 +16,7 @@ Phase A comparison prototype, 2026-10-13 (America/Toronto).
 - Native PNG export of neutral P2 produced 2861 × 1316 RGBA pixels. All RGB samples exactly matched an independent NumPy mapping of pydicom's raw pixels (`round(clamp(raw / 4095) × 255)`); all alpha samples were 255. The generated image stays in ignored `local-verification/`.
 - Windows NSIS installer built successfully. Installation on a separate clean Windows PC remains untested.
 - Intermediate cache follow-up: 25 Rust tests pass (plus the nine unchanged frontend tests), including byte-identical cached/direct rendering across all adjustments and rejecting a request superseded while waiting for its source cache. Strict Clippy passes. A 12-change R1 sharpness workload measured 94.62 ms cached versus 139.13 ms uncached median; output bytes matched exactly. See `PROCESSING.md`.
+- The updated native release and installer were rebuilt. Reopened all four samples in the native app; R2 Bitewing rendered in 110 ms, followed by a distinct sharpness change to 0.72 in 74 ms including PNG encoding. No rendering errors occurred. These are single functional-check observations, not a controlled latency benchmark.
 
 ## Required review gate
 
