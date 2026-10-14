@@ -175,6 +175,64 @@ fn signed_eight_bit_dicom_does_not_become_unsigned() {
 }
 
 #[test]
+fn secondary_capture_is_detected_by_content_with_sc_and_cs_extensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let sop_class = b"1.2.840.10008.5.1.4.1.1.7\0";
+    let transfer_syntax = b"1.2.840.10008.1.2.1\0";
+    let mut meta = Vec::new();
+    element(&mut meta, 2, 2, b"UI", sop_class, false);
+    element(&mut meta, 2, 0x10, b"UI", transfer_syntax, false);
+    let mut bytes = vec![0; 128];
+    bytes.extend(b"DICM");
+    element(
+        &mut bytes,
+        2,
+        0,
+        b"UL",
+        &(meta.len() as u32).to_le_bytes(),
+        false,
+    );
+    bytes.extend(meta);
+    element(&mut bytes, 8, 0x16, b"UI", sop_class, false);
+    for (tag, value) in [
+        (2, 1_u16),
+        (0x10, 2),
+        (0x11, 3),
+        (0x100, 8),
+        (0x101, 8),
+        (0x102, 7),
+        (0x103, 0),
+    ] {
+        element(&mut bytes, 0x28, tag, b"US", &value.to_le_bytes(), false);
+    }
+    element(&mut bytes, 0x28, 4, b"CS", b"MONOCHROME2 ", false);
+    element(
+        &mut bytes,
+        0x7fe0,
+        0x10,
+        b"OB",
+        &[0, 1, 64, 127, 199, 255],
+        false,
+    );
+    for extension in ["sc", "cs", "SC", "CS"] {
+        let path = dir.path().join(format!("secondary-capture.{extension}"));
+        std::fs::write(&path, &bytes).unwrap();
+        let decoded = decode(&path).unwrap();
+        assert_eq!((decoded.width, decoded.height), (3, 2));
+        assert_eq!(decoded.samples, [0., 1., 64., 127., 199., 255.]);
+        assert_eq!(decoded.metadata.format, "DICOM");
+        assert_eq!(decoded.metadata.bits_stored, 8);
+        assert!(!decoded.metadata.signed);
+        assert_eq!(decoded.metadata.photometric, "MONOCHROME2");
+        assert_eq!(
+            (decoded.metadata.slope, decoded.metadata.intercept),
+            (1., 0.)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn signed_dicom_preserves_samples_modality_voi_and_polarity_separately() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("signed.unknown");

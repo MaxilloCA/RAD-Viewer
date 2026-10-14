@@ -2,6 +2,14 @@
 
 Phase A comparison prototype, 2026-10-13 (America/Toronto).
 
+## 0.3.3 Secondary Capture and LAN access — 2026-10-14
+
+- The two supplied files are named `C1.sc` and `C2.sc` (not `.cs`). Both are DICOM Part 10, Secondary Capture Image Storage (`1.2.840.10008.5.1.4.1.1.7`), with JPEG Extended compression (`1.2.840.10008.1.2.4.51`), one 852 × 668 frame, unsigned 8-bit MONOCHROME2, and `LossyImageCompression=01`. These are image-header findings, not assumptions based on suffix. See [DICOM Secondary Capture](https://dicom.nema.org/medical/dicom/2026c/output/chtml/part03/sect_A.8.html) and [JPEG transfer syntaxes](https://dicom.nema.org/Medical/Dicom/current/output/chtml/part05/sect_A.4.html).
+- The existing decoder already handles these files. Added explicit `.sc`/`.cs` picker entries, case-insensitive patient discovery suffixes, interface format text, and synthetic Secondary Capture regression coverage. Standard DICOM content detection still works independently of suffix.
+- Independent pylibjpeg/libjpeg comparison: 569,136 pixels per image, about 97.62% exact agreement; remaining values differ by one 8-bit level only, consistent with independent lossy JPEG rounding. Both images processed and exported successfully with neutral, legacy, Bitewing, Detail and Colorize recipes (10 full-resolution PNGs). Original SHA-256 hashes are unchanged. Clinical outputs and machine-readable reports remain ignored under `local-verification/sc-format/`. The requested gamma 0.22 remains unchanged; on these rendered 8-bit captures, it clips approximately 19.2%/16.8% of pixels at black, including background. Successful decoding is not image-quality acceptance.
+- Patient opening now falls back from local D: to `\\C04577\ABELDent\DATA\NOTES` when the local patient folder is unavailable. The example network folder is reachable from SERVER. The executable remains `C:\CODEX\RAD-Viewer\target\release\rad-viewer.exe`; sharing the release folder as `RADViewer` gives `\\SERVER\RADViewer\rad-viewer.exe`. No Windows sharing settings were changed, and execution from a second LAN PC remains untested.
+- Frontend: 36 tests and production build pass. Rust: 51 tests pass, two manual benchmarks ignored; strict Clippy and rustfmt pass. Built `target/release/rad-viewer.exe` and `RAD Viewer_0.3.3_x64-setup.exe` with frontend asset `index-D3Iwg_UD.js`. Native UI and execution from a second LAN PC were not verified in this revision.
+
 ## 0.3.2 automatic patient collection — 2026-10-14
 
 - Read the example patient's `PatientInfo.xml` locally. It supplies first/last name and a UNC `directory`; the referenced directory is accessible and currently contains six RVG files. These files are now also present in the local patient folder, superseding the earlier empty-folder observation. Patient names and clinical content are not copied into source or test fixtures.

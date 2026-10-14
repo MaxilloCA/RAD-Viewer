@@ -63,7 +63,7 @@ fn is_radiograph(path: &Path) -> bool {
         .to_ascii_lowercase();
     if matches!(
         extension.as_str(),
-        "rvg" | "pano" | "dcm" | "dicom" | "jpg" | "jpeg" | "png"
+        "rvg" | "pano" | "sc" | "cs" | "dcm" | "dicom" | "jpg" | "jpeg" | "png"
     ) {
         return true;
     }
@@ -229,6 +229,15 @@ mod tests {
         assert_eq!(study.patient_number, "00102");
         assert_eq!(study.patient_name.as_deref(), Some("Test Person"));
         assert!(study.warnings.is_empty());
+    }
+    #[test]
+    fn secondary_capture_suffixes_are_discovered_case_insensitively() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["C1.sc", "C2.SC", "C3.cs", "C4.CS"] {
+            fs::write(root.path().join(name), []).unwrap();
+        }
+        let study = discover(root.path(), "12").unwrap();
+        assert_eq!(study.paths.len(), 4);
     }
     #[test]
     fn unavailable_xml_directory_falls_back_and_missing_xml_is_supported() {

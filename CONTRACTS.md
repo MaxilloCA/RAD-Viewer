@@ -1,5 +1,11 @@
 # Phase A integration contract
 
+## 0.3.3 Carestream Secondary Capture and LAN lookup
+
+The picker and patient discovery recognize `.sc`/`.cs` case-insensitively; decoding still identifies content rather than assuming every file with that suffix is DICOM. The supplied `.sc` files are single-frame DICOM Secondary Capture with JPEG Extended compressed unsigned 8-bit MONOCHROME2 data. No decoder conversion or invented bit depth is introduced. Edits remain processing recipes and separate PNG exports.
+
+`open_patient` tries the local patient directory first and falls back to the same patient-number layout under `\\C04577\ABELDent\DATA\NOTES` if the local directory is absent/inaccessible. This permits execution from a LAN share without treating the client PC's D: drive as the sole patient location. Patient XML directory resolution then proceeds as before.
+
 ## 0.3.2 automatic patient loading
 
 `open_patient { patientNumber: string } -> { patientNumber, patientName: string | null, directory, paths: string[], warnings: string[] }` validates a trimmed ASCII identifier of 2–64 digits, preserves leading zeros, and resolves `D:\ABELDent\DATA\NOTES\<last two digits>\<complete number>`. On a blocking worker it reads the local `PatientInfo.xml` trophy/patient parameters `first_name`, `last_name`, and `directory`. The entered ABELDent number remains the displayed ID; the XML internal identifier is not substituted. XML entities are decoded, DTDs rejected, and XML input limited to 1 MiB. An unavailable XML target falls back to the local folder with a warning. Discovery recursively lists supported image suffixes and standard DICOM magic without following junctions/symlinks or enumerating the entire archive. There is no file-selection dialog or 24-entry discovery limit. Patient changes replace the strip and identity, while failed/empty discovery preserves the existing review.

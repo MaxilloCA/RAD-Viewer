@@ -102,7 +102,9 @@ fn pick_radiographs(directory: Option<&Path>) -> Vec<String> {
     dialog
         .add_filter(
             "Radiographs",
-            &["rvg", "pano", "dcm", "dicom", "jpg", "jpeg", "png"],
+            &[
+                "rvg", "pano", "sc", "cs", "dcm", "dicom", "jpg", "jpeg", "png",
+            ],
         )
         .add_filter("All files (DICOM by content)", &["*"])
         .pick_files()
@@ -143,7 +145,16 @@ async fn open_patient(
     let protected_sources = state.source_paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let directory =
-            existing_patient_directory(Path::new(r"D:\ABELDent\DATA\NOTES"), &patient_number)?;
+            existing_patient_directory(Path::new(r"D:\ABELDent\DATA\NOTES"), &patient_number)
+                .or_else(|local_error| {
+                    existing_patient_directory(
+                        Path::new(r"\\C04577\ABELDent\DATA\NOTES"),
+                        &patient_number,
+                    )
+                    .map_err(|network_error| {
+                        format!("{local_error}\nNetwork fallback: {network_error}")
+                    })
+                })?;
         let study = patient::discover(&directory, patient_number.trim())?;
         let mut sources = protected_sources.lock().unwrap();
         for path in &study.paths {

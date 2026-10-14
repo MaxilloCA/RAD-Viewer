@@ -23,6 +23,8 @@ npm.cmd run tauri -- build -- --locked
 Executable: `target\release\rad-viewer.exe`. Installer: `target\release\bundle\nsis\`.
 Dependency versions are pinned in manifests and resolved dependencies in `Cargo.lock` / `package-lock.json`.
 
+For LAN access, share `C:\CODEX\RAD-Viewer\target\release` on **SERVER**. If the share is named `RADViewer`, the executable is `\\SERVER\RADViewer\rad-viewer.exe`. It runs on the Windows PC opening it. Patient lookup tries the local `D:\ABELDent\DATA\NOTES` folder first, then `\\C04577\ABELDent\DATA\NOTES` when the local patient folder is unavailable. The remote PC needs access to that patient share. The installer in `target\release\bundle\nsis` can install the viewer and its WebView2 prerequisite on another PC.
+
 ```powershell
 npm.cmd test
 npm.cmd run build
@@ -43,6 +45,8 @@ Hold the left mouse button on the image and drag **right/left to lighten/darken 
 Expand advanced controls for local contrast, noise reduction and detail enhancement. Undo, redo and Reset affect the selected image. Old saved recipes retain their rendering, even when stored values fall outside the new slider ranges; the UI identifies those values. PNG export always processes the full source resolution. Save review JSON to record recipes; it is not a reopenable workspace session. See [processing details](PROCESSING.md) and [the earlier research and comparison report](verification/IMAGE_QUALITY_REVIEW.md). Matched-scale Carestream comparison remains part of the user's image-quality review.
 
 ## Privacy and source preservation
+
+Carestream `.sc` (and `.cs`) files are available in the radiograph picker and automatic patient discovery. The inspected examples are DICOM Secondary Capture images, 852 × 668, unsigned 8-bit MONOCHROME2, with JPEG Extended compression (transfer syntax `1.2.840.10008.1.2.4.51`) and the lossy flag set. The existing DICOM decoder reads their pixels by content; they use the same non-destructive tone, sharpening, colorization and PNG export workflow. The source DICOM files are never rewritten.
 
 Processing and storage stay local. There are no cloud services, telemetry, patient indexing or background directory scans. Source pixels are immutable; exports are separate files. Identifying DICOM tags are not displayed. Patient samples and local generated verification material are excluded from Git. Do not add clinical images or references to the repository.
 
