@@ -247,14 +247,14 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
   it('toggles false color without changing tone/detail and keeps a linear monochrome histogram', async () => {
     render(<App />); await open(); setSlider('Gamma', .33); setSlider('Tone', 30);
     fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
-    expect(screen.getByLabelText('False-color intensity legend')).toBeTruthy();
+    expect(screen.getByLabelText('Local contrast color legend')).toBeTruthy();
     expect(slider('Gamma').value).toBe('0.33'); expect(Number(slider('Tone').value)).toBeCloseTo(30); expect(slider('Sharpness strength').value).toBe('6');
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, gamma: .33, sharpen: 6 }) })));
     const histogram = screen.getByRole('img', { name: /Monochrome intensity histogram.*linear count/ });
     expect(histogram.querySelector('path')?.getAttribute('d')).toContain('L85.33333333333333,59');
     expect(screen.getByText('Midtones')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Colorize On' }));
-    expect(screen.queryByLabelText('False-color intensity legend')).toBeNull();
+    expect(screen.queryByLabelText('Local contrast color legend')).toBeNull();
   });
   it('preserves out-of-range legacy values with a visible note until the control is changed', async () => {
     const legacy = { ...neutral, gamma: 1.2, sharpen: .7 };
@@ -314,7 +314,66 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     fireEvent.click(screen.getByRole('button', { name: '02 second.rvg' }));
     expect(screen.getAllByText('Date unavailable')).toHaveLength(2);
     fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
-    expect(screen.getByLabelText('False-color intensity legend').textContent).toContain('Dark · YellowLight · Purple');
+    expect(screen.getByLabelText('Local contrast color legend').textContent).toContain('Darker than nearbyLighter than nearby');
+  });
+  it('provides local color defaults, range limits, undo, preset preservation and reset', async () => {
+    render(<App />); await open();
+    expect(screen.queryByRole('slider', { name: 'Color amount' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
+    expect(slider('Color amount').value).toBe('0.8');
+    expect(slider('Color amount').getAttribute('aria-valuetext')).toBe('80%');
+    expect(slider('Color amount').closest('label')?.querySelector('output')?.textContent).toBe('80%');
+    expect(slider('Feature size').getAttribute('aria-valuetext')).toBe('8 px');
+    expect(slider('Feature size').closest('label')?.querySelector('output')?.textContent).toBe('8 px');
+    expect(slider('Color amount').min).toBe('0'); expect(slider('Color amount').max).toBe('1');
+    expect(slider('Feature size').value).toBe('8');
+    expect(slider('Feature size').min).toBe('2'); expect(slider('Feature size').max).toBe('24');
+    expect(screen.getByText('Color emphasizes local midtone differences. Flat areas and extremes stay grayscale.')).toBeTruthy();
+    setSlider('Color amount', .42); setSlider('Feature size', 17);
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Bitewing');
+    fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
+    expect(slider('Feature size').value).toBe('8'); expect(slider('Color amount').value).toBe('0.42');
+    fireEvent.click(screen.getByRole('button', { name: '↷ Redo' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Detail' }));
+    expect(slider('Feature size').value).toBe('17'); expect(slider('Color amount').value).toBe('0.42');
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Detail');
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ colorize: true, colorStrength: .42, colorScale: 17, sharpen: 8 }) })));
+    fireEvent.click(screen.getByRole('button', { name: 'Export PNG' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('export_image', expect.objectContaining({ recipe: expect.objectContaining({ colorStrength: .42, colorScale: 17 }) })));
+    fireEvent.change(screen.getByLabelText('New preset name'), { target: { value: 'Local overlay' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_presets', { presets: [expect.objectContaining({ recipe: expect.objectContaining({ colorStrength: .42, colorScale: 17 }) })] }));
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(screen.queryByRole('slider', { name: 'Color amount' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
+    expect(slider('Color amount').value).toBe('0.8'); expect(slider('Feature size').value).toBe('8');
+  });
+  it('commits keyboard color adjustment as one undo step with accessible units', async () => {
+    render(<App />); await open();
+    fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
+    slider('Color amount').focus();
+    fireEvent.change(slider('Color amount'), { target: { value: '.81' } });
+    fireEvent.keyUp(slider('Color amount'), { key: 'ArrowRight' });
+    fireEvent.blur(slider('Color amount'));
+    expect(slider('Color amount').getAttribute('aria-valuetext')).toBe('81%');
+    fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
+    expect(slider('Color amount').getAttribute('aria-valuetext')).toBe('80%');
+    fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
+    expect(screen.queryByRole('slider', { name: 'Color amount' })).toBeNull();
+  });
+  it('uses legacy overlay defaults without losing existing tone and retains color settings per image', async () => {
+    openPaths = ['first.rvg', 'second.rvg'];
+    customInvoke = command => command === 'load_presets' ? Promise.resolve([{ name: 'Legacy color', recipe: { ...neutral, gamma: .55, colorize: true } }]) : undefined;
+    render(<App />); await open(); await readyThumbnail('02 second.rvg');
+    fireEvent.change(screen.getByLabelText('Apply saved preset'), { target: { value: 'Legacy color' } });
+    expect(slider('Color amount').value).toBe('0.8'); expect(slider('Feature size').value).toBe('8');
+    expect(slider('Gamma').value).toBe('0.55');
+    setSlider('Color amount', .37); setSlider('Feature size', 20);
+    fireEvent.click(screen.getByRole('button', { name: '02 second.rvg' }));
+    expect(screen.queryByRole('slider', { name: 'Color amount' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '01 first.rvg' }));
+    expect(slider('Color amount').value).toBe('0.37'); expect(slider('Feature size').value).toBe('20');
+    expect(slider('Gamma').value).toBe('0.55');
   });
   it('saves the visible recipe including false color', async () => {
     render(<App />); await open(); fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));

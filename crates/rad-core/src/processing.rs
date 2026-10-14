@@ -23,6 +23,17 @@ pub struct Recipe {
     pub invert: bool,
     #[serde(default)]
     pub colorize: bool,
+    #[serde(default = "default_color_strength")]
+    pub color_strength: f32,
+    #[serde(default = "default_color_scale")]
+    pub color_scale: f32,
+}
+
+fn default_color_strength() -> f32 {
+    0.8
+}
+fn default_color_scale() -> f32 {
+    8.0
 }
 
 impl Recipe {
@@ -54,6 +65,8 @@ impl Recipe {
             detail_mode: "unsharp".into(),
             invert: false,
             colorize: false,
+            color_strength: default_color_strength(),
+            color_scale: default_color_scale(),
         }
     }
 
@@ -84,6 +97,8 @@ impl Recipe {
             ("radius", self.radius, 0.35, 12.0),
             ("threshold", self.threshold, 0.0, 0.25),
             ("halo suppression", self.halo, 0.0, 1.0),
+            ("color strength", self.color_strength, 0.0, 1.0),
+            ("color scale", self.color_scale, 2.0, 24.0),
         ] {
             if !v.is_finite() || !(min..=max).contains(&v) {
                 return Err(format!("{name} must be between {min} and {max}"));
@@ -236,6 +251,10 @@ fn finish_render(source: &SourceImage, recipe: &Recipe, mut values: Vec<f32>) ->
     let (w, h) = (source.width as usize, source.height as usize);
     let n = w * h;
     let m = &source.metadata;
+    // Analyze the prepared image before fine sharpening can create overshoots.
+    // These final-display settings deliberately do not invalidate the tone cache.
+    let color_evidence = (recipe.colorize && recipe.color_strength > 0.0)
+        .then(|| density_color_evidence(&values, w, h, recipe.color_scale));
     if recipe.sharpen > 0.0 {
         values = if recipe.version == 2 && recipe.detail_mode == "radiograph" {
             radiograph_bands(&values, w, h, recipe, false)
@@ -262,7 +281,11 @@ fn finish_render(source: &SourceImage, recipe: &Recipe, mut values: Vec<f32>) ->
         let gray = quantize(y);
         rendered.histogram[gray as usize] += 1;
         if recipe.colorize {
-            rendered.rgba.extend(sampled_viridis(y).map(quantize));
+            let evidence = color_evidence.as_ref().map_or(0.0, |e| e[i]);
+            let evidence = if recipe.invert { -evidence } else { evidence };
+            rendered
+                .rgba
+                .extend(density_color(y, evidence, recipe.color_strength).map(quantize));
         } else if let Some(colors) = &source.color {
             let rgb = colors[i].map(|v| v / color_scale);
             let channels = recolor(rgb, y);
@@ -279,29 +302,82 @@ fn quantize(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// Approximate reversed sampled Viridis: dark luminance maps to yellow and
-/// bright luminance to dark purple, interpolating nine fixed display-color stops.
-/// This remaps processed luminance only; it does not add
-/// image information, alter enhancement, or change luminance histogram counts.
-fn sampled_viridis(luminance: f32) -> [f32; 3] {
-    const STOPS: [[f32; 3]; 9] = [
-        [68.0, 1.0, 84.0],
-        [71.0, 44.0, 122.0],
-        [59.0, 81.0, 139.0],
-        [44.0, 113.0, 142.0],
-        [33.0, 144.0, 141.0],
-        [39.0, 173.0, 129.0],
-        [92.0, 200.0, 99.0],
-        [170.0, 220.0, 50.0],
-        [253.0, 231.0, 37.0],
-    ];
-    let position = (1.0 - luminance.clamp(0.0, 1.0)) * 8.0;
-    let index = (position as usize).min(STOPS.len() - 2);
-    let fraction = position - index as f32;
-    std::array::from_fn(|channel| {
-        (STOPS[index][channel] + (STOPS[index + 1][channel] - STOPS[index][channel]) * fraction)
-            / 255.0
-    })
+/// Signed local density-change evidence, not a diagnostic or anatomical map.
+/// The source-domain scale is independent of zoom. This intentionally uses the
+/// prepared tone/contrast image, but never the subsequently sharpened result.
+fn density_color_evidence(input: &[f32], w: usize, h: usize, scale: f32) -> Vec<f32> {
+    let smooth = gaussian(input, w, h, 1.0);
+    let near = gaussian(&smooth, w, h, scale);
+    let far = gaussian(&smooth, w, h, scale * 2.0);
+    let residual_energy: Vec<_> = input
+        .iter()
+        .zip(&smooth)
+        .map(|(a, b)| (a - b).powi(2))
+        .collect();
+    let noise_energy = box_mean(&residual_energy, w, h, 3);
+    let mut edges = vec![0.0; input.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let dx = smooth[y * w + (x + 1).min(w - 1)] - smooth[y * w + x.saturating_sub(1)];
+            let dy = smooth[(y + 1).min(h - 1) * w + x] - smooth[y.saturating_sub(1) * w + x];
+            edges[y * w + x] = smooth_step(
+                ((dx * dx + dy * dy - 0.035f32.powi(2)) / (0.10f32.powi(2) - 0.035f32.powi(2)))
+                    .clamp(0.0, 1.0),
+            );
+        }
+    }
+    // Protect the support of the wider neighborhood, preventing a high-contrast
+    // background edge from leaving a large colored contour inside a flat region.
+    let edges = box_max(&edges, w, h, (scale * 6.0).ceil() as usize + 4);
+    let mut evidence = vec![0.0; input.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let a = smooth[i] - near[i];
+            let b = smooth[i] - far[i];
+            if a * b <= 0.0 {
+                continue;
+            }
+            let difference = 0.65 * a + 0.35 * b;
+            let noise_floor = 0.0015 + 0.85 * noise_energy[i].max(0.0).sqrt();
+            let activity = smooth_step(
+                ((difference.abs() - noise_floor) / (0.015 + 2.0 * noise_floor)).clamp(0.0, 1.0),
+            );
+            let agreement = 2.0 * a.abs().min(b.abs()) / (a.abs() + b.abs());
+            let upper_gate = 1.0 - smooth_step(((difference.abs() - 0.08) / 0.10).clamp(0.0, 1.0));
+            let border = x.min(w - 1 - x).min(y.min(h - 1 - y)) as f32;
+            let boundary_gate =
+                smooth_step(((border - (2.0 * scale + 2.0)) / (2.0 * scale + 2.0)).clamp(0.0, 1.0));
+            evidence[i] = difference.signum()
+                * activity
+                * agreement
+                * upper_gate
+                * (1.0 - edges[i])
+                * boundary_gate;
+        }
+    }
+    evidence
+}
+
+/// Preserve Rec.709-weighted display RGB brightness before 8-bit rounding;
+/// this is not calibrated linear-light luminance or perceptual invariance.
+/// Only add bounded chroma in midtones.
+/// Amber (#e5a547) means locally darker, cyan (#63c7dc) locally lighter.
+fn density_color(luminance: f32, evidence: f32, strength: f32) -> [f32; 3] {
+    let gray = luminance.clamp(0.0, 1.0);
+    let midtone = smooth_step(((gray - 0.06) / 0.18).clamp(0.0, 1.0))
+        * smooth_step(((0.94 - gray) / 0.22).clamp(0.0, 1.0));
+    let alpha = (evidence.abs() * strength * midtone).clamp(0.0, 1.0);
+    if alpha == 0.0 {
+        return [gray; 3];
+    }
+    let hue = if evidence < 0.0 {
+        [229.0 / 255.0, 165.0 / 255.0, 71.0 / 255.0]
+    } else {
+        [99.0 / 255.0, 199.0 / 255.0, 220.0 / 255.0]
+    };
+    let mapped = recolor(hue, gray);
+    mapped.map(|channel| gray + alpha * (channel - gray))
 }
 
 /// Adjust luminance and shrink chroma only as needed to remain within RGB gamut.
@@ -1072,9 +1148,13 @@ mod tests {
         let mut json = serde_json::to_value(&r).unwrap();
         json.as_object_mut().unwrap().remove("localContrast");
         json.as_object_mut().unwrap().remove("colorize");
+        json.as_object_mut().unwrap().remove("colorStrength");
+        json.as_object_mut().unwrap().remove("colorScale");
         let restored: Recipe = serde_json::from_value(json).unwrap();
         assert_eq!(restored.local_contrast, 0.0);
         assert!(!restored.colorize);
+        assert_eq!(restored.color_strength, 0.8);
+        assert_eq!(restored.color_scale, 8.0);
         assert_eq!(
             process(&s, &restored).unwrap().rgba,
             process(&s, &r).unwrap().rgba
@@ -1144,35 +1224,101 @@ mod tests {
     }
 
     #[test]
-    fn sampled_viridis_endpoints_channels_and_luminance_order_are_stable() {
-        assert_eq!(sampled_viridis(0.0).map(quantize), [253, 231, 37]);
-        assert_eq!(sampled_viridis(1.0).map(quantize), [68, 1, 84]);
-        assert_eq!(sampled_viridis(0.5).map(quantize), [33, 144, 141]);
+    fn density_color_preserves_display_luma_and_gamut_without_tinting_extremes() {
         let luminance = |rgb: [f32; 3]| rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
-        let mut previous = f32::INFINITY;
-        for i in 0..=4096 {
-            let rgb = sampled_viridis(i as f32 / 4096.0);
-            assert!(rgb.iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)));
-            let current = luminance(rgb);
-            assert!(current <= previous);
-            previous = current;
+        for i in 0..=256 {
+            for evidence in [-1.0, -0.4, 0.0, 0.4, 1.0] {
+                let y = i as f32 / 256.0;
+                let rgb = density_color(y, evidence, 0.8);
+                assert!(rgb.iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)));
+                assert!((luminance(rgb) - y).abs() < 1e-6);
+                assert!(
+                    (luminance(rgb.map(quantize).map(|c| c as f32 / 255.0)) - y).abs()
+                        <= 0.5 / 255.0 + 1e-6
+                );
+                if y <= 0.06 || y >= 0.94 || evidence == 0.0 {
+                    assert_eq!(rgb, [y; 3]);
+                }
+                assert_eq!(density_color(y, evidence, 0.0), [y; 3]);
+            }
         }
-        // Verify actual rounded colors for every 8-bit display-luminance value,
-        // not only the nine control points.
-        previous = f32::INFINITY;
-        for i in 0..=255 {
-            let rgb = sampled_viridis(i as f32 / 255.0)
-                .map(quantize)
-                .map(f32::from);
-            let current = luminance(rgb);
-            assert!(current <= previous);
-            previous = current;
+        let amber = density_color(0.5, -1.0, 1.0);
+        let cyan = density_color(0.5, 1.0, 1.0);
+        assert!(amber[0] > amber[1] && amber[1] > amber[2]);
+        assert!(cyan[2] > cyan[1] && cyan[1] > cyan[0]);
+    }
+
+    fn density_features(w: usize, h: usize) -> Vec<f32> {
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as f32, (i / w) as f32);
+                let bump = |center: f32| {
+                    (-((x - center).powi(2) + (y - h as f32 / 2.0).powi(2)) / 50.0).exp()
+                };
+                0.5 + 0.035 * (bump(w as f32 * 0.68) - bump(w as f32 * 0.32))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn density_color_responds_to_coherent_midtone_features_more_than_noise() {
+        let (w, h) = (161, 129);
+        let feature = density_features(w, h);
+        let signal = density_color_evidence(&feature, w, h, 8.0);
+        let dark = (h / 2) * w + (w as f32 * 0.32) as usize;
+        let light = (h / 2) * w + (w as f32 * 0.68) as usize;
+        assert!(
+            signal[dark] < -0.5 && signal[light] > 0.5,
+            "Coherent low-contrast structures should receive signed color: {},{}",
+            signal[dark],
+            signal[light]
+        );
+        let noisy: Vec<_> = (0..w * h)
+            .map(|i| 0.5 + (((i * 71 + i / w * 19) % 97) as f32 / 96.0 - 0.5) * 0.02)
+            .collect();
+        let noise = density_color_evidence(&noisy, w, h, 8.0);
+        assert!(noise.iter().map(|v| v.abs()).sum::<f32>() / (noise.len() as f32) < 0.01);
+        let negated: Vec<_> = feature.iter().map(|v| 1.0 - v).collect();
+        let inverse = density_color_evidence(&negated, w, h, 8.0);
+        assert!(signal
+            .iter()
+            .zip(inverse)
+            .all(|(a, b)| (a + b).abs() < 1e-4));
+    }
+
+    #[test]
+    fn density_color_keeps_flats_ramps_and_strong_edge_context_neutral() {
+        for (w, h) in [(1, 1), (7, 3), (257, 129)] {
+            for scale in [2.0, 8.0, 24.0] {
+                let flat = vec![0.5; w * h];
+                assert!(density_color_evidence(&flat, w, h, scale)
+                    .iter()
+                    .all(|v| *v == 0.0));
+                let ramp: Vec<_> = (0..w * h)
+                    .map(|i| 0.25 + 0.5 * (i % w) as f32 / (w.max(2) - 1) as f32)
+                    .collect();
+                assert!(density_color_evidence(&ramp, w, h, scale)
+                    .iter()
+                    .all(|v| v.abs() < 0.01));
+            }
         }
+        let (w, h) = (257, 129);
+        let step: Vec<_> = (0..w * h)
+            .map(|i| if i % w < 128 { 0.2 } else { 0.8 })
+            .collect();
+        assert!(density_color_evidence(&step, w, h, 8.0)
+            .iter()
+            .all(|v| v.abs() < 1e-4));
     }
 
     #[test]
     fn colorize_is_final_only_preserves_histogram_source_and_cached_gray_output() {
-        let mut s = source(256, 1, (0..256).map(|v| v as f32).collect());
+        let (w, h) = (161, 129);
+        let mut s = source(
+            w as u32,
+            h as u32,
+            density_features(w, h).iter().map(|v| v * 255.0).collect(),
+        );
         s.metadata.format = "PNG".into();
         s.metadata.bits_stored = 8;
         let source = Arc::new(s);
@@ -1185,11 +1331,6 @@ mod tests {
         recipe.colorize = true;
         let colorized = session.process(&recipe).unwrap();
         assert_eq!(allocation, session.prepared.as_ref().unwrap().1.as_ptr());
-        assert_eq!(&colorized.rgba[..4], &[253, 231, 37, 255]);
-        assert_eq!(
-            &colorized.rgba[colorized.rgba.len() - 4..],
-            &[68, 1, 84, 255]
-        );
         assert_ne!(colorized.rgba, grayscale.rgba);
         assert_eq!(colorized.histogram, grayscale.histogram);
         assert_eq!(
@@ -1197,6 +1338,28 @@ mod tests {
             (grayscale.clipped_low, grayscale.clipped_high)
         );
         assert_eq!(colorized.rgba, process(&source, &recipe).unwrap().rgba);
+        for scale in [2.0, 8.0, 24.0] {
+            for strength in [0.0, 0.4, 1.0] {
+                recipe.color_scale = scale;
+                recipe.color_strength = strength;
+                let cached = session.process(&recipe).unwrap();
+                assert_eq!(cached.rgba, process(&source, &recipe).unwrap().rgba);
+                assert_eq!(cached.histogram, grayscale.histogram);
+                assert_eq!(allocation, session.prepared.as_ref().unwrap().1.as_ptr());
+                if strength == 0.0 {
+                    assert_eq!(cached.rgba, grayscale.rgba);
+                }
+            }
+        }
+        recipe.color_scale = 8.0;
+        recipe.color_strength = 0.8;
+        recipe.invert = true;
+        let inverted = session.process(&recipe).unwrap();
+        let dark = ((h / 2) * w + (w as f32 * 0.32) as usize) * 4;
+        assert!(colorized.rgba[dark] > colorized.rgba[dark + 2]);
+        assert!(inverted.rgba[dark] < inverted.rgba[dark + 2]);
+        assert_eq!(inverted.rgba, process(&source, &recipe).unwrap().rgba);
+        recipe.invert = false;
         recipe.colorize = false;
         assert_eq!(grayscale.rgba, session.process(&recipe).unwrap().rgba);
         assert_eq!(source.samples, original);
@@ -1229,6 +1392,7 @@ mod tests {
         r.version = 2;
         let original_display = process(&s, &r).unwrap();
         r.colorize = true;
+        r.color_strength = 0.0;
         let mapped = process(&s, &r).unwrap();
         let mut monochrome = s.clone();
         monochrome.color = None;

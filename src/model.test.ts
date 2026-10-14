@@ -98,3 +98,14 @@ describe('calendar dates and quarter-turn orientation', () => {
     expect(orientedDimensions(1200, 900, 3)).toEqual({ width: 900, height: 1200 });
   });
 });
+
+describe('local color recipe compatibility', () => {
+  it('equates omitted color parameters with defaults while detecting overlay changes', () => {
+    expect(sameRecipe(neutral, { ...neutral, colorStrength: .8, colorScale: 8 })).toBe(true);
+    expect(sameRecipe(neutral, { ...neutral, colorStrength: .5 })).toBe(false);
+    expect(sameRecipe(neutral, { ...neutral, colorScale: 12 })).toBe(false);
+    expect(experimentalPreset('bitewing', neutral)).toMatchObject({ colorStrength: .8, colorScale: 8 });
+    const legacy = { past: [], present: neutral, future: [] };
+    expect(commit(legacy, { ...neutral, colorStrength: .8, colorScale: 8 })).toBe(legacy);
+  });
+});

@@ -105,13 +105,13 @@ function ImagePane({ info, render, view, setView, processing, onSize, pixelRatio
     </div><footer><span>{info.width} × {info.height}</span><span>{processing ? 'Updating' : 'Full-resolution processing'}</span></footer></section>;
 }
 
-function Slider({ label, value, min, max, step = .01, onChange, onCommit, endpoints }: {
+function Slider({ label, value, min, max, step = .01, onChange, onCommit, endpoints, formatValue }: {
   label: string; value: number; min: number; max: number; step?: number;
-  onChange: (value: number) => void; onCommit: () => void; endpoints?: [string, string];
+  onChange: (value: number) => void; onCommit: () => void; endpoints?: [string, string]; formatValue?: (value: number) => string;
 }) {
   const decimals = step >= 1 ? 0 : step >= .01 ? 2 : step >= .001 ? 3 : 4;
-  return <label className="slider-control"><span>{label}<output>{value.toFixed(decimals)}</output></span>
-    <input type="range" min={min} max={max} step={step} value={clamp(value, min, max)} aria-label={label} onChange={event => onChange(Number(event.target.value))} onPointerUp={onCommit} onPointerCancel={onCommit} onKeyUp={onCommit} onBlur={onCommit} />
+  return <label className="slider-control"><span>{label}<output>{formatValue ? formatValue(value) : value.toFixed(decimals)}</output></span>
+    <input type="range" min={min} max={max} step={step} value={clamp(value, min, max)} aria-label={label} aria-valuetext={formatValue?.(value)} onChange={event => onChange(Number(event.target.value))} onPointerUp={onCommit} onPointerCancel={onCommit} onKeyUp={onCommit} onBlur={onCommit} />
     {endpoints && <span className="slider-endpoints"><span>{endpoints[0]}</span><span>{endpoints[1]}</span></span>}
     {(value < min || value > max) && <span className="stored-value-note">Stored value {value.toFixed(decimals)} is outside {min}–{max}. Adjusting this slider selects a new value in that range.</span>}
   </label>;
@@ -142,7 +142,7 @@ export default function App() {
   const recipeRef = useRef(recipe); recipeRef.current = recipe;
   const dragRecipe = useRef<{ id: string; start: Recipe; base: Recipe; photometric: string } | null>(null);
   const { rendered, processing } = useRenderedImage(active, recipe, setError);
-  const currentPreset = active && recipe ? presetOptions.find(([key]) => sameRecipe({ ...recipe, colorize: false }, experimentalPreset(key, active.info.neutral, active.info.suggested)))?.[1]
+  const currentPreset = active && recipe ? presetOptions.find(([key]) => sameRecipe({ ...recipe, colorize: false, colorStrength: .8, colorScale: 8 }, experimentalPreset(key, active.info.neutral, active.info.suggested)))?.[1]
     ?? presets.find(preset => sameRecipe(recipe, preset.recipe))?.name ?? 'Custom adjustments' : null;
   const onPaneSize = useCallback((width: number, height: number) => setPaneSize({ width, height }), []);
   const fitScale = displayDimensions ? Math.min((paneSize.width - 28) / displayDimensions.width, (paneSize.height - 28) / displayDimensions.height) : 1;
@@ -190,7 +190,7 @@ export default function App() {
   const commitDraft = () => { if (draftRef.current) { const value = draftRef.current; changeHistory(history => commit(history, value)); } };
   const updateDraft = (value: Recipe) => { draftRef.current = value; setDraft(value); };
   const changeValue = (key: keyof Recipe, value: number | string | boolean) => {
-    if (recipe) updateDraft({ ...recipe, [key]: value, version: key === 'localContrast' || key === 'sharpen' ? 2 : recipe.version });
+    if (recipe) updateDraft({ ...recipe, [key]: value, version: key === 'localContrast' || key === 'sharpen' || key === 'colorStrength' || key === 'colorScale' ? 2 : recipe.version });
   };
   const applyRecipe = (value: Recipe) => changeHistory(history => commit(history, value));
   useEffect(() => {
@@ -239,7 +239,7 @@ export default function App() {
     <div className="main-body"><div className="workspace"><div className="toolbar">
       <div className="document-title"><strong>{active?.info.metadata.name ?? activeEntry?.name ?? 'Radiograph workspace'}</strong>{activeEntry && <time className="image-date" title={dateSourceLabel(activeEntry.details?.metadata.dateSource)}>{formatImageDate(activeEntry.details?.metadata.imageDate)}</time>}<span>{active ? `${active.info.metadata.format} · ${active.info.metadata.bitsStored}-bit · ${active.info.metadata.photometric}` : 'Enhanced, full-resolution viewing'}</span></div>
       <div className="view-tools"><button disabled={!active} aria-label="Rotate 90 degrees clockwise" title="Rotate clockwise; separate from adjustment undo" onClick={() => { commitDraft(); rotateImage(); setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); }}>↻ Rotate 90°{rotationQuarterTurns ? ` · ${rotationQuarterTurns * 90}°` : ''}</button><button className={view.fit ? 'active' : ''} disabled={!active} onClick={() => setView(previous => ({ ...previous, fit: true, x: 0, y: 0 }))}>Fit</button><button className={!view.fit && Math.abs(view.scale - nativePixelScale) < .00001 ? 'active' : ''} disabled={!active} title="One source pixel per physical display pixel" onClick={() => setView({ scale: nativePixelScale, x: 0, y: 0, fit: false })}>100%</button><span className="zoom-label" title="Source pixels relative to physical display pixels">{active ? `${Math.round(effectiveView.scale * pixelRatio * 100)}%` : '—'}</span></div></div>
-      {active && rendered ? <div className="single-image-workspace"><ImagePane key={active.info.id} info={active.info} rotationQuarterTurns={rotationQuarterTurns} render={rendered} view={effectiveView} setView={updateView} processing={processing} onSize={onPaneSize} pixelRatio={pixelRatio} badge={`${currentPreset ?? 'Enhanced'}${recipe?.colorize ? ' · False color' : ''}`}
+      {active && rendered ? <div className="single-image-workspace"><ImagePane key={active.info.id} info={active.info} rotationQuarterTurns={rotationQuarterTurns} render={rendered} view={effectiveView} setView={updateView} processing={processing} onSize={onPaneSize} pixelRatio={pixelRatio} badge={`${currentPreset ?? 'Enhanced'}${recipe?.colorize ? ' · Local color' : ''}`}
         onAdjustStart={() => { if (activeRef.current && recipeRef.current) dragRecipe.current = { id: activeRef.current.info.id, start: recipeRef.current, base: activeRef.current.info.suggested ?? activeRef.current.info.neutral, photometric: activeRef.current.info.metadata.photometric }; }}
         onAdjustMove={(dx, dy) => { const snapshot = dragRecipe.current; if (snapshot && snapshot.id === activeRef.current?.info.id) updateDraft(dragAdjustment(snapshot.start, snapshot.base, dx, dy, snapshot.photometric)); }}
         onAdjustEnd={() => { const snapshot = dragRecipe.current; dragRecipe.current = null; if (snapshot?.id === activeRef.current?.info.id) commitDraft(); }} /></div>
@@ -248,14 +248,18 @@ export default function App() {
       <div className="filmstrip" aria-label="Open images">{images.map((image, index) => <button key={image.key} aria-label={`${String(index + 1).padStart(2, '0')} ${image.name}`} aria-describedby={`date-${image.key}`} className={`thumbnail ${selected === image.key ? 'selected' : ''}`} title={image.error ?? image.path} onClick={() => { commitDraft(); dragRecipe.current = null; selectImage(image.key); setDraft(null); draftRef.current = null; setError(null); setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); }} aria-pressed={selected === image.key}>{image.thumbnail ? <span className={`thumbnail-image ${image.rotationQuarterTurns % 2 ? 'quarter-turned' : ''}`}><img src={image.thumbnail} alt="" style={{ transform: `translate(-50%, -50%) rotate(${image.rotationQuarterTurns * 90}deg)` }} /></span> : <span className="thumbnail-placeholder" aria-hidden="true">{image.error ? 'Unavailable' : 'Loading…'}</span>}<span className="thumbnail-number">{String(index + 1).padStart(2, '0')}</span><span className="thumbnail-name">{image.name}</span><time id={`date-${image.key}`} className="thumbnail-date" title={dateSourceLabel(image.details?.metadata.dateSource)}>{formatImageDate(image.details?.metadata.imageDate)}</time></button>)}<button className="add-thumbnail" onClick={() => void chooseImages()} disabled={!desktop}><span>＋</span>{images.length ? 'Add images' : 'Open images'}</button></div>
     </div><aside className="adjustments"><div className="panel-title"><h2>Adjustments</h2><span>NON-DESTRUCTIVE</span></div><fieldset disabled={!active} className="adjustment-fields">
       <div className="history-tools"><button disabled={!active?.history.past.length} title="Undo (Ctrl+Z)" onClick={() => changeHistory(undo)}>↶ Undo</button><button disabled={!active?.history.future.length} title="Redo (Ctrl+Y)" onClick={() => changeHistory(redo)}>↷ Redo</button><button onClick={() => active && applyRecipe(active.defaultRecipe)}>Reset</button></div>
-      <div className="section-label">PROCESSING PRESET <span>Experimental</span></div><div className="preset-grid">{presetOptions.map(([key, label]) => <button key={key} className={currentPreset === label ? 'active' : ''} onClick={() => active && applyRecipe({ ...experimentalPreset(key, active.info.neutral, active.info.suggested), colorize: Boolean(recipe?.colorize) })}>{label}</button>)}</div>
+      <div className="section-label">PROCESSING PRESET <span>Experimental</span></div><div className="preset-grid">{presetOptions.map(([key, label]) => <button key={key} className={currentPreset === label ? 'active' : ''} onClick={() => active && applyRecipe({ ...experimentalPreset(key, active.info.neutral, active.info.suggested), colorize: Boolean(recipe?.colorize), colorStrength: recipe?.colorStrength ?? .8, colorScale: recipe?.colorScale ?? 8 })}>{label}</button>)}</div>
       {currentPreset && <div className="current-recipe" aria-label="Current processing preset"><span>Current: <strong>{currentPreset}</strong></span><span>v{recipe?.version}</span></div>}
       {recipe && base ? <><div className="section-label">TONE & CONTRAST</div>{range('gamma', 'Gamma', .1, .9)}
         <Slider label="Tone" value={toneValue(recipe, base, photometric)} min={-100} max={100} step={1} endpoints={['Darker', 'Lighter']} onChange={value => updateDraft(withTone(recipe, base, value, photometric))} onCommit={commitDraft} />
         <Slider label="Contrast" value={contrastValue(recipe, base)} min={-100} max={100} step={1} endpoints={['Softer', 'Stronger']} onChange={value => updateDraft(withContrast(recipe, base, value))} onCommit={commitDraft} />
         <div className="section-label">DETAIL</div>{range('sharpen', 'Sharpness strength', 5, 10, .1)}
-        <button className={`colorize-button ${recipe.colorize ? 'active' : ''}`} aria-pressed={Boolean(recipe.colorize)} onClick={() => applyRecipe({ ...recipe, colorize: !recipe.colorize, version: 2 })}>Colorize <span>{recipe.colorize ? 'On' : 'Off'}</span></button>
-        {recipe.colorize && <div className="color-legend" aria-label="False-color intensity legend"><div className="color-legend-ramp" /><div><span>Dark · Yellow</span><span>Light · Purple</span></div><p>False-color intensity</p></div>}
+        <button className={`colorize-button ${recipe.colorize ? 'active' : ''}`} aria-pressed={Boolean(recipe.colorize)} onClick={() => applyRecipe({ ...recipe, colorize: !recipe.colorize, colorStrength: recipe.colorStrength ?? .8, colorScale: recipe.colorScale ?? 8, version: 2 })}>Colorize <span>{recipe.colorize ? 'On' : 'Off'}</span></button>
+        {recipe.colorize && <div className="local-color-controls">
+          <Slider label="Color amount" formatValue={value => `${Math.round(value * 100)}%`} value={recipe.colorStrength ?? .8} min={0} max={1} step={.01} onChange={value => changeValue('colorStrength', value)} onCommit={commitDraft} />
+          <Slider label="Feature size" formatValue={value => `${value} px`} value={recipe.colorScale ?? 8} min={2} max={24} step={1} endpoints={['Small · 2 px', 'Broad · 24 px']} onChange={value => changeValue('colorScale', value)} onCommit={commitDraft} />
+          <div className="color-legend local-color-legend" aria-label="Local contrast color legend"><div><span><i className="color-swatch amber" />Darker than nearby</span><span><i className="color-swatch cyan" />Lighter than nearby</span></div><p>Color emphasizes local midtone differences. Flat areas and extremes stay grayscale.</p></div>
+        </div>}
         <button className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}><span>{advanced ? '−' : '+'} Advanced processing</span></button>
         {advanced && <div className="advanced-controls"><label className="select-control">Detail method<select value={recipe.detailMode} onChange={event => applyRecipe({ ...recipe, detailMode: event.target.value, version: event.target.value === 'radiograph' ? 2 : recipe.version })}><option value="radiograph">Radiograph multiscale</option><option value="unsharp">Unsharp</option><option value="multiscale">Legacy two-scale</option></select></label>
           {range('radius', 'Radius / detail scale (px)', .5, 8, .1)}{range('threshold', 'Noise threshold', 0, .05, .0005)}{range('halo', 'Halo suppression', 0, 1)}{range('denoise', 'Noise reduction', 0, 1)}{range('localContrast', 'Local contrast', 0, 1)}{range('clahe', 'Adaptive contrast (CLAHE)', 0, 1)}

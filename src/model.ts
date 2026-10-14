@@ -13,6 +13,8 @@ export interface Recipe {
   detailMode: string;
   invert: boolean;
   colorize: boolean;
+  colorStrength?: number;
+  colorScale?: number;
 }
 export interface ImageMetadata {
   name: string; format: string; bitsStored: number; signed: boolean;
@@ -50,7 +52,7 @@ export function formatImageDate(value?: string | null): string {
 export const orientedDimensions = (width: number, height: number, turns: number) => turns % 2 ? { width: height, height: width } : { width, height };
 export const dateSourceLabel = (source?: string | null): string => ({ AcquisitionDateTime: 'Acquisition date/time', AcquisitionDate: 'Acquisition date', ContentDate: 'Image content date', StudyDate: 'Study date', SeriesDate: 'Series date' }[source ?? ''] ?? source ?? 'No acquisition date metadata');
 const recipeKeys: (keyof Recipe)[] = ['version', 'windowCenter', 'windowWidth', 'gamma', 'denoise', 'localContrast', 'clahe', 'sharpen', 'radius', 'threshold', 'halo', 'detailMode', 'invert'];
-export const sameRecipe = (a: Recipe, b: Recipe) => recipeKeys.every(key => a[key] === b[key]) && Boolean(a.colorize) === Boolean(b.colorize);
+export const sameRecipe = (a: Recipe, b: Recipe) => recipeKeys.every(key => a[key] === b[key]) && Boolean(a.colorize) === Boolean(b.colorize) && (a.colorStrength ?? .8) === (b.colorStrength ?? .8) && (a.colorScale ?? 8) === (b.colorScale ?? 8);
 export const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 const toneDirection = (recipe: Recipe, photometric: string) => (photometric === 'MONOCHROME1' ? -1 : 1) * (recipe.invert ? -1 : 1);
 export const toneValue = (recipe: Recipe, base: Recipe, photometric = 'MONOCHROME2') => (base.windowCenter - recipe.windowCenter) / (base.windowWidth * .25) * 100 * toneDirection(recipe, photometric);
@@ -79,7 +81,7 @@ export function redo(history: History): History {
   return { past: [...history.past, history.present], present: history.future[0], future: history.future.slice(1) };
 }
 export function experimentalPreset(name: string, neutral: Recipe, suggested: Recipe = neutral): Recipe {
-  const enhanced = { ...suggested, version: 2, detailMode: 'radiograph', denoise: 0, clahe: 0, colorize: false };
+  const enhanced = { ...suggested, version: 2, detailMode: 'radiograph', denoise: 0, clahe: 0, colorize: false, colorStrength: .8, colorScale: 8 };
   switch (name) {
     case 'bitewing': return { ...enhanced, gamma: .22, localContrast: 0.4, sharpen: 6, radius: 2.2, threshold: 0.0015, halo: 0.35 };
     case 'detail': return { ...enhanced, gamma: .22, localContrast: 0.35, sharpen: 8, radius: 2.5, threshold: 0.001, halo: 0.35 };

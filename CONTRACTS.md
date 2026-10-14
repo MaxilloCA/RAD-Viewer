@@ -1,5 +1,13 @@
 # Phase A integration contract
 
+## 0.3.5 selective local Colorize
+
+Version-2 Colorize now uses signed local contrast rather than a global intensity palette. `Recipe` adds `color_strength: f32` / `colorStrength` (0–1, default 0.8) and `color_scale: f32` / `colorScale` (2–24 source pixels, default 8). Serde supplies defaults for older JSON; frontend equality treats omitted values as those defaults. Invalid/nonfinite values are rejected. This intentionally changes the appearance of older Colorize recipes; grayscale recipes retain their rendering.
+
+Color evidence is computed from prepared floating-point values before fine sharpening. Display inversion reverses hue sign: amber means darker than the local neighborhood, cyan lighter. A smooth final-brightness gate concentrates chroma in midtones, with local noise, scale agreement, strong-edge and boundary suppression. Color amount zero produces the processed grayscale image when Colorize is on, including RGB inputs. Rec.709-weighted display RGB brightness is preserved before quantization; this is not a linear-light or perceptual luminance guarantee.
+
+New fields affect final render equality and serialized review/export/preset recipes, but not the upstream prepared-stage cache key. Full-resolution display/export share the same algorithm; histogram and clipping are unchanged. Built-in processing presets preserve the selected overlay settings; Reset restores 0.8/8 with Colorize off. Controls are visible only when Colorize is on. Rotation and image dates are unchanged.
+
 ## 0.3.4 rotation, image dates and reversed color
 
 `ImageMetadata` adds nullable `imageDate` (validated calendar `YYYY-MM-DD`) and `dateSource` (DICOM keyword). Preference is AcquisitionDateTime, AcquisitionDate, ContentDate, StudyDate, SeriesDate. Missing or invalid values fall through; ordinary PNG/JPEG dates are unavailable. The interface formats calendar components as `DD-MMM-YYYY` without timezone conversion.

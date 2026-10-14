@@ -1,5 +1,15 @@
 # Versioned radiograph processing
 
+## 0.3.5 selective local Colorize
+
+The global intensity palette described in historical sections below is replaced by a spatial color overlay. It selects coherent local differences within displayed midtones rather than assigning color to every pixel with the same brightness. Original grayscale processing, histogram, clipping and source data are unchanged. This is an experimental viewing aid, not tissue segmentation or a validated diagnostic map.
+
+The analysis uses the prepared floating-point image after tone/broad contrast and before fine sharpening. It compares a lightly smoothed image with neighborhoods at `colorScale` and twice that scale, requires sign agreement, and smoothly gates small differences using local residual energy. Strong transitions and image boundaries suppress color through the wider filter support. These choices reduce grain and colored edge halos; they can also suppress real structures. The final grayscale brightness gates the chroma toward the midrange. Inversion changes the sign of relative brightness and therefore swaps the hue direction.
+
+Amber (#e5a547) indicates locally darker values; cyan (#63c7dc) locally lighter. A shared gamut contraction and blend preserve Rec.709-weighted **display RGB brightness** before 8-bit quantization, while leaving the underlying grayscale structure visible. This is not color-managed linear-light luminance preservation or a guarantee of equal perceived brightness. Color amount defaults to 80% (0–100%); feature size defaults to 8 source pixels (2–24), independent of zoom and physical detector pixel spacing. Zero amount produces grayscale in Colorize mode, even for RGB sources.
+
+Old Colorize recipes receive default amount/scale and use this new appearance. The fields are final-stage settings, so changing them reuses the prepared floating-point cache. Display and PNG export call the same deterministic pipeline. Reproduce local comparisons with `cargo run --release --locked -p rad-core --example compare_colorize -- INPUT local-verification/OUTPUT`; outputs contain clinical pixels and must remain out of Git. See [research and validation](verification/SELECTIVE_COLORIZE.md).
+
 ## 0.3.0 controls and false color
 
 The default gamma is 0.22 and sharpness 6 for all imports and Reset. UI gamma ranges from 0.1 to 0.9 and sharpness from 5 to 10. The engine still accepts gamma through 5 and spatial strength zero for old saved recipes and its neutral baseline; version 1 sharpness remains limited to 3. New defaults use version 2 recipes. No source samples change.
