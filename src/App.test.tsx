@@ -8,7 +8,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke, isTauri: () => tr
 vi.mock('@tauri-apps/api/webview', () => ({ getCurrentWebview: () => ({ onDragDropEvent: () => Promise.resolve(() => {}) }) }));
 import App from './App';
 
-const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false };
+const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, localContrast: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false };
 const info = (name: string): ImageInfo => ({ id: name, width: name === 'reference.png' ? 800 : 1200, height: 900, neutral, decodeMs: 15, metadata: { name, format: 'DICOM', bitsStored: 12, signed: false, photometric: 'MONOCHROME2', slope: 1, intercept: 0, windowCenter: null, windowWidth: null, min: 0, max: 4095 } });
 const result = (id: string, requestId: number): RenderInfo => ({ id, requestId, url: `http://test.local/${id}/${requestId}.png`, histogram: Array(256).fill(1), clippedLow: 3, clippedHigh: 5, renderMs: 25 });
 let openPaths: string[];
@@ -38,6 +38,66 @@ const gamma = (value: number) => {
   fireEvent.blur(input);
 };
 describe('comparison workflow with test-only Tauri IPC', () => {
+  it('starts eligible sources with Bitewing while preserving original and reference neutrality', async () => {
+    customInvoke = (command, args) => command === 'import_image' ? Promise.resolve({ ...info(String(args.path)), suggested: { ...neutral, version: 2, gamma: .38, windowCenter: 2500, windowWidth: 1400 } }) : undefined;
+    render(<App />); await open();
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Bitewing');
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ id: 'first.rvg', recipe: expect.objectContaining({ version: 2, gamma: .38, sharpen: 5 }) })));
+    const originalUrl = screen.getByAltText('Original: first.rvg').getAttribute('src');
+    expect(screen.getByAltText('Adjusted: first.rvg').getAttribute('src')).not.toBe(originalUrl);
+    fireEvent.click(screen.getByRole('button', { name: '＋ Add reference image' }));
+    await screen.findByAltText('Carestream reference: reference.png');
+    const referenceRenders = mocks.invoke.mock.calls.filter(([command, args]) => command === 'render_image' && args.id === 'reference.png');
+    expect(referenceRenders).toHaveLength(1);
+    expect(referenceRenders[0][1].recipe).toEqual(neutral);
+    fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Neutral');
+    expect(screen.getByAltText('Adjusted: first.rvg').getAttribute('src')).toBe(originalUrl);
+    fireEvent.click(screen.getByRole('button', { name: '↷ Redo' }));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Bitewing');
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Neutral');
+  });
+  it('identifies tuned presets and preserves fine threshold precision', async () => {
+    customInvoke = (command, args) => command === 'import_image' ? Promise.resolve({ ...info(String(args.path)), suggested: { ...neutral, gamma: .38, windowCenter: 2500, windowWidth: 1400 } }) : undefined;
+    render(<App />); await open();
+    fireEvent.click(screen.getByRole('button', { name: 'Bitewing' }));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Bitewing');
+    fireEvent.click(screen.getByRole('button', { name: /Advanced processing/ }));
+    const threshold = screen.getByRole('slider', { name: 'Noise threshold' }) as HTMLInputElement;
+    expect(threshold.value).toBe('0.0015');
+    expect(threshold.step).toBe('0.0005');
+    expect(screen.getByText('0.0015')).toBeTruthy();
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: expect.objectContaining({ version: 2, gamma: .38, threshold: .0015, sharpen: 5, radius: 2.2 }) })));
+    fireEvent.click(screen.getByRole('button', { name: 'Detail' }));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Detail');
+    fireEvent.click(screen.getByRole('button', { name: 'Neutral' }));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Neutral');
+    expect((screen.getByRole('slider', { name: 'Gamma' }) as HTMLInputElement).value).toBe('1');
+  });
+  it('shows the current recipe and upgrades legacy recipes only when new processing is chosen', async () => {
+    const legacy = { ...neutral, threshold: .12, sharpen: .6 };
+    customInvoke = command => command === 'load_presets' ? Promise.resolve([{ name: 'Saved legacy', recipe: legacy }]) : undefined;
+    render(<App />); await open();
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Neutral');
+    fireEvent.change(screen.getByLabelText('Apply saved preset'), { target: { value: 'Saved legacy' } });
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Saved legacy');
+    fireEvent.click(screen.getByRole('button', { name: /Advanced processing/ }));
+    expect((screen.getByRole('slider', { name: 'Noise threshold' }) as HTMLInputElement).value).toBe('0.12');
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: legacy })));
+    const localContrast = screen.getByRole('slider', { name: 'Local contrast' });
+    fireEvent.change(localContrast, { target: { value: '.25' } });
+    fireEvent.blur(localContrast);
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Custom adjustments');
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('v2');
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: { ...legacy, localContrast: .25, version: 2 } })));
+    fireEvent.click(screen.getByRole('button', { name: '↶ Undo' }));
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('Saved legacy');
+    expect(screen.getByLabelText('Current processing preset').textContent).toContain('v1');
+    fireEvent.change(screen.getByLabelText('Detail method'), { target: { value: 'radiograph' } });
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('render_image', expect.objectContaining({ recipe: { ...legacy, detailMode: 'radiograph', version: 2 } })));
+    expect((screen.getByRole('slider', { name: 'Sharpness strength' }) as HTMLInputElement).max).toBe('6');
+  });
   it('uses physical pixel scale at 100% and shows binary image display failures', async () => {
     vi.stubGlobal('devicePixelRatio', 2);
     render(<App />); await open();

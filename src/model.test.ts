@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { commit, experimentalPreset, redo, sourcePixelScale, undo } from './model';
 import type { Recipe } from './model';
 
-const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false };
+const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, localContrast: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false };
 describe('non-destructive per-image adjustment history', () => {
   it('maps source pixels to physical display pixels on HiDPI displays', () => {
     expect(sourcePixelScale(2)).toBe(.5);
@@ -30,6 +30,18 @@ describe('non-destructive per-image adjustment history', () => {
     expect(preset.sharpen).toBeGreaterThan(0);
     expect(neutral.sharpen).toBe(0);
     expect(experimentalPreset('neutral', neutral)).toEqual(neutral);
-    expect(experimentalPreset('detail', neutral).detailMode).toBe('multiscale');
+    expect(experimentalPreset('detail', neutral).detailMode).toBe('radiograph');
+    expect(experimentalPreset('detail', neutral).version).toBe(2);
+  });
+  it('uses the suggested window only for enhanced presets', () => {
+    const suggested = { ...neutral, windowCenter: 2800, windowWidth: 1400, gamma: .38 };
+    expect(experimentalPreset('neutral', neutral, suggested)).toEqual(neutral);
+    expect(experimentalPreset('bitewing', neutral, suggested).windowCenter).toBe(2800);
+    expect(experimentalPreset('endo', neutral, suggested).windowWidth).toBe(1400);
+    expect(experimentalPreset('bitewing', neutral, suggested).gamma).toBe(.38);
+    expect(experimentalPreset('endo', neutral, suggested).gamma).toBeCloseTo(.646);
+    expect(experimentalPreset('detail', neutral, suggested).gamma).toBeCloseTo(.399);
+    expect(experimentalPreset('bitewing', neutral).gamma).toBe(1);
+    expect(neutral.windowWidth).toBe(4096);
   });
 });

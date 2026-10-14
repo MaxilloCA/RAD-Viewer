@@ -2,7 +2,7 @@
 
 use image::ImageEncoder;
 use rad_core::processing::ProcessingSession;
-use rad_core::{decode, process, ImageMetadata, Recipe, SourceImage};
+use rad_core::{decode, process, suggested_recipe, ImageMetadata, Recipe, SourceImage};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -50,6 +50,7 @@ struct ImageInfo {
     height: u32,
     metadata: ImageMetadata,
     neutral: Recipe,
+    suggested: Recipe,
     decode_ms: f64,
 }
 #[derive(Clone, Serialize)]
@@ -135,10 +136,14 @@ async fn import_image(path: String, state: State<'_, AppState>) -> Result<ImageI
         .await
         .map_err(|e| e.to_string())?;
     let decode_path = path.clone();
-    let (source, elapsed) = tauri::async_runtime::spawn_blocking(move || {
+    let (source, suggested, elapsed) = tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
         let start = Instant::now();
-        decode(&decode_path).map(|s| (s, start.elapsed().as_secs_f64() * 1000.0))
+        decode(&decode_path).map(|s| {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            let suggested = suggested_recipe(&s);
+            (s, suggested, elapsed)
+        })
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -148,6 +153,7 @@ async fn import_image(path: String, state: State<'_, AppState>) -> Result<ImageI
         width: source.width,
         height: source.height,
         neutral: Recipe::neutral(&source),
+        suggested,
         metadata: source.metadata.clone(),
         decode_ms: elapsed,
     };

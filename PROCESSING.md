@@ -1,4 +1,30 @@
-# Processing version 1
+# Versioned radiograph processing
+
+## Version 2 image-quality revision
+
+The 0.2.0 prototype adds source-aware tone suggestions and a `radiograph` detail mode. Version 1 algorithms remain unchanged for saved recipes. `localContrast` defaults to zero when older JSON is read. Neutral remains version 1 with all spatial filters off.
+
+For high-depth grayscale DICOM without supplied windowing, `suggested_recipe` estimates q1/q99 after modality mapping, omitting exact global extrema and a 2% border only while collecting statistics. It adds 7.5% headroom toward display-white and uses gamma 0.38. This addresses the supplied R4's compressed upper-range anatomy without changing decoding. Stored windowing, ordinary images, flat/tiny sources and recognized panoramic images retain neutral suggestions. Panoramic recognition is currently `.pano` or width/height greater than two. Suggestions are experimental display settings, not calibrated attenuation or tissue segmentation.
+
+Eligible intraoral sources open with Bitewing applied only in the adjusted pane. References always use neutral. Reset/undo restore neutral mapping. The current preset and processing version are visible.
+
+Version 2 preserves the input and adds noise-gated, bounded band contrast. Fine detail uses Gaussian scales at radius × 1, 2 and 4; local contrast uses differences between scales 4, 8, 16, 32 and 64 source pixels. Original coefficients remain even when extra gain is suppressed. Threshold is a display-relative activity control, not a calibrated detector noise estimate. Broad bands have a separate sharp-transition guard: a smoothed gradient detects localized edges, and a maximum filter expands protection through each band's support. The fine halo control suppresses gain near strong edges; near-edge sharpening overshoot remains possible. CLAHE and denoising are disabled in new built-ins.
+
+| Preset | Gamma for eligible source | Local contrast | Fine strength | Radius px | Threshold | Halo |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Bitewing | 0.38 | 0.40 | 5.0 | 2.2 | 0.0015 | 0.35 |
+| Endo | 0.646 | 0.30 | 3.5 | 2.0 | 0.0020 | 0.50 |
+| Detail | 0.399 | 0.35 | 6.0 | 2.5 | 0.0010 | 0.35 |
+
+For images without a source-aware suggestion, explicitly choosing these presets uses the neutral tone base with gamma multipliers 1, 1.7 and 1.05 respectively. Neutral ordinary/reference imports are unchanged.
+
+Tone statistics and processing run on background workers. The prepared-stage cache keys version and local contrast as well as earlier controls; when broad contrast is active, threshold and halo also participate. Preview and export share deterministic processing.
+
+See [image-quality research and comparison](verification/IMAGE_QUALITY_REVIEW.md) for primary sources, rationale and limits. Reproduce current preset outputs with `cargo run --release --locked -p rad-core --example compare_presets -- INPUT local-verification/OUTPUT`. The optional third argument is a recipe JSON, producing only a candidate render. Outputs are private clinical material and must stay out of Git.
+
+Version 2 R1, 12 sharpness changes after warm-up: **208.59 ms cached median**, **779.66 ms uncached median**, byte-identical outputs. Reproduce with `cargo run --release --locked -p rad-core --example cache_benchmark -- "Sample RAD Files/R1.rvg" --v2`. Without `--v2` it retains the historical v1 workload. These are CPU-only measurements. Native R4 automatic Bitewing reported 603 ms including PNG while other samples imported. Busy concurrent-build runs exceeded one second on intraoral images, so sub-second end-to-end interaction is not guaranteed.
+
+## Version 1 behavior and historical measurements
 
 The Phase A engine is a deterministic CPU implementation in `crates/rad-core/src/processing.rs`. Source samples are immutable. DICOM integer samples through 16 bits remain exactly representable in the stored `f32` buffer. Spatial operations use source-image coordinates and never depend on viewer zoom. Final display and PNG export are 8-bit RGBA; no intermediate stage quantizes to 8 bits.
 
@@ -25,7 +51,7 @@ Algorithms are independently implemented; preset names do not indicate replicas 
 
 `cargo test -p rad-core processing` runs synthetic checks for 12-bit neutral ramps, original-buffer immutability, modality-once behavior, signed and negative-slope inputs, polarity, width-one VOI, grayscale and RGB reference fidelity, flat fields, tiny images, boundary filtering, noise/edge behavior, thresholding, halo bounds, CLAHE continuity, and invalid inputs.
 
-`cargo test -p rad-core --release benchmark_supplied_samples -- --ignored --nocapture` runs locally against all four private supplied samples. It reports first decode timing and five full-resolution renders per neutral/experimental UI preset after one warm-up. It also measures all optional stages on R1. Preset parameters in this test mirror `src/model.ts`. These are CPU pipeline timings and exclude PNG encoding, IPC, WebView rendering, and interaction latency; they are not end-to-end promises.
+`cargo test -p rad-core --release benchmark_supplied_samples -- --ignored --nocapture` runs locally against all four private supplied samples. It reports first decode timing and five full-resolution renders per original version 1 preset after one warm-up. It also measures all optional stages on R1. These legacy parameters no longer represent the current version 2 UI presets. These timings exclude PNG encoding, IPC, WebView rendering, and interaction latency; they are not end-to-end promises.
 
 Independent raw-pixel decoder comparison is reported separately. Synthetic numerical checks and performance measurements do not replace Carestream comparison or user image-quality acceptance.
 

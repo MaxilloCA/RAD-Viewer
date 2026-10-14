@@ -1,5 +1,13 @@
 # Phase A integration contract
 
+## 0.2.0 contract extension
+
+`Recipe` now includes `local_contrast: f32` / `localContrast: number`, defaulting to zero when reading old JSON. Version 1 rendering is preserved. Version 2 adds `detail_mode: "radiograph"`, strength up to six and independent local contrast. A deliberate choice of a new control upgrades the selected recipe to version 2; loading a saved version 1 preset does not.
+
+`import_image` additionally returns `suggested: Recipe`. It is computed in the worker from immutable samples. A version 2 suggestion identifies an eligible source for initial Bitewing processing in the adjusted pane; a neutral version 1 suggestion leaves initial processing neutral. Reference loading always uses `neutral`, regardless of suggestion. The left original pane always uses the pinned neutral render. Automatic Bitewing has neutral in its undo history.
+
+Processing order for version 2 is modality, optional denoise, window/polarity/gamma, optional CLAHE, broad local contrast, selected fine detail, final inversion/display. Fine and broad stages use source coordinates. The cached prepared stage includes broad local contrast, with every upstream control in its key. Exports use the identical uncached pipeline. The older contract below remains applicable except for these extensions.
+
 Patient samples, decoded dumps, screenshots and references stay local and out of Git.
 Phase B/C are gated on user acceptance of the Carestream comparison.
 

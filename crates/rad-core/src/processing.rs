@@ -1,4 +1,4 @@
-//! Version 1 CPU pipeline. All spatial scales are source-image pixels.
+//! Versioned CPU pipelines. All spatial scales are source-image pixels.
 //! Source samples stay immutable; quantization occurs only at the final RGBA conversion.
 use crate::SourceImage;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,8 @@ pub struct Recipe {
     pub gamma: f32,
     pub denoise: f32,
     pub clahe: f32,
+    #[serde(default)]
+    pub local_contrast: f32,
     pub sharpen: f32,
     pub radius: f32,
     pub threshold: f32,
@@ -42,6 +44,7 @@ impl Recipe {
             gamma: 1.0,
             denoise: 0.0,
             clahe: 0.0,
+            local_contrast: 0.0,
             sharpen: 0.0,
             radius: 2.0,
             threshold: 0.01,
@@ -52,7 +55,7 @@ impl Recipe {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1 {
+        if !matches!(self.version, 1 | 2) {
             return Err("Unsupported processing recipe version".into());
         }
         if !self.window_center.is_finite()
@@ -65,7 +68,13 @@ impl Recipe {
             ("gamma", self.gamma, 0.1, 5.0),
             ("denoise", self.denoise, 0.0, 1.0),
             ("CLAHE", self.clahe, 0.0, 1.0),
-            ("sharpen", self.sharpen, 0.0, 3.0),
+            ("local contrast", self.local_contrast, 0.0, 1.0),
+            (
+                "sharpen",
+                self.sharpen,
+                0.0,
+                if self.version == 2 { 6.0 } else { 3.0 },
+            ),
             ("radius", self.radius, 0.35, 12.0),
             ("threshold", self.threshold, 0.0, 0.25),
             ("halo suppression", self.halo, 0.0, 1.0),
@@ -74,8 +83,11 @@ impl Recipe {
                 return Err(format!("{name} must be between {min} and {max}"));
             }
         }
-        if self.detail_mode != "unsharp" && self.detail_mode != "multiscale" {
-            return Err("Detail mode must be unsharp or multiscale".into());
+        if self.detail_mode != "unsharp"
+            && self.detail_mode != "multiscale"
+            && !(self.version == 2 && self.detail_mode == "radiograph")
+        {
+            return Err("Detail mode must be unsharp, multiscale, or version 2 radiograph".into());
         }
         Ok(())
     }
@@ -95,7 +107,7 @@ pub struct RenderedImage {
 /// Keeping the source inside the session prevents reusing another image's cache.
 pub struct ProcessingSession {
     source: Arc<SourceImage>,
-    prepared: Option<([u32; 5], Vec<f32>)>,
+    prepared: Option<([u32; 9], Vec<f32>)>,
 }
 
 impl ProcessingSession {
@@ -108,14 +120,23 @@ impl ProcessingSession {
 
     pub fn process(&mut self, recipe: &Recipe) -> Result<RenderedImage, String> {
         validate_source(&self.source, recipe)?;
-        let key = [
-            recipe.window_center,
-            recipe.window_width,
-            recipe.gamma,
-            recipe.denoise,
-            recipe.clahe,
-        ]
-        .map(f32::to_bits);
+        let mut key = [0u32; 9];
+        key[0] = recipe.version;
+        key[1..6].copy_from_slice(
+            &[
+                recipe.window_center,
+                recipe.window_width,
+                recipe.gamma,
+                recipe.denoise,
+                recipe.clahe,
+            ]
+            .map(f32::to_bits),
+        );
+        if recipe.version == 2 && recipe.local_contrast > 0.0 {
+            key[6..].copy_from_slice(
+                &[recipe.local_contrast, recipe.threshold, recipe.halo].map(f32::to_bits),
+            );
+        }
         let values =
             if let Some((_, values)) = self.prepared.as_ref().filter(|(old, _)| *old == key) {
                 values.clone()
@@ -199,6 +220,9 @@ fn prepare(source: &SourceImage, recipe: &Recipe) -> Result<Vec<f32>, String> {
     if recipe.clahe > 0.0 {
         values = clahe(&values, w, h, recipe.clahe);
     }
+    if recipe.version == 2 && recipe.local_contrast > 0.0 {
+        values = radiograph_bands(&values, w, h, recipe, true);
+    }
     Ok(values)
 }
 
@@ -207,7 +231,11 @@ fn finish_render(source: &SourceImage, recipe: &Recipe, mut values: Vec<f32>) ->
     let n = w * h;
     let m = &source.metadata;
     if recipe.sharpen > 0.0 {
-        values = detail(&values, w, h, recipe);
+        values = if recipe.version == 2 && recipe.detail_mode == "radiograph" {
+            radiograph_bands(&values, w, h, recipe, false)
+        } else {
+            detail(&values, w, h, recipe)
+        };
     }
 
     let mut rendered = RenderedImage {
@@ -463,6 +491,165 @@ fn gaussian(input: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
     result
 }
 
+/// Version 2 independently implemented scale-space enhancement. Its design is
+/// informed by nonlinear radiographic multiscale enhancement and noise containment
+/// (Stahl/Aach/Dippel, Medical Physics 2000, doi:10.1118/1.598857). It is not a
+/// reproduction of that algorithm or of any vendor's proprietary processing.
+///
+/// Preserve input coefficients: only add a smooth, bounded boost. Low-activity
+/// bands get no additional gain below the noise threshold. Large coefficients
+/// and neighborhoods containing strong edges get less gain, instead of clipping
+/// every local extremum to its 3x3 range and thereby suppressing subtle detail.
+fn radiograph_bands(input: &[f32], w: usize, h: usize, recipe: &Recipe, broad: bool) -> Vec<f32> {
+    let fine_scales = [recipe.radius, recipe.radius * 2.0, recipe.radius * 4.0];
+    let (scales, weights, strength): (&[f32], &[f32], f32) = if broad {
+        (
+            &[4.0, 8.0, 16.0, 32.0, 64.0],
+            &[0.9, 1.2, 1.0, 0.6],
+            recipe.local_contrast,
+        )
+    } else {
+        (&fine_scales, &[0.5, 0.35, 0.15], recipe.sharpen)
+    };
+    if strength == 0.0 {
+        return input.to_vec();
+    }
+    let centered: Vec<f32> = input.iter().map(|v| v - 0.5).collect();
+    let square: Vec<f32> = centered.iter().map(|v| v * v).collect();
+    // Broad Gaussian bands otherwise turn even moderate step edges into long
+    // bright/dark contours. Detect sharp transitions independently of the fine
+    // halo control, then protect the entire support of every broad-band filter.
+    // Smoothing first limits sensitivity to isolated pixel-scale detector noise.
+    let sharp_edges = broad.then(|| {
+        let smooth = gaussian(input, w, h, 2.0);
+        let mut weights = vec![0.0; input.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let dx = smooth[y * w + (x + 2).min(w - 1)] - smooth[y * w + x.saturating_sub(2)];
+                let dy = smooth[(y + 2).min(h - 1) * w + x] - smooth[y.saturating_sub(2) * w + x];
+                weights[y * w + x] = smooth_step(
+                    ((dx * dx + dy * dy - 0.010f32.powi(2))
+                        / (0.026f32.powi(2) - 0.010f32.powi(2)))
+                    .clamp(0.0, 1.0),
+                );
+            }
+        }
+        weights
+    });
+    let mut output = input.to_vec();
+    let mut previous = if broad {
+        gaussian(input, w, h, scales[0])
+    } else {
+        input.to_vec()
+    };
+    let first = usize::from(broad);
+    let mut previous_scale = if broad { scales[0] } else { 0.0 };
+    for (band_index, &scale) in scales[first..].iter().enumerate() {
+        let smooth = gaussian(input, w, h, scale);
+        let band: Vec<f32> = previous.iter().zip(&smooth).map(|(a, b)| a - b).collect();
+        let energy: Vec<f32> = band.iter().map(|v| v * v).collect();
+        let energy = box_mean(&energy, w, h, (scale.ceil() as usize).max(1));
+        // Blurred bands contain less pixel-scale noise. This scale normalization
+        // is a tuning model, not a calibrated detector noise estimate.
+        let floor = recipe.threshold.powi(2) / (1.0 + previous_scale);
+        let edge_radius = (scale * 3.0).ceil() as usize + 2;
+        let edges = (recipe.halo > 0.0).then(|| {
+            let mean = box_mean(&centered, w, h, edge_radius);
+            let second = box_mean(&square, w, h, edge_radius);
+            mean.into_iter()
+                .zip(second)
+                .map(|(m, q)| (q - m * m).max(0.0))
+                .collect::<Vec<_>>()
+        });
+        let protected_edges = sharp_edges
+            .as_ref()
+            .map(|edges| box_max(edges, w, h, edge_radius));
+        let edge_start = 0.1 - 0.075 * recipe.halo;
+        let edge_end = edge_start * 2.4;
+        let edge_start_squared = edge_start * edge_start;
+        let edge_end_squared = edge_end * edge_end;
+        let knee = 0.04 + 0.03 * scale / (scale + 8.0);
+        let gain = strength * weights[band_index];
+        for i in 0..input.len() {
+            let activity = if energy[i] <= floor {
+                0.0
+            } else {
+                smooth_step((1.0 - floor / energy[i]).clamp(0.0, 1.0))
+            };
+            let edge_weight = edges.as_ref().map_or(1.0, |v| {
+                1.0 - smooth_step(
+                    ((v[i] - edge_start_squared) / (edge_end_squared - edge_start_squared))
+                        .clamp(0.0, 1.0),
+                )
+            });
+            let edge_weight = edge_weight * protected_edges.as_ref().map_or(1.0, |e| 1.0 - e[i]);
+            let coefficient = band[i];
+            let relative = coefficient / knee;
+            output[i] += gain * activity * edge_weight * coefficient / (1.0 + relative * relative);
+        }
+        previous = smooth;
+        previous_scale = scale;
+    }
+    output
+}
+
+/// Separable rectangular maximum in O(pixels), independent of support radius.
+/// A support maximum prevents a narrow detected edge from being diluted by the
+/// large neighborhoods used for broad local contrast. It does not clamp pixels.
+fn box_max(input: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+    use std::collections::VecDeque;
+    let mut tmp = vec![0.0; input.len()];
+    let mut result = vec![0.0; input.len()];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for y in 0..h {
+        queue.clear();
+        let mut next = 0;
+        for x in 0..w {
+            let right = (x + radius).min(w - 1);
+            while next <= right {
+                while queue
+                    .back()
+                    .is_some_and(|&j| input[y * w + j] <= input[y * w + next])
+                {
+                    queue.pop_back();
+                }
+                queue.push_back(next);
+                next += 1;
+            }
+            while queue.front().is_some_and(|&j| j < x.saturating_sub(radius)) {
+                queue.pop_front();
+            }
+            tmp[y * w + x] = input[y * w + queue[0]];
+        }
+    }
+    for x in 0..w {
+        queue.clear();
+        let mut next = 0;
+        for y in 0..h {
+            let bottom = (y + radius).min(h - 1);
+            while next <= bottom {
+                while queue
+                    .back()
+                    .is_some_and(|&j| tmp[j * w + x] <= tmp[next * w + x])
+                {
+                    queue.pop_back();
+                }
+                queue.push_back(next);
+                next += 1;
+            }
+            while queue.front().is_some_and(|&j| j < y.saturating_sub(radius)) {
+                queue.pop_front();
+            }
+            result[y * w + x] = tmp[queue[0] * w + x];
+        }
+    }
+    result
+}
+
+fn smooth_step(v: f32) -> f32 {
+    v * v * (3.0 - 2.0 * v)
+}
+
 fn detail(input: &[f32], w: usize, h: usize, recipe: &Recipe) -> Vec<f32> {
     let fine = gaussian(input, w, h, recipe.radius);
     let coarse =
@@ -592,8 +779,330 @@ mod tests {
         let two = second.process(&recipe).unwrap();
         assert_ne!(one.rgba, two.rgba);
         assert_eq!(two.rgba, process(&b, &recipe).unwrap().rgba);
-        recipe.version = 2;
+        recipe.version = 3;
         assert!(first.process(&recipe).is_err());
+    }
+
+    fn radiograph_recipe() -> Recipe {
+        let mut r = Recipe::neutral(&source(1, 1, vec![0.5]));
+        r.version = 2;
+        r.window_center = 0.5;
+        r.window_width = 2.0;
+        r.sharpen = 2.0;
+        r.local_contrast = 0.5;
+        r.radius = 1.2;
+        r.threshold = 0.003;
+        r.halo = 0.8;
+        r.detail_mode = "radiograph".into();
+        r
+    }
+
+    #[test]
+    fn radiograph_enhances_subtle_detail_and_broad_local_contrast_separately() {
+        let (w, h) = (256, 48);
+        let pattern = |period: f32, amplitude: f32| {
+            (0..w * h)
+                .map(|i| 0.5 + amplitude * (std::f32::consts::TAU * (i % w) as f32 / period).sin())
+                .collect::<Vec<_>>()
+        };
+        let rms =
+            |a: &[f32]| (a.iter().map(|v| (v - 0.5).powi(2)).sum::<f32>() / a.len() as f32).sqrt();
+        let fine = pattern(8.0, 0.008);
+        let mut r = radiograph_recipe();
+        r.threshold = 0.0015;
+        let enhanced = radiograph_bands(&fine, w, h, &r, false);
+        assert!(
+            rms(&enhanced) > 1.35 * rms(&fine),
+            "Subtle fine contrast must get meaningful enhancement"
+        );
+        let broad = pattern(80.0, 0.015);
+        let enhanced = radiograph_bands(&broad, w, h, &r, true);
+        assert!(
+            rms(&enhanced) > 1.2 * rms(&broad),
+            "Medium structures need their own contrast stage"
+        );
+    }
+
+    #[test]
+    fn radiograph_noise_containment_preserves_original_noise_without_boosting_it() {
+        let (w, h) = (129, 65);
+        let noisy: Vec<f32> = (0..w * h)
+            .map(|i| 0.5 + if (i + i / w) % 2 == 0 { 0.002 } else { -0.002 })
+            .collect();
+        let mut r = radiograph_recipe();
+        r.sharpen = 6.0;
+        r.local_contrast = 1.0;
+        r.threshold = 0.006;
+        let broad = radiograph_bands(&noisy, w, h, &r, true);
+        let enhanced = radiograph_bands(&broad, w, h, &r, false);
+        let maximum_change = enhanced
+            .iter()
+            .zip(&noisy)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            maximum_change < 0.00005,
+            "Noise must remain unchanged within 0.013 display levels; max={maximum_change}"
+        );
+        assert!(enhanced.iter().any(|v| *v < 0.499));
+        assert!(enhanced.iter().any(|v| *v > 0.501));
+    }
+
+    #[test]
+    fn radiograph_strong_edges_have_no_material_new_contours() {
+        let (w, h) = (512, 25);
+        let step: Vec<f32> = (0..w * h)
+            .map(|i| if i % w < 256 { 0.15 } else { 0.85 })
+            .collect();
+        let mut r = radiograph_recipe();
+        r.local_contrast = 1.0;
+        r.sharpen = 6.0;
+        r.threshold = 0.0;
+        r.halo = 0.8;
+        let broad = radiograph_bands(&step, w, h, &r, true);
+        let enhanced = radiograph_bands(&broad, w, h, &r, false);
+        let maximum_change = enhanced
+            .iter()
+            .zip(&step)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            maximum_change < 1.0 / 255.0,
+            "Strong-edge artifacts must stay below one display level; max={maximum_change}"
+        );
+        let row = &enhanced[w * 12..w * 13];
+        assert!(
+            row.windows(2).all(|p| p[1] >= p[0] - 0.0001),
+            "No material gradient reversal adjacent to strong edge"
+        );
+        r.halo = 0.0;
+        let unprotected = radiograph_bands(&step, w, h, &r, false);
+        let unprotected_change = unprotected
+            .iter()
+            .zip(&step)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            unprotected_change > maximum_change * 5.0,
+            "Edge protection should have a measurable effect"
+        );
+    }
+
+    #[test]
+    fn radiograph_flat_fields_tiny_images_and_ramps_remain_finite() {
+        let mut r = radiograph_recipe();
+        r.sharpen = 6.0;
+        r.local_contrast = 1.0;
+        r.threshold = 0.0;
+        for (w, h) in [(1, 1), (2, 3), (129, 65)] {
+            for value in [0.0, 0.1, 0.5, 0.9, 1.0] {
+                let input = vec![value; w * h];
+                let output =
+                    radiograph_bands(&radiograph_bands(&input, w, h, &r, true), w, h, &r, false);
+                assert!(output
+                    .iter()
+                    .all(|v| v.is_finite() && (v - value).abs() < 1e-6));
+            }
+        }
+        let ramp: Vec<_> = (0..512 * 20).map(|i| (i % 512) as f32 / 511.0).collect();
+        let output = radiograph_bands(
+            &radiograph_bands(&ramp, 512, 20, &r, true),
+            512,
+            20,
+            &r,
+            false,
+        );
+        assert!(output
+            .iter()
+            .all(|v| v.is_finite() && (-0.05..=1.05).contains(v)));
+        assert!(output[512 * 10..512 * 11]
+            .windows(2)
+            .all(|p| p[1] >= p[0] - 1e-5));
+    }
+
+    #[test]
+    fn broad_contrast_does_not_create_long_contours_at_moderate_edges() {
+        for halo in [0.35, 0.7, 0.8] {
+            for contrast in [0.05, 0.10, 0.15] {
+                for direction in [-1.0, 1.0] {
+                    for vertical in [false, true] {
+                        let (w, h) = if vertical { (17, 257) } else { (257, 17) };
+                        let step: Vec<_> = (0..w * h)
+                            .map(|i| {
+                                let coordinate = if vertical { i / w } else { i % w };
+                                0.5 + direction
+                                    * contrast
+                                    * if coordinate < 128 { -0.5 } else { 0.5 }
+                            })
+                            .collect();
+                        for (local, strength, radius, threshold) in [
+                            (0.4, 5.0, 2.2, 0.0015), // revised Bitewing
+                            (0.35, 6.0, 2.5, 0.001), // revised Detail
+                        ] {
+                            let mut recipe = radiograph_recipe();
+                            recipe.local_contrast = local;
+                            recipe.sharpen = strength;
+                            recipe.radius = radius;
+                            recipe.threshold = threshold;
+                            recipe.halo = halo;
+                            let broad = radiograph_bands(&step, w, h, &recipe, true);
+                            let maximum = broad
+                                .iter()
+                                .zip(&step)
+                                .map(|(a, b)| (a - b).abs())
+                                .fold(0.0f32, f32::max);
+                            assert!(maximum < 0.25 / 255.0,
+                            "Broad contour: contrast={contrast}, halo={halo}, vertical={vertical}, max={maximum}");
+                            let final_values = radiograph_bands(&broad, w, h, &recipe, false);
+                            for (i, &v) in final_values.iter().enumerate() {
+                                let coordinate = if vertical { i / w } else { i % w };
+                                let distance = coordinate.abs_diff(128);
+                                if distance > 32 {
+                                    assert!((v-step[i]).abs() < 0.25 / 255.0,
+                                    "Fine enhancement must not create a long broad contour: contrast={contrast}, distance={distance}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn broad_edge_guard_retains_low_contrast_structure_amid_fine_noise() {
+        let (w, h) = (320, 31);
+        let pattern: Vec<_> = (0..w * h)
+            .map(|i| {
+                let phase = std::f32::consts::TAU * (i % w) as f32 / 80.0;
+                let noise = ((i * 71 + i / w * 19) % 97) as f32 / 96.0 - 0.5;
+                0.5 + phase.sin() * 0.015 + noise * 0.012
+            })
+            .collect();
+        let mut recipe = radiograph_recipe();
+        recipe.local_contrast = 0.4;
+        recipe.threshold = 0.0015;
+        recipe.halo = 0.35;
+        let broad = radiograph_bands(&pattern, w, h, &recipe, true);
+        let contrast = |image: &[f32]| {
+            image
+                .iter()
+                .enumerate()
+                .map(|(i, value)| {
+                    (value - 0.5) * (std::f32::consts::TAU * (i % w) as f32 / 80.0).sin()
+                })
+                .sum::<f32>()
+        };
+        assert!(
+            contrast(&broad) > contrast(&pattern) * 1.15,
+            "Coherent broad contrast must remain visible despite fine noise and edge protection"
+        );
+    }
+
+    #[test]
+    fn edge_support_maximum_matches_naive_including_boundaries() {
+        let (w, h) = (7, 3);
+        let v: Vec<_> = (0..w * h).map(|i| ((i * 11) % 13) as f32 / 13.0).collect();
+        for radius in [0, 1, 2, 8] {
+            let result = box_max(&v, w, h, radius);
+            for y in 0..h {
+                for x in 0..w {
+                    let mut expected = 0.0f32;
+                    for yy in y.saturating_sub(radius)..=(y + radius).min(h - 1) {
+                        for xx in x.saturating_sub(radius)..=(x + radius).min(w - 1) {
+                            expected = expected.max(v[yy * w + xx]);
+                        }
+                    }
+                    assert_eq!(result[y * w + x], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn version_one_recipes_keep_old_semantics_and_deserialize_without_new_fields() {
+        let s = source(
+            31,
+            17,
+            (0..31 * 17).map(|i| ((i * 73) % 4096) as f32).collect(),
+        );
+        let mut r = Recipe::neutral(&s);
+        r.gamma = 0.94;
+        r.clahe = 0.2;
+        r.sharpen = 0.65;
+        r.radius = 1.5;
+        r.threshold = 0.016;
+        r.halo = 0.8;
+        let mut json = serde_json::to_value(&r).unwrap();
+        json.as_object_mut().unwrap().remove("localContrast");
+        let restored: Recipe = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.local_contrast, 0.0);
+        assert_eq!(
+            process(&s, &restored).unwrap().rgba,
+            process(&s, &r).unwrap().rgba
+        );
+        let old = process(&s, &r).unwrap();
+        r.local_contrast = 1.0;
+        assert_eq!(
+            old.rgba,
+            process(&s, &r).unwrap().rgba,
+            "v1 must ignore v2 stage"
+        );
+        r.local_contrast = 0.0;
+        r.version = 2;
+        assert_eq!(
+            old.rgba,
+            process(&s, &r).unwrap().rgba,
+            "unchanged legacy detail mode remains identical"
+        );
+        r = Recipe::neutral(&s);
+        let neutral = process(&s, &r).unwrap();
+        r.version = 2;
+        r.detail_mode = "radiograph".into();
+        assert_eq!(neutral.rgba, process(&s, &r).unwrap().rgba);
+    }
+
+    #[test]
+    fn version_two_cached_and_direct_pixels_match_for_all_new_stage_keys() {
+        let source = Arc::new(source(
+            71,
+            43,
+            (0..71 * 43).map(|i| ((i * 61) % 4096) as f32).collect(),
+        ));
+        let original = source.samples.clone();
+        let mut cached = ProcessingSession::new(source.clone());
+        let mut r = Recipe::neutral(&source);
+        let mut recipes = vec![r.clone()];
+        r.version = 2;
+        recipes.push(r.clone());
+        r.detail_mode = "radiograph".into();
+        r.sharpen = 2.0;
+        recipes.push(r.clone());
+        r.local_contrast = 0.7;
+        recipes.push(r.clone());
+        r.threshold = 0.003;
+        recipes.push(r.clone());
+        r.halo = 0.3;
+        recipes.push(r.clone());
+        r.gamma = 0.92;
+        recipes.push(r.clone());
+        r.local_contrast = 0.0;
+        recipes.push(r.clone());
+        r.version = 1;
+        r.detail_mode = "unsharp".into();
+        recipes.push(r.clone());
+        recipes.extend(recipes.clone().into_iter().rev());
+        for recipe in recipes {
+            let a = cached.process(&recipe).unwrap();
+            let b = process(&source, &recipe).unwrap();
+            assert_eq!(a.rgba, b.rgba);
+            assert_eq!(a.histogram, b.histogram);
+            assert_eq!(
+                (a.clipped_low, a.clipped_high),
+                (b.clipped_low, b.clipped_high)
+            );
+        }
+        assert_eq!(source.samples, original);
     }
 
     #[test]
@@ -793,7 +1302,7 @@ mod tests {
         r.gamma = f32::NAN;
         assert!(process(&s, &r).is_err());
         r = Recipe::neutral(&s);
-        r.version = 2;
+        r.version = 3;
         assert!(process(&s, &r).is_err());
         r.version = 1;
         s.samples.pop();
@@ -846,7 +1355,7 @@ mod tests {
                     continue;
                 }
                 let mut r = neutral.clone();
-                // Exact values in src/model.ts; update this comparison if UI presets change.
+                // Historical version 1 presets. Current v2 UI is exercised by compare_presets.
                 match preset {
                     "bitewing" => {
                         r.gamma = 0.94;

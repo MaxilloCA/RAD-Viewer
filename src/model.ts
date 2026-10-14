@@ -4,6 +4,7 @@ export interface Recipe {
   windowWidth: number;
   gamma: number;
   denoise: number;
+  localContrast: number;
   clahe: number;
   sharpen: number;
   radius: number;
@@ -18,7 +19,7 @@ export interface ImageMetadata {
   windowCenter: number | null; windowWidth: number | null; min: number; max: number;
 }
 export interface ImageInfo {
-  id: string; width: number; height: number; metadata: ImageMetadata; neutral: Recipe; decodeMs: number;
+  id: string; width: number; height: number; metadata: ImageMetadata; neutral: Recipe; suggested?: Recipe; decodeMs: number;
 }
 export interface RenderInfo {
   id: string; requestId: number; url: string; histogram: number[];
@@ -47,11 +48,12 @@ export function redo(history: History): History {
   if (!history.future.length) return history;
   return { past: [...history.past, history.present], present: history.future[0], future: history.future.slice(1) };
 }
-export function experimentalPreset(name: string, neutral: Recipe): Recipe {
+export function experimentalPreset(name: string, neutral: Recipe, suggested: Recipe = neutral): Recipe {
+  const enhanced = { ...suggested, version: 2, detailMode: 'radiograph', denoise: 0, clahe: 0 };
   switch (name) {
-    case 'bitewing': return { ...neutral, gamma: 0.94, clahe: 0.2, sharpen: 0.65, radius: 1.5, threshold: 0.016, halo: 0.8 };
-    case 'endo': return { ...neutral, gamma: 0.88, clahe: 0.28, sharpen: 0.5, radius: 2.2, threshold: 0.018, halo: 0.85 };
-    case 'detail': return { ...neutral, sharpen: 0.65, radius: 1.4, threshold: 0.02, halo: 0.85, detailMode: 'multiscale' };
+    case 'bitewing': return { ...enhanced, gamma: suggested.gamma, localContrast: 0.4, sharpen: 5, radius: 2.2, threshold: 0.0015, halo: 0.35 };
+    case 'endo': return { ...enhanced, gamma: Math.min(5, suggested.gamma * 1.7), localContrast: 0.3, sharpen: 3.5, radius: 2, threshold: 0.002, halo: 0.5 };
+    case 'detail': return { ...enhanced, gamma: Math.min(5, suggested.gamma * 1.05), localContrast: 0.35, sharpen: 6, radius: 2.5, threshold: 0.001, halo: 0.35 };
     default: return { ...neutral };
   }
 }

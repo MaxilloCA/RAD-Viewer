@@ -11,6 +11,7 @@ const nextRequest = () => ++requestCounter;
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const formatMs = (value: number) => `${Math.round(value)} ms`;
 const initialNotes: ReferenceNotes = { preset: 'Dentin-to-enamel junction', sharpness: '', orientation: 'As exported', zoom: '', appearanceConfirmed: false };
+const presetOptions = [['neutral', 'Neutral'], ['bitewing', 'Bitewing'], ['endo', 'Endo'], ['detail', 'Detail']] as const;
 type View = { scale: number; x: number; y: number; fit: boolean };
 
 function Histogram({ render, pixels }: { render: RenderInfo; pixels: number }) {
@@ -64,7 +65,7 @@ function Slider({ label, value, min, max, step = .01, onChange, onCommit, hint }
   label: string; value: number; min: number; max: number; step?: number;
   onChange: (value: number) => void; onCommit: () => void; hint?: string;
 }) {
-  const decimals = step >= 1 ? 0 : step >= .01 ? 2 : 3;
+  const decimals = step >= 1 ? 0 : step >= .01 ? 2 : step >= .001 ? 3 : 4;
   return <label className="slider-control" title={hint}>
     <span>{label}<output>{value.toFixed(decimals)}</output></span>
     <input type="range" min={min} max={max} step={step} value={value} aria-label={label} onChange={event => onChange(Number(event.target.value))} onPointerUp={onCommit} onKeyUp={onCommit} onBlur={onCommit} />
@@ -96,6 +97,8 @@ export default function App() {
   const importBusy = useRef(false);
   const active = images.find(image => image.info.id === selected);
   const recipe = draft ?? active?.history.present;
+  const currentPreset = active && recipe ? presetOptions.find(([key]) => sameRecipe(recipe, experimentalPreset(key, active.info.neutral, active.info.suggested)))?.[1]
+    ?? presets.find(preset => sameRecipe(recipe, preset.recipe))?.name ?? 'Custom adjustments' : null;
   const activeRef = useRef(active);
   activeRef.current = active;
   const onPaneSize = useCallback((width: number, height: number) => setPaneSize({ width, height }), []);
@@ -120,11 +123,13 @@ export default function App() {
     void invoke<CustomPreset[]>('load_presets').then(setPresets).catch(problem => setError(`Could not load saved presets: ${message(problem)}`));
   }, []);
 
-  const loadImage = useCallback(async (path: string): Promise<OpenImage> => {
+  const loadImage = useCallback(async (path: string, enhance = false): Promise<OpenImage> => {
     const info = await invoke<ImageInfo>('import_image', { path });
     try {
       const neutral = await invoke<RenderInfo>('render_image', { id: info.id, recipe: info.neutral, requestId: nextRequest() });
-      return { path, info, neutral, history: { past: [], present: info.neutral, future: [] } };
+      const autoEnhance = enhance && info.suggested?.version === 2;
+      const initialRecipe = autoEnhance ? experimentalPreset('bitewing', info.neutral, info.suggested) : info.neutral;
+      return { path, info, neutral, history: { past: autoEnhance ? [info.neutral] : [], present: initialRecipe, future: [] } };
     } catch (problem) {
       await invoke('release_image', { id: info.id }).catch(() => {});
       throw problem;
@@ -140,7 +145,7 @@ export default function App() {
     for (let index = 0; index < paths.length; index++) {
       setLoading(`Opening ${index + 1} of ${paths.length}`);
       try {
-        const entry = await loadImage(paths[index]);
+        const entry = await loadImage(paths[index], true);
         setImages(previous => [...previous, entry]);
         if (first) { setSelected(entry.info.id); setDraft(null); draftRef.current = null; setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); first = false; }
       } catch (problem) { failures.push(`${paths[index].split(/[\\/]/).pop()}: ${message(problem)}`); }
@@ -188,7 +193,7 @@ export default function App() {
   };
   const changeValue = (key: keyof Recipe, value: number | string | boolean) => {
     if (!recipe) return;
-    const updated = { ...recipe, [key]: value };
+    const updated = { ...recipe, [key]: value, version: key === 'localContrast' ? 2 : recipe.version };
     draftRef.current = updated;
     setDraft(updated);
   };
@@ -217,7 +222,7 @@ export default function App() {
       if (!path) return;
       setLoading('Opening Carestream reference');
       importBusy.current = true;
-      const entry = await loadImage(path);
+      const entry = await loadImage(path, false);
       if (reference) await invoke('release_image', { id: reference.info.id });
       setReference(entry); setReferenceSourceId(active?.info.id ?? null); setReferenceNotes(initialNotes); setShowReferenceNotes(true);
     } catch (problem) { setError(`Reference import failed: ${message(problem)}`); }
@@ -234,7 +239,7 @@ export default function App() {
     if (!active) return;
     try {
       const path = await invoke<string | null>('save_review', { review: {
-        version: 1, processingVersion: 1, createdAt: new Date().toISOString(), qualityAcceptance: 'Pending user comparison',
+        version: 1, processingVersion: recipe?.version ?? 1, createdAt: new Date().toISOString(), qualityAcceptance: 'Pending user comparison',
         selectedImageId: active.info.id,
         images: images.map(image => ({ source: image.path, metadata: image.info.metadata, width: image.info.width, height: image.info.height, recipe: image.info.id === active.info.id ? recipe : image.history.present })),
         reference: reference ? { source: reference.path, sourceImageId: referenceSourceId, width: reference.info.width, height: reference.info.height, ...referenceNotes } : null,
@@ -282,7 +287,7 @@ export default function App() {
         {active && reference && (active.info.width !== reference.info.width || active.info.height !== reference.info.height) && <div className="reference-warning" role="status">Different reference dimensions · Match crop, orientation, and scale before judging detail. This reference is not registered to the source.</div>}
         {active && displayed ? <div className={`comparison-grid ${reference ? 'with-reference' : ''}`}>
           <ImagePane title="Original" badge="Neutral mapping" info={active.info} render={active.neutral} view={effectiveView} setView={updateView} onSize={onPaneSize} pixelRatio={pixelRatio} />
-          <ImagePane title={bypass ? 'Adjusted · bypassed' : 'Adjusted'} badge={bypass ? 'Neutral mapping' : 'Experimental processing'} info={active.info} render={displayed} view={effectiveView} setView={updateView} processing={processing && !bypass} pixelRatio={pixelRatio} />
+          <ImagePane title={bypass ? 'Adjusted · bypassed' : 'Adjusted'} badge={bypass ? 'Neutral mapping' : currentPreset === 'Neutral' ? 'Neutral · enhancement off' : currentPreset ?? 'Experimental processing'} info={active.info} render={displayed} view={effectiveView} setView={updateView} processing={processing && !bypass} pixelRatio={pixelRatio} />
           {reference && <ImagePane title="Carestream reference" badge="Rendered reference" info={reference.info} render={reference.neutral} view={effectiveView} setView={updateView} pixelRatio={pixelRatio} />}
         </div> : <div className="empty-workspace">
           <div className="empty-frame"><span /><span /><span /><span /><svg width="64" height="64" viewBox="0 0 64 64" aria-hidden="true"><path d="M17 13h30v38H17zM25 24h14M25 32h14M25 40h8" /></svg></div>
@@ -302,26 +307,29 @@ export default function App() {
         <fieldset disabled={!active} className="adjustment-fields">
           <div className="history-tools"><button disabled={!active?.history.past.length} title="Undo (Ctrl+Z)" onClick={() => changeHistory(undo)}>↶ Undo</button><button disabled={!active?.history.future.length} title="Redo (Ctrl+Y)" onClick={() => changeHistory(redo)}>↷ Redo</button><button onClick={() => active && applyRecipe(active.info.neutral)}>Reset</button></div>
           <div className="section-label">PROCESSING PRESET <span>Experimental</span></div>
-          <div className="preset-grid">{[['neutral', 'Neutral'], ['bitewing', 'Bitewing'], ['endo', 'Endo'], ['detail', 'Detail']].map(([key, label]) => <button key={key} className={active && recipe && sameRecipe(recipe, experimentalPreset(key, active.info.neutral)) ? 'active' : ''} onClick={() => active && applyRecipe(experimentalPreset(key, active.info.neutral))}>{label}</button>)}</div>
+          <div className="preset-grid">{presetOptions.map(([key, label]) => <button key={key} className={active && recipe && sameRecipe(recipe, experimentalPreset(key, active.info.neutral, active.info.suggested)) ? 'active' : ''} onClick={() => active && applyRecipe(experimentalPreset(key, active.info.neutral, active.info.suggested))}>{label}</button>)}</div>
+          {currentPreset && <div className="current-recipe" aria-label="Current processing preset"><span>Current: <strong>{currentPreset}</strong></span><span>v{recipe?.version}</span></div>}
           <p className="control-note">Starting points for visual review. Carestream comparison is pending.</p>
+          {active?.info.suggested && <p className="control-note">Enhanced presets use an image-specific tone window. Neutral keeps the original mapping.</p>}
           {recipe ? <>
             <div className="section-label">TONE</div>
             {range('windowCenter', 'Window center', mappedLow - windowRange * .5, mappedHigh + windowRange * .5, windowRange > 100 ? 1 : .01)}
             {range('windowWidth', 'Window width', 1, windowRange * 2, windowRange > 100 ? 1 : .01)}
             {range('gamma', 'Gamma', .2, 3)}
             <div className="section-label">DETAIL</div>
-            {range('sharpen', 'Sharpness strength', 0, 2)}
+            {range('sharpen', 'Sharpness strength', 0, recipe.version >= 2 ? 6 : 2)}
             <button className={`bypass-button ${bypass ? 'active' : ''}`} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); setBypass(true); }} onPointerUp={() => setBypass(false)} onPointerCancel={() => setBypass(false)} onLostPointerCapture={() => setBypass(false)} onKeyDown={event => { if (event.key === 'Enter') setBypass(true); }} onKeyUp={() => setBypass(false)} onBlur={() => setBypass(false)}>Hold to bypass <kbd>Space</kbd></button>
             <button className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}><span>{advanced ? '−' : '+'} Advanced processing</span></button>
             {advanced && <div className="advanced-controls">
-              <label className="select-control">Detail method<select value={recipe.detailMode} onChange={event => applyRecipe({ ...recipe, detailMode: event.target.value })}><option value="unsharp">Thresholded unsharp mask</option><option value="multiscale">Multiscale detail</option></select></label>
+              <label className="select-control">Detail method<select value={recipe.detailMode} onChange={event => applyRecipe({ ...recipe, detailMode: event.target.value, version: event.target.value === 'radiograph' ? 2 : recipe.version })}><option value="radiograph">Radiograph multiscale</option><option value="unsharp">Unsharp</option><option value="multiscale">Legacy two-scale</option></select></label>
               {range('radius', 'Radius / detail scale (px)', .5, 8, .1, 'Source-pixel units; independent of zoom')}
-              {range('threshold', 'Noise threshold', 0, .2, .001)}
+              {range('threshold', 'Noise threshold', 0, .05, .0005)}
               {range('halo', 'Halo suppression', 0, 1)}
               {range('denoise', 'Noise reduction', 0, 1)}
-              {range('clahe', 'Local contrast (CLAHE)', 0, 1)}
+              {range('localContrast', 'Local contrast', 0, 1)}
+              {range('clahe', 'Adaptive contrast (CLAHE)', 0, 1)}
               <label className="checkbox-control"><input type="checkbox" checked={recipe.invert} onChange={event => applyRecipe({ ...recipe, invert: event.target.checked })} /> Invert display</label>
-              <p className="control-note">Modality → denoise → window / gamma → local contrast → detail → display.</p>
+              <p className="control-note">Modality → denoise → window / gamma → local contrast → detail → display. Local contrast and Radiograph multiscale use processing v2.</p>
             </div>}
             <div className="section-label">OUTPUT HISTOGRAM {processing && <span>Updating</span>}</div>
             {displayed && <Histogram render={displayed} pixels={active!.info.width * active!.info.height} />}
