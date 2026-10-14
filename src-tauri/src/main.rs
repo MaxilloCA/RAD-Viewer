@@ -12,6 +12,7 @@ use std::{
 };
 use tauri::{Manager, State};
 use tokio::sync::Semaphore;
+mod patient;
 
 struct Entry {
     source: Arc<SourceImage>,
@@ -135,11 +136,23 @@ fn existing_patient_directory(root: &Path, patient_number: &str) -> Result<PathB
 }
 
 #[tauri::command]
-async fn choose_patient_images(patient_number: String) -> Result<Vec<String>, String> {
+async fn open_patient(
+    patient_number: String,
+    state: State<'_, AppState>,
+) -> Result<patient::PatientStudy, String> {
+    let protected_sources = state.source_paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let directory =
             existing_patient_directory(Path::new(r"D:\ABELDent\DATA\NOTES"), &patient_number)?;
-        Ok(pick_radiographs(Some(&directory)))
+        let study = patient::discover(&directory, patient_number.trim())?;
+        let mut sources = protected_sources.lock().unwrap();
+        for path in &study.paths {
+            let path = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+            if !sources.contains(&path) {
+                sources.push(path);
+            }
+        }
+        Ok(study)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -232,10 +245,9 @@ async fn render_image(
     };
     let recipe_key = serde_json::to_string(&recipe).map_err(|e| e.to_string())?;
     let key = format!("{id}:{recipe_key}");
-    if let Some(cached) = state.renders.lock().unwrap().get(&key) {
-        let mut info = cached.info.clone();
-        info.request_id = request_id;
-        return Ok(info);
+    if let Some(cached) = state.renders.lock().unwrap().get_mut(&key) {
+        cached.info.request_id = request_id;
+        return Ok(cached.info.clone());
     }
     let (mut processor, permit) = processing_slot(&state, &id, request_id, processor).await?;
     let neutral = serde_json::to_string(&Recipe::neutral(&source)).unwrap() == recipe_key;
@@ -312,6 +324,46 @@ async fn processing_slot(
     }
     Ok((processor, permit))
 }
+#[tauri::command]
+async fn image_thumbnail(
+    id: String,
+    request_id: u64,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let bytes = state
+        .renders
+        .lock()
+        .unwrap()
+        .values()
+        .find(|cached| cached.image_id == id && cached.info.request_id == request_id)
+        .map(|cached| cached.bytes.clone())
+        .ok_or("Rendered image is no longer available")?;
+    tauri::async_runtime::spawn_blocking(move || thumbnail_data_url(&bytes))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn thumbnail_data_url(bytes: &[u8]) -> Result<String, String> {
+    use base64::Engine;
+    let thumbnail = image::load_from_memory(bytes)
+        .map_err(|e| e.to_string())?
+        .thumbnail(120, 120)
+        .to_rgba8();
+    let mut output = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut output)
+        .write_image(
+            thumbnail.as_raw(),
+            thumbnail.width(),
+            thumbnail.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(output)
+    ))
+}
+
 #[tauri::command]
 fn release_image(id: String, state: State<'_, AppState>) {
     state.images.lock().unwrap().remove(&id);
@@ -475,11 +527,12 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             choose_images,
-            choose_patient_images,
+            open_patient,
             choose_reference,
             import_image,
             render_image,
             release_image,
+            image_thumbnail,
             load_presets,
             save_presets,
             export_image,
@@ -598,6 +651,25 @@ mod tests {
             &directory.path().join("export.png"),
             &[path]
         ));
+    }
+    #[test]
+    fn thumbnail_is_bounded_and_preserves_aspect_ratio() {
+        use base64::Engine;
+        let mut source = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut source)
+            .write_image(
+                &vec![127; 400 * 200 * 4],
+                400,
+                200,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        let url = thumbnail_data_url(&source).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(url.strip_prefix("data:image/png;base64,").unwrap())
+            .unwrap();
+        let result = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((result.width(), result.height()), (120, 60));
     }
     #[test]
     fn encoded_png_preserves_final_pixels() {

@@ -3,15 +3,16 @@ import type { Dispatch, SetStateAction } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { clamp, commit, contrastValue, dragAdjustment, experimentalPreset, redo, sameRecipe, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
-import type { CustomPreset, History, ImageInfo, OpenImage, Recipe, RenderInfo } from './model';
-import { nextRequest, useRenderedImage } from './useRenderedImage';
+import type { CustomPreset, History, ImageInfo, PatientDiscovery, Recipe, RenderInfo } from './model';
+import { useRenderedImage } from './useRenderedImage';
+import { useImageLibrary } from './useImageLibrary';
 
 const desktop = isTauri();
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const presetOptions = [['bitewing', 'Bitewing'], ['detail', 'Detail']] as const;
 type View = { scale: number; x: number; y: number; fit: boolean };
 
-function PatientOpenDialog({ onClose, onChoose }: { onClose: () => void; onChoose: (paths: string[]) => Promise<void> }) {
+function PatientOpenDialog({ onClose, onOpen }: { onClose: () => void; onOpen: (patient: PatientDiscovery) => Promise<void> }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const input = useRef<HTMLInputElement>(null);
   const alive = useRef(true);
@@ -19,7 +20,6 @@ function PatientOpenDialog({ onClose, onChoose }: { onClose: () => void; onChoos
   const [patientNumber, setPatientNumber] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [status, setStatus] = useState<string | null>(null);
   const trimmed = patientNumber.trim();
   const valid = /^[0-9]{2,64}$/.test(trimmed);
   const folder = valid ? `D:\\ABELDent\\DATA\\NOTES\\${trimmed.slice(-2)}\\${trimmed}` : null;
@@ -34,13 +34,13 @@ function PatientOpenDialog({ onClose, onChoose }: { onClose: () => void; onChoos
   const submit = async () => {
     if (pending.current) return;
     if (!valid) { setError('Enter a patient number containing 2–64 digits only.'); input.current?.focus(); return; }
-    pending.current = true; setBusy('Choosing radiographs…'); setError(null); setStatus(null);
+    pending.current = true; setBusy('Finding patient radiographs…'); setError(null);
     try {
-      const paths = await invoke<string[]>('choose_patient_images', { patientNumber: trimmed });
+      const patient = await invoke<PatientDiscovery>('open_patient', { patientNumber: trimmed });
       if (!alive.current) return;
-      if (!paths.length) { setStatus('No radiographs selected.'); return; }
-      setBusy('Opening selected radiographs…');
-      await onChoose(paths);
+      if (!patient.paths.length) throw new Error('No radiographs were found for this patient. Your current images remain open.');
+      setBusy('Opening patient…');
+      await onOpen(patient);
       if (alive.current) onClose();
     } catch (problem) { if (alive.current) setError(message(problem)); }
     finally { pending.current = false; if (alive.current) setBusy(null); }
@@ -50,15 +50,15 @@ function PatientOpenDialog({ onClose, onChoose }: { onClose: () => void; onChoos
     onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (!pending.current) onClose(); } }}>
     <form aria-label="Open patient" noValidate onSubmit={event => { event.preventDefault(); void submit(); }}>
       <h2 id="patient-dialog-title">Open patient</h2>
-      <p id="patient-dialog-description">Enter the patient number, then choose the radiographs you want from their folder.</p>
+      <p id="patient-dialog-description">Enter the patient number to open all their radiographs.</p>
       <label className="patient-number-label" htmlFor="patient-number">Patient number</label>
       <input ref={input} id="patient-number" type="text" inputMode="numeric" autoComplete="off" maxLength={64} value={patientNumber} disabled={Boolean(busy)} aria-invalid={Boolean(error) && !valid} aria-describedby={error ? 'patient-number-error patient-folder-preview' : 'patient-folder-preview'}
-        onChange={event => { setPatientNumber(event.target.value); setError(null); setStatus(null); }} />
+        onChange={event => { setPatientNumber(event.target.value); setError(null); }} />
       <div id="patient-folder-preview" className="patient-folder-preview"><span>Folder</span><code>{folder ?? 'Enter at least two digits to preview the folder.'}</code></div>
-      <p className="patient-selection-note">Select only the images needed for this review. Up to 24 images can be open at once.</p>
+      <p className="patient-selection-note">The full image list appears below. Previews load progressively, with the selected image first.</p>
       {error && <p id="patient-number-error" className="patient-dialog-error" role="alert">{error}</p>}
-      {(busy || status) && <p className="patient-dialog-status" role="status">{busy && <span className="spinner" />}{busy ?? status}</p>}
-      <div className="patient-dialog-actions"><button type="button" disabled={Boolean(busy)} onClick={onClose}>Cancel</button><button type="submit" className="primary" disabled={Boolean(busy)}>Choose radiographs</button></div>
+      {busy && <p className="patient-dialog-status" role="status"><span className="spinner" />{busy}</p>}
+      <div className="patient-dialog-actions"><button type="button" disabled={Boolean(busy)} onClick={onClose}>Cancel</button><button type="submit" className="primary" disabled={Boolean(busy)}>Open all radiographs</button></div>
     </form>
   </dialog>;
 }
@@ -118,13 +118,11 @@ function Slider({ label, value, min, max, step = .01, onChange, onCommit, endpoi
 }
 
 export default function App() {
-  const [images, setImages] = useState<OpenImage[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
   const [draft, setDraft] = useState<Recipe | null>(null);
   const draftRef = useRef<Recipe | null>(null);
-  const [loading, setLoading] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { entries: images, selectedKey: selected, loading, select: selectImage, append: appendImages, replace: replaceImages, changeHistory: updateHistory, close: closeLibraryImage } = useImageLibrary(setError);
   const [presets, setPresets] = useState<CustomPreset[]>([]);
   const [presetName, setPresetName] = useState('');
   const [advanced, setAdvanced] = useState(false);
@@ -133,8 +131,8 @@ export default function App() {
   const [view, setView] = useState<View>({ scale: .4, x: 0, y: 0, fit: true });
   const [pixelRatio, setPixelRatio] = useState(window.devicePixelRatio || 1);
   const [paneSize, setPaneSize] = useState({ width: 500, height: 500 });
-  const importBusy = useRef(false);
-  const active = images.find(image => image.info.id === selected);
+  const activeEntry = images.find(image => image.key === selected);
+  const active = activeEntry?.image;
   const recipe = draft ?? active?.history.present;
   const base = active?.info.suggested ?? active?.info.neutral;
   const photometric = active?.info.metadata.photometric ?? 'MONOCHROME2';
@@ -160,28 +158,18 @@ export default function App() {
   }, [pixelRatio]);
   useEffect(() => { if (desktop) void invoke<CustomPreset[]>('load_presets').then(setPresets).catch(problem => setError(`Could not load saved presets: ${message(problem)}`)); }, []);
 
-  const loadImage = useCallback(async (path: string): Promise<OpenImage> => {
-    const info = await invoke<ImageInfo>('import_image', { path });
-    try {
-      const defaultRecipe = experimentalPreset('bitewing', info.neutral, info.suggested);
-      const initial = await invoke<RenderInfo>('render_image', { id: info.id, recipe: defaultRecipe, requestId: nextRequest() });
-      return { path, info, initial, defaultRecipe, history: { past: [], present: defaultRecipe, future: [] } };
-    } catch (problem) { await invoke('release_image', { id: info.id }).catch(() => {}); throw problem; }
-  }, []);
-  const importPaths = useCallback(async (paths: string[], localErrors = false) => {
+  const importPaths = useCallback(async (paths: string[]) => {
     if (!paths.length) return;
-    if (importBusy.current) { if (localErrors) throw new Error('Another image import is in progress. Please try again when it finishes.'); return; }
-    importBusy.current = true; setError(null); let first = true; const failures: string[] = [];
-    for (let index = 0; index < paths.length; index++) {
-      setLoading(`Opening ${index + 1} of ${paths.length}`);
-      try {
-        const entry = await loadImage(paths[index]); setImages(previous => [...previous, entry]);
-        if (first) { setSelected(entry.info.id); setDraft(null); draftRef.current = null; dragRecipe.current = null; setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); first = false; }
-      } catch (problem) { failures.push(`${paths[index].split(/[\\/]/).pop()}: ${message(problem)}`); }
-    }
-    setLoading(null); importBusy.current = false;
-    if (failures.length) { if (localErrors) throw new Error(failures.join('\n')); setError(failures.join('\n')); }
-  }, [loadImage]);
+    if (draftRef.current) { const value = draftRef.current; updateHistory(history => commit(history, value)); }
+    setError(null); setDraft(null); draftRef.current = null; dragRecipe.current = null;
+    setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); appendImages(paths);
+  }, [appendImages, updateHistory]);
+  const openPatient = async (patient: PatientDiscovery) => {
+    setError(null); setDraft(null); draftRef.current = null; dragRecipe.current = null;
+    setView(previous => ({ ...previous, fit: true, x: 0, y: 0 }));
+    await replaceImages(patient.paths, { patientNumber: patient.patientNumber, patientName: patient.patientName, directory: patient.directory });
+    setNotice(patient.warnings.length ? patient.warnings.join('\n') : null);
+  };
   useEffect(() => {
     if (!desktop) return;
     let stop: (() => void) | undefined; let cancelled = false;
@@ -193,10 +181,10 @@ export default function App() {
     return () => { cancelled = true; stop?.(); };
   }, [importPaths]);
   const changeHistory = useCallback((operation: (history: History) => History) => {
-    const id = activeRef.current?.info.id; if (!id) return;
+    if (!activeRef.current) return;
     draftRef.current = null; setDraft(null);
-    setImages(previous => previous.map(image => image.info.id === id ? { ...image, history: operation(image.history) } : image));
-  }, []);
+    updateHistory(operation);
+  }, [updateHistory]);
   const commitDraft = () => { if (draftRef.current) { const value = draftRef.current; changeHistory(history => commit(history, value)); } };
   const updateDraft = (value: Recipe) => { draftRef.current = value; setDraft(value); };
   const changeValue = (key: keyof Recipe, value: number | string | boolean) => {
@@ -221,7 +209,7 @@ export default function App() {
     if (!active) return;
     try {
       const path = await invoke<string | null>('save_review', { review: { version: 1, processingVersion: recipe?.version ?? 2, createdAt: new Date().toISOString(), qualityAcceptance: 'Pending user review', selectedImageId: active.info.id,
-        images: images.map(image => ({ source: image.path, metadata: image.info.metadata, width: image.info.width, height: image.info.height, recipe: image.info.id === active.info.id ? recipe : image.history.present })), view: effectiveView } });
+        images: images.map(image => ({ source: image.path, patient: image.patient, metadata: image.details?.metadata, width: image.details?.width, height: image.details?.height, recipe: image.key === selected ? recipe : image.history?.present ?? null })), view: effectiveView } });
       if (path) setNotice(`Viewer settings saved: ${path}`);
     } catch (problem) { setError(`Save failed: ${message(problem)}`); }
   };
@@ -234,30 +222,28 @@ export default function App() {
     catch (problem) { setError(`Could not save preset: ${message(problem)}`); }
   };
   const closeImage = async () => {
-    if (!active) return;
-    const remaining = images.filter(image => image.info.id !== active.info.id);
-    setImages(remaining); setSelected(remaining[0]?.info.id ?? null); setDraft(null); draftRef.current = null; dragRecipe.current = null;
-    try { await invoke('release_image', { id: active.info.id }); } catch (problem) { setError(message(problem)); }
+    setDraft(null); draftRef.current = null; dragRecipe.current = null;
+    await closeLibraryImage();
   };
   const range = (key: keyof Recipe, label: string, min: number, max: number, step?: number) => recipe && <Slider label={label} value={recipe[key] as number} min={min} max={max} step={step} onChange={value => changeValue(key, value)} onCommit={commitDraft} />;
 
   return <main className="app-shell"><header className="app-header">
     <div className="brand"><span className="brand-symbol" aria-hidden="true">R</span><div><strong>RAD <span>Viewer</span></strong><small>RADIOGRAPH VIEWER</small></div></div>
-    <div className="header-divider" /><div className="header-context"><span className="status-dot" />Local processing<small>Original files preserved</small></div>
-    <div className="header-actions"><button onClick={() => void saveReview()} disabled={!active}>Save settings</button><button onClick={() => void exportImage()} disabled={!active}>Export PNG</button><button onClick={() => setPatientDialogOpen(true)} disabled={!desktop || !!loading}>Open patient</button><button className="primary" onClick={() => void chooseImages()} disabled={!desktop || !!loading}>＋ Open images</button></div></header>
+    <div className="header-divider" />{activeEntry?.patient ? <div className="patient-identity" aria-label="Current patient"><strong>{activeEntry.patient.patientName || 'Name unavailable'}</strong><small>Patient {activeEntry.patient.patientNumber}</small></div> : <div className="header-context"><span className="status-dot" />Local processing<small>Original files preserved</small></div>}
+    <div className="header-actions"><button onClick={() => void saveReview()} disabled={!active}>Save settings</button><button onClick={() => void exportImage()} disabled={!active}>Export PNG</button><button onClick={() => setPatientDialogOpen(true)} disabled={!desktop}>Open patient</button><button className="primary" onClick={() => void chooseImages()} disabled={!desktop}>＋ Open images</button></div></header>
     {!desktop && <div className="browser-banner"><strong>Desktop application required.</strong> Open RAD Viewer to import local radiographs and use the Rust processing engine. This browser view is the interface only.</div>}
     {error && <div role="alert" className="notice error"><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
     {notice && <div role="status" className="notice"><span>{notice}</span><button onClick={() => setNotice(null)} aria-label="Dismiss notification">×</button></div>}
     <div className="main-body"><div className="workspace"><div className="toolbar">
-      <div className="document-title"><strong>{active?.info.metadata.name ?? 'Radiograph workspace'}</strong><span>{active ? `${active.info.metadata.format} · ${active.info.metadata.bitsStored}-bit · ${active.info.metadata.photometric}` : 'Enhanced, full-resolution viewing'}</span></div>
+      <div className="document-title"><strong>{active?.info.metadata.name ?? activeEntry?.name ?? 'Radiograph workspace'}</strong><span>{active ? `${active.info.metadata.format} · ${active.info.metadata.bitsStored}-bit · ${active.info.metadata.photometric}` : 'Enhanced, full-resolution viewing'}</span></div>
       <div className="view-tools"><button className={view.fit ? 'active' : ''} disabled={!active} onClick={() => setView(previous => ({ ...previous, fit: true, x: 0, y: 0 }))}>Fit</button><button className={!view.fit && Math.abs(view.scale - nativePixelScale) < .00001 ? 'active' : ''} disabled={!active} title="One source pixel per physical display pixel" onClick={() => setView({ scale: nativePixelScale, x: 0, y: 0, fit: false })}>100%</button><span className="zoom-label" title="Source pixels relative to physical display pixels">{active ? `${Math.round(effectiveView.scale * pixelRatio * 100)}%` : '—'}</span></div></div>
       {active && rendered ? <div className="single-image-workspace"><ImagePane key={active.info.id} info={active.info} render={rendered} view={effectiveView} setView={updateView} processing={processing} onSize={onPaneSize} pixelRatio={pixelRatio} badge={`${currentPreset ?? 'Enhanced'}${recipe?.colorize ? ' · False color' : ''}`}
         onAdjustStart={() => { if (activeRef.current && recipeRef.current) dragRecipe.current = { id: activeRef.current.info.id, start: recipeRef.current, base: activeRef.current.info.suggested ?? activeRef.current.info.neutral, photometric: activeRef.current.info.metadata.photometric }; }}
         onAdjustMove={(dx, dy) => { const snapshot = dragRecipe.current; if (snapshot && snapshot.id === activeRef.current?.info.id) updateDraft(dragAdjustment(snapshot.start, snapshot.base, dx, dy, snapshot.photometric)); }}
         onAdjustEnd={() => { const snapshot = dragRecipe.current; dragRecipe.current = null; if (snapshot?.id === activeRef.current?.info.id) commitDraft(); }} /></div>
-      : <div className="empty-workspace"><div className="empty-frame"><span /><span /><span /><span /><svg width="64" height="64" viewBox="0 0 64 64" aria-hidden="true"><path d="M17 13h30v38H17zM25 24h14M25 32h14M25 40h8" /></svg></div><h1>{loading ? 'Preparing your image…' : 'Open a radiograph.'}</h1><p>Review enhanced images with responsive tone<br />and detail controls, processed on this computer.</p><button className="primary" onClick={() => void chooseImages()} disabled={!desktop || !!loading}>Open radiographs</button><span className="supported-formats">RVG · PANO · DICOM · PNG · JPEG</span></div>}
-      <div className="workspace-help"><span>{loading ? <><span className="spinner" /> {loading}</> : active ? 'Drag ↑↓ gamma · Drag ←→ tone · Shift-drag or middle-drag to pan · Scroll to zoom' : 'Drop radiographs anywhere in the desktop window'}</span>{active && <button className="text-button" onClick={() => void closeImage()}>Close selected</button>}</div>
-      <div className="filmstrip" aria-label="Open images">{images.map((image, index) => <button key={image.info.id} className={`thumbnail ${selected === image.info.id ? 'selected' : ''}`} onClick={() => { commitDraft(); dragRecipe.current = null; setSelected(image.info.id); setDraft(null); draftRef.current = null; setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); }} aria-pressed={selected === image.info.id}><img src={image.initial.url} alt="" /><span className="thumbnail-number">{String(index + 1).padStart(2, '0')}</span><span>{image.info.metadata.name}</span></button>)}<button className="add-thumbnail" onClick={() => void chooseImages()} disabled={!desktop || !!loading}><span>＋</span>{images.length ? 'Add images' : 'Open images'}</button></div>
+      : <div className="empty-workspace"><div className="empty-frame"><span /><span /><span /><span /><svg width="64" height="64" viewBox="0 0 64 64" aria-hidden="true"><path d="M17 13h30v38H17zM25 24h14M25 32h14M25 40h8" /></svg></div><h1>{activeEntry?.error ? 'Image unavailable' : activeEntry ? 'Preparing your image…' : 'Open a radiograph.'}</h1><p>{activeEntry?.error ?? 'Review enhanced images with responsive tone and detail controls, processed on this computer.'}</p>{activeEntry?.error ? <button className="primary" onClick={() => selectImage(activeEntry.key)}>Retry image</button> : !activeEntry && <button className="primary" onClick={() => void chooseImages()} disabled={!desktop}>Open radiographs</button>}<span className="supported-formats">RVG · PANO · DICOM · PNG · JPEG</span></div>}
+      <div className="workspace-help"><span>{loading ? <><span className="spinner" /> {loading}</> : active ? 'Drag ↑↓ gamma · Drag ←→ tone · Shift-drag or middle-drag to pan · Scroll to zoom' : 'Drop radiographs anywhere in the desktop window'}</span>{activeEntry && <button className="text-button" onClick={() => void closeImage()}>Close selected</button>}</div>
+      <div className="filmstrip" aria-label="Open images">{images.map((image, index) => <button key={image.key} className={`thumbnail ${selected === image.key ? 'selected' : ''}`} title={image.error ?? image.path} onClick={() => { commitDraft(); dragRecipe.current = null; selectImage(image.key); setDraft(null); draftRef.current = null; setError(null); setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); }} aria-pressed={selected === image.key}>{image.thumbnail ? <img src={image.thumbnail} alt="" /> : <span className="thumbnail-placeholder" aria-hidden="true">{image.error ? 'Unavailable' : 'Loading…'}</span>}<span className="thumbnail-number">{String(index + 1).padStart(2, '0')}</span><span>{image.name}</span></button>)}<button className="add-thumbnail" onClick={() => void chooseImages()} disabled={!desktop}><span>＋</span>{images.length ? 'Add images' : 'Open images'}</button></div>
     </div><aside className="adjustments"><div className="panel-title"><h2>Adjustments</h2><span>NON-DESTRUCTIVE</span></div><fieldset disabled={!active} className="adjustment-fields">
       <div className="history-tools"><button disabled={!active?.history.past.length} title="Undo (Ctrl+Z)" onClick={() => changeHistory(undo)}>↶ Undo</button><button disabled={!active?.history.future.length} title="Redo (Ctrl+Y)" onClick={() => changeHistory(redo)}>↷ Redo</button><button onClick={() => active && applyRecipe(active.defaultRecipe)}>Reset</button></div>
       <div className="section-label">PROCESSING PRESET <span>Experimental</span></div><div className="preset-grid">{presetOptions.map(([key, label]) => <button key={key} className={currentPreset === label ? 'active' : ''} onClick={() => active && applyRecipe({ ...experimentalPreset(key, active.info.neutral, active.info.suggested), colorize: Boolean(recipe?.colorize) })}>{label}</button>)}</div>
@@ -279,6 +265,6 @@ export default function App() {
     </fieldset></aside></div>
     <footer className="status-bar"><span><span className="status-dot amber" />Image-quality review pending</span><span>{active ? `${Math.round(active.info.decodeMs)} ms decode · ${Math.round(rendered?.renderMs ?? 0)} ms processing · ${images.length} image${images.length === 1 ? '' : 's'}` : 'Offline · CPU processing'}</span></footer>
     {dragging && <div className="drop-overlay"><strong>Drop radiographs to open</strong><span>RVG · PANO · DICOM · PNG · JPEG</span></div>}
-    {patientDialogOpen && <PatientOpenDialog onClose={() => setPatientDialogOpen(false)} onChoose={paths => importPaths(paths, true)} />}
+    {patientDialogOpen && <PatientOpenDialog onClose={() => setPatientDialogOpen(false)} onOpen={openPatient} />}
   </main>;
 }

@@ -1,8 +1,10 @@
 # Phase A integration contract
 
-## 0.3.1 patient folder shortcut
+## 0.3.2 automatic patient loading
 
-`choose_patient_images { patientNumber: string } -> string[]` validates a trimmed ASCII identifier of 2–64 digits, preserves leading zeros, and resolves `D:\ABELDent\DATA\NOTES\<last two digits>\<complete number>`. It checks folder existence on a blocking worker, then opens the standard radiograph multi-select dialog there. Cancellation returns an empty array. Missing/non-directory/inaccessible paths return an actionable error; no archive enumeration occurs. Selected paths use the existing progressive import and resource limits. The frontend provides an Open patient dialog with a path preview and retains the existing images.
+`open_patient { patientNumber: string } -> { patientNumber, patientName: string | null, directory, paths: string[], warnings: string[] }` validates a trimmed ASCII identifier of 2–64 digits, preserves leading zeros, and resolves `D:\ABELDent\DATA\NOTES\<last two digits>\<complete number>`. On a blocking worker it reads the local `PatientInfo.xml` trophy/patient parameters `first_name`, `last_name`, and `directory`. The entered ABELDent number remains the displayed ID; the XML internal identifier is not substituted. XML entities are decoded, DTDs rejected, and XML input limited to 1 MiB. An unavailable XML target falls back to the local folder with a warning. Discovery recursively lists supported image suffixes and standard DICOM magic without following junctions/symlinks or enumerating the entire archive. There is no file-selection dialog or 24-entry discovery limit. Patient changes replace the strip and identity, while failed/empty discovery preserves the existing review.
+
+`image_thumbnail { id, requestId } -> string` returns a local PNG data URL with a maximum edge of 120 pixels from the specified initial full-resolution render. Compact previews survive release of decoded sources; full-resolution decoding remains bounded. Thumbnail pixels are never used for full-size viewing or export.
 
 ## 0.3.0 controls and display contract
 

@@ -2,6 +2,14 @@
 
 Phase A comparison prototype, 2026-10-13 (America/Toronto).
 
+## 0.3.2 automatic patient collection — 2026-10-14
+
+- Read the example patient's `PatientInfo.xml` locally. It supplies first/last name and a UNC `directory`; the referenced directory is accessible and currently contains six RVG files. These files are now also present in the local patient folder, superseding the earlier empty-folder observation. Patient names and clinical content are not copied into source or test fixtures.
+- Replaced the native patient file picker with automatic recursive discovery from the XML target, with a warning and local-folder fallback for inaccessible targets. XML parsing decodes entities, rejects DTDs, limits input size, and never executes file content. Folder traversal skips symlinks/junctions. The entered patient number remains the displayed ID.
+- Rust workspace tests: 49 passed, two manual performance benchmarks ignored. New coverage includes XML metadata/entities, recursive discovery beyond 24 images, DICOM content recognition, missing XML/target fallback, and bounded aspect-preserving thumbnails. Strict workspace Clippy passes.
+- All 36 frontend tests and the production build pass. Tests cover automatic loading, patient name/ID, unknown-name and warning display, failed/empty lookup preservation, manual-image identity isolation, 30 thumbnail entries with at most eight decoded sources, retained adjustment/undo history after eviction, selected-image priority, and stale/overlapping patient changes. All discovered originals are protected from overwrite even before decoding.
+- Built the final Windows executable and `RAD Viewer_0.3.2_x64-setup.exe` with frontend asset `index-CmFbH-SH.js`, then launched the final executable. Native visual verification could not be completed: Windows automation returned `GetCursorPos failed: Access is denied (0x80070005)` after the viewer launched. No claim of a verified native six-image display is made; the XML target and six-file listing were verified read-only, and the import/preview workflow is covered by automated tests.
+
 ## 0.3.1 patient folder shortcut — 2026-10-14
 
 - Added **Open patient**, with patient-number entry, exact folder preview and native radiograph selection. Patient `67589` resolves to `D:\ABELDent\DATA\NOTES\89\67589`. Lookup is read-only and checks only the requested directory. Existing images remain open and cancelling does not import files.

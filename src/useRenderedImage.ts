@@ -61,7 +61,7 @@ export function useRenderedImage(active: OpenImage | undefined, recipe: Recipe |
 
   useEffect(() => {
     if (!active || !recipe) { latest.current = null; setRendered(null); setProcessing(false); return; }
-    if (!cache.current.has(active.info.id)) cache.current.set(active.info.id, { recipe: active.defaultRecipe, rendered: active.initial });
+    if (!cache.current.has(active.info.id)) cache.current.set(active.info.id, { recipe: active.history.present, rendered: active.initial });
     latest.current = { id: active.info.id, recipe };
     const previous = cache.current.get(active.info.id)!;
     setRendered(previous.rendered);

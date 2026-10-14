@@ -29,6 +29,13 @@ export interface RenderInfo {
 export interface History { past: Recipe[]; present: Recipe; future: Recipe[] }
 export interface OpenImage { info: ImageInfo; path: string; initial: RenderInfo; defaultRecipe: Recipe; history: History }
 export interface CustomPreset { name: string; recipe: Recipe }
+export interface PatientDiscovery { patientNumber: string; patientName: string | null; directory: string; paths: string[]; warnings: string[] }
+export type PatientIdentity = Pick<PatientDiscovery, 'patientNumber' | 'patientName' | 'directory'>;
+export interface ImageEntry {
+  key: string; path: string; name: string; patient?: PatientIdentity;
+  image?: OpenImage; details?: ImageInfo; history?: History; defaultRecipe?: Recipe;
+  thumbnail?: string; error?: string; lastUsed: number;
+}
 const recipeKeys: (keyof Recipe)[] = ['version', 'windowCenter', 'windowWidth', 'gamma', 'denoise', 'localContrast', 'clahe', 'sharpen', 'radius', 'threshold', 'halo', 'detailMode', 'invert'];
 export const sameRecipe = (a: Recipe, b: Recipe) => recipeKeys.every(key => a[key] === b[key]) && Boolean(a.colorize) === Boolean(b.colorize);
 export const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
