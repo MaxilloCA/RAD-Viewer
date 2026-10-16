@@ -306,6 +306,7 @@ describe('bounded patient image library', () => {
     let closing!: Promise<void>;
     act(() => { closing = result.current.close(); });
     act(() => result.current.select(third.key));
+    await waitFor(() => expect(finishRelease).toBeTypeOf('function'));
     await act(async () => { finishRelease(); await closing; finishSnapshot(snapshot(snapshotArgs)); });
     expect(result.current.selectedKey).toBe(third.key);
     expect(result.current.entries.every(entry => !entry.pinnedRender)).toBe(true);
@@ -316,14 +317,44 @@ describe('bounded patient image library', () => {
   });
 });
 
-describe('newest patient pair', () => {
+describe('latest-day patient opening', () => {
+  it('opens every latest-day image even beyond the decoded cache limit, leaving earlier dates in the library', async () => {
+    const latest = Array.from({ length: 12 }, (_, i) => `latest-${i}.rvg`);
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    await act(async () => result.current.replace([...latest, 'older.rvg'], patient('00123'), latest));
+    await waitFor(() => expect(result.current.entries.every(entry => entry.thumbnail)).toBe(true));
+    expect(result.current.entries.filter(entry => entry.pinned)).toHaveLength(11);
+    expect(result.current.entries.slice(0, 11).every(entry => entry.pinnedRender)).toBe(true);
+    expect(result.current.selectedKey).toBe(result.current.entries[11].key);
+    expect(result.current.entries[12].pinned).not.toBe(true);
+    expect(maxLive).toBeLessThanOrEqual(DECODED_IMAGE_LIMIT);
+  });
+
+  it('retains enhancement edits made while a pinned source is reloading', async () => {
+    const latest = Array.from({ length: 10 }, (_, i) => `latest-${i}.rvg`);
+    const { result } = renderHook(() => useImageLibrary(vi.fn()));
+    await act(async () => result.current.replace(latest, patient('00123'), latest));
+    await waitFor(() => expect(result.current.entries.filter(entry => entry.pinned)).toHaveLength(9));
+    const first = result.current.entries[0];
+    expect(first.image).toBeUndefined();
+    let finish!: (value: ImageInfo) => void;
+    customInvoke = (command, args) => command === 'import_image' && args.path === first.path ? new Promise(resolve => { finish = resolve; }) : undefined;
+    act(() => result.current.select(first.key));
+    await waitFor(() => expect(finish).toBeTruthy());
+    act(() => result.current.changeHistory(history => commit(history, { ...history.present, sharpen: 7 }), first.key));
+    await act(async () => finish(allocate(first.path)));
+    await waitFor(() => expect(result.current.entries[0].image?.history.present.sharpen).toBe(7));
+    expect(result.current.entries[0].history?.present.sharpen).toBe(7);
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === 'render_snapshot').at(-1)?.[1].recipe.sharpen).toBe(7);
+  });
+
   it('shows the first immediately and selects the second only after its first-image pin is ready', async () => {
     let finishSecond!: (value: ImageInfo) => void;
     let finishPin!: (value: RenderInfo) => void;
     let pinArgs!: Record<string, unknown>;
     customInvoke = (command, args) => command === 'import_image' && args.path === 'second.rvg' ? new Promise(resolve => { finishSecond = resolve; }) : command === 'render_snapshot' ? new Promise(resolve => { pinArgs = args; finishPin = resolve; }) : undefined;
     const { result } = renderHook(() => useImageLibrary(vi.fn()));
-    await act(async () => result.current.replace(['first.rvg', 'second.rvg', 'third.rvg'], patient('00123')));
+    await act(async () => result.current.replace(['first.rvg', 'second.rvg', 'third.rvg'], patient('00123'), ['first.rvg', 'second.rvg']));
     await waitFor(() => expect(finishSecond).toBeTruthy());
     expect(result.current.selectedKey).toBe(result.current.entries[0].key);
     expect(result.current.entries[0].image).toBeTruthy();
@@ -337,10 +368,10 @@ describe('newest patient pair', () => {
     expect(result.current.selectedKey).toBe(result.current.entries[1].key);
     expect(result.current.entries.filter(entry => entry.pinned)).toHaveLength(1);
   });
-  it('uses the first two successful images after unsupported newest files', async () => {
+  it('shows usable latest-day images without filling failed slots from earlier days', async () => {
     customInvoke = (command, args) => command === 'import_image' && ['bad-first.rvg', 'bad-middle.rvg'].includes(String(args.path)) ? Promise.reject('Unsupported synthetic image') : undefined;
     const { result } = renderHook(() => useImageLibrary(vi.fn()));
-    await act(async () => result.current.replace(['bad-first.rvg', 'good-first.rvg', 'bad-middle.rvg', 'good-second.rvg', 'older.rvg'], patient('00123')));
+    await act(async () => result.current.replace(['bad-first.rvg', 'good-first.rvg', 'bad-middle.rvg', 'good-second.rvg', 'older.rvg'], patient('00123'), ['bad-first.rvg', 'good-first.rvg', 'bad-middle.rvg', 'good-second.rvg']));
     await waitFor(() => expect(result.current.entries[1].pinned).toBe(true));
     expect(result.current.selectedKey).toBe(result.current.entries[3].key);
     expect(result.current.entries.filter(entry => entry.pinned)).toHaveLength(1);
@@ -379,7 +410,7 @@ describe('newest patient pair', () => {
     let args!: Record<string, unknown>;
     customInvoke = (command, input) => command === 'render_snapshot' ? new Promise(resolve => { args = input; finish = resolve; }) : undefined;
     const { result } = renderHook(() => useImageLibrary(vi.fn()));
-    await act(async () => result.current.replace(['first.rvg', 'second.rvg', 'third.rvg'], patient('00123')));
+    await act(async () => result.current.replace(['first.rvg', 'second.rvg', 'third.rvg'], patient('00123'), ['first.rvg', 'second.rvg']));
     await waitFor(() => expect(finish).toBeTruthy());
     act(() => result.current.select(result.current.entries[2].key));
     await act(async () => finish(snapshot(args)));
@@ -400,16 +431,17 @@ describe('newest patient pair', () => {
     expect(result.current.selectedKey).toBe(result.current.entries[0].key);
     expect(result.current.entries[0].pinned).not.toBe(true);
   });
-  it('retains the second candidate while a slow auto-pin runs beyond the decoded cache limit', async () => {
+  it('retains candidates while a slow automatic snapshot completes before further decoding', async () => {
     let finish!: (value: RenderInfo) => void;
     let args!: Record<string, unknown>;
     customInvoke = (command, input) => command === 'render_snapshot' ? new Promise(resolve => { args = input; finish = resolve; }) : undefined;
     const { result } = renderHook(() => useImageLibrary(vi.fn()));
-    await act(async () => result.current.replace(Array.from({ length: 15 }, (_, i) => `newest-${i}.rvg`), patient('00123')));
-    await waitFor(() => expect(result.current.entries.every(entry => entry.thumbnail)).toBe(true));
+    await act(async () => result.current.replace(Array.from({ length: 15 }, (_, i) => `newest-${i}.rvg`), patient('00123'), ['newest-0.rvg', 'newest-1.rvg']));
+    await waitFor(() => expect(finish).toBeTruthy());
     expect(result.current.entries[1].image).toBeTruthy();
     expect(maxLive).toBeLessThanOrEqual(DECODED_IMAGE_LIMIT);
     await act(async () => finish(snapshot(args)));
+    await waitFor(() => expect(result.current.entries.every(entry => entry.thumbnail)).toBe(true));
     expect(result.current.selectedKey).toBe(result.current.entries[1].key);
     expect(result.current.entries[0].pinned).toBe(true);
   });
@@ -440,4 +472,21 @@ describe('automatic pair cancellation boundaries', () => {
     expect(result.current.entries.every(entry => !entry.pinned && !entry.pinPending)).toBe(true);
     expect(onError).toHaveBeenCalledOnce();
   });
+});
+
+it('restores shared settings on import and saves edits and annotation removal without touching image bytes', async () => {
+  const ellipse = { x: 10, y: 20, width: 40, height: 30, color: 'yellow' as const };
+  customInvoke = (command, args) => {
+    if (command === 'import_image') return Promise.resolve({ ...allocate(String(args.path)), settingsKey: 'shared-key', sourceSha256: 'hash', settingsRevision: 'revision-1', savedAppearance: { recipe: { ...neutral, gamma: .73 }, rotationQuarterTurns: 2, ellipses: [ellipse] } });
+    if (command === 'save_image_settings') return Promise.resolve('revision-2');
+  };
+  const { result } = renderHook(() => useImageLibrary(vi.fn())); act(() => result.current.append(['shared.rvg']));
+  await waitFor(() => expect(result.current.entries[0].image).toBeTruthy()); const entry = result.current.entries[0];
+  expect(entry.history!.present.gamma).toBe(.73); expect(entry.rotationQuarterTurns).toBe(2); expect(entry.ellipses).toEqual([ellipse]);
+  expect(mocks.invoke.mock.calls.find(([command]) => command === 'render_image')?.[1].recipe.gamma).toBe(.73);
+  act(() => result.current.changeHistory(history => commit(history, { ...history.present, gamma: .85 })));
+  await act(async () => { expect(await result.current.flushSettings()).toBe(true); });
+  let saved = mocks.invoke.mock.calls.filter(([command]) => command === 'save_image_settings').at(-1)![1]; expect(saved.expectedRevision).toBe('revision-1'); expect(saved.appearance.ellipses).toEqual([ellipse]); expect(saved.appearance.rotationQuarterTurns).toBe(2);
+  act(() => result.current.setEllipses({ [entry.key]: [] })); await act(async () => { await result.current.flushSettings(); });
+  saved = mocks.invoke.mock.calls.filter(([command]) => command === 'save_image_settings').at(-1)![1]; expect(saved.appearance.ellipses).toEqual([]); expect(saved.appearance.recipe.gamma).toBe(.85);
 });

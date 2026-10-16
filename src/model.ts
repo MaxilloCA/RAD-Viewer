@@ -1,3 +1,5 @@
+import type { Ellipse, ReviewOverlay } from './workspace';
+export interface ImageAppearance { recipe: Recipe; rotationQuarterTurns: number; ellipses: Ellipse[]; overlay?: ReviewOverlay | null }
 export interface Recipe {
   version: number;
   windowCenter: number;
@@ -24,6 +26,7 @@ export interface ImageMetadata {
 }
 export interface ImageInfo {
   id: string; width: number; height: number; metadata: ImageMetadata; neutral: Recipe; suggested?: Recipe; decodeMs: number;
+  settingsKey?: string; sourceSha256?: string; savedAppearance?: ImageAppearance | null; settingsRevision?: string | null; settingsError?: string | null;
 }
 export interface RenderInfo {
   id: string; requestId: number; url: string; histogram: number[];
@@ -32,13 +35,14 @@ export interface RenderInfo {
 export interface History { past: Recipe[]; present: Recipe; future: Recipe[] }
 export interface OpenImage { info: ImageInfo; path: string; initial: RenderInfo; defaultRecipe: Recipe; history: History }
 export interface CustomPreset { name: string; recipe: Recipe }
-export interface PatientDiscovery { patientNumber: string; patientName: string | null; directory: string; paths: string[]; warnings: string[] }
+export interface PatientDiscovery { patientNumber: string; patientName: string | null; directory: string; paths: string[]; latestDatePaths: string[]; warnings: string[] }
 export type PatientIdentity = Pick<PatientDiscovery, 'patientNumber' | 'patientName' | 'directory'>;
 export interface ImageEntry {
   key: string; path: string; name: string; patient?: PatientIdentity;
   image?: OpenImage; details?: ImageInfo; history?: History; defaultRecipe?: Recipe;
   thumbnail?: string; error?: string; lastUsed: number; rotationQuarterTurns: number;
   pinned?: boolean; pinPending?: boolean; pinError?: string; pinOrder?: number; pinnedRender?: RenderInfo;
+  ellipses?: Ellipse[]; overlay?: ReviewOverlay; settingsKey?: string; settingsBlocked?: boolean;
 }
 /** Calendar-only parsing: no local timezone conversion or inferred acquisition date. */
 export function formatImageDate(value?: string | null): string {

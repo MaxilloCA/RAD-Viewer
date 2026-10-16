@@ -8,6 +8,7 @@ import type { ImageInfo, PatientDiscovery, Recipe, RenderInfo } from './model';
 const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke, isTauri: () => true }));
 vi.mock('@tauri-apps/api/webview', () => ({ getCurrentWebview: () => ({ onDragDropEvent: () => Promise.resolve(() => {}) }) }));
+vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => ({ onCloseRequested: () => Promise.resolve(() => {}) }) }));
 import App from './App';
 
 const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, localContrast: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false, colorize: false };
@@ -38,7 +39,7 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 const open = async () => { fireEvent.click(screen.getByRole('button', { name: 'Open radiographs' })); await screen.findByAltText('Enhanced: first.rvg'); };
-const patient = (paths: string[], patientNumber = '00123', patientName: string | null = 'Example Person'): PatientDiscovery => ({ patientNumber, patientName, directory: 'C:\\Synthetic', paths, warnings: [] });
+const patient = (paths: string[], patientNumber = '00123', patientName: string | null = 'Example Person'): PatientDiscovery => ({ patientNumber, patientName, directory: 'C:\\Synthetic', paths, latestDatePaths: paths.slice(0, 2), warnings: [] });
 const submitPatient = (value = '00123') => {
   fireEvent.click(screen.getByRole('button', { name: 'Open patient' }));
   fireEvent.change(screen.getByLabelText('Patient number'), { target: { value } });
@@ -58,6 +59,73 @@ const moveDrag = (x: number, y: number) => fireEvent.pointerMove(screen.getByTes
 const finishDrag = () => fireEvent.pointerUp(screen.getByTestId('image-viewport'), { pointerId: 1 });
 
 describe('enhanced viewer with test-only Tauri IPC', () => {
+  it('starts with patient entry and keeps detailed controls collapsed after opening', async () => {
+    render(<App />);
+    expect(screen.getByLabelText('Patient number')).toBe(document.activeElement);
+    expect(screen.getByRole('button', { name: 'Open patient' }).className).toContain('primary');
+    await open();
+    for (const title of ['Detailed adjustments', 'Intensity histogram', 'Saved presets']) expect(screen.getByText(title).closest('details')?.open).toBe(false);
+    expect(screen.getByLabelText('Adjusting selected image').textContent).toContain('first.rvg');
+    expect(screen.getByRole('button', { name: 'Hold to compare with neutral' })).toBeTruthy();
+  });
+  it('sets and clears the native patient title as selection changes', async () => {
+    customInvoke = command => command === 'open_patient' ? Promise.resolve(patient(['patient.rvg'], '00123', 'Synthetic Patient')) : undefined;
+    render(<App />); submitPatient(); await screen.findByAltText('Enhanced: patient.rvg');
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('set_viewer_title', { title: 'Synthetic Patient · Patient ID 00123 — RAD Viewer' }));
+    fireEvent.click(screen.getByRole('button', { name: '＋ Open images' })); await screen.findByAltText('Enhanced: first.rvg');
+    expect(document.title).toBe('RAD Viewer');
+    expect(mocks.invoke).toHaveBeenCalledWith('set_viewer_title', { title: 'RAD Viewer' });
+  });
+  it('restores the enhanced frame immediately when comparison ends without changing history', async () => {
+    render(<App />); await open();
+    const before = screen.getByAltText('Enhanced: first.rvg').getAttribute('src');
+    const compare = screen.getByRole('button', { name: 'Hold to compare with neutral' });
+    fireEvent.pointerDown(compare, { button: 0, pointerId: 1 });
+    await screen.findByText('Neutral · release to restore');
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('src')).not.toBe(before);
+    fireEvent.pointerUp(compare, { pointerId: 1 });
+    expect(screen.getByAltText('Enhanced: first.rvg').getAttribute('src')).toBe(before);
+    expect((screen.getByRole('button', { name: '↶ Undo' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+  it('keeps drawings with their images through swaps, exports and patient changes', async () => {
+    openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg');
+    fireEvent.click(screen.getByRole('button', { name: 'Pin image first.rvg' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Unpin image first.rvg' })).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: '02 second.rvg' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Ellipse' }));
+    const viewport = within(screen.getByRole('region', { name: 'Image: second.rvg' })).getByTestId('image-viewport');
+    fireEvent.pointerDown(viewport, { button: 0, pointerId: 1, clientX: 10, clientY: 10 });
+    fireEvent.pointerUp(viewport, { pointerId: 1, clientX: 60, clientY: 60 });
+    expect(screen.getByRole('region', { name: 'Image: second.rvg' }).querySelectorAll('ellipse')).toHaveLength(1);
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Move image second.rvg' }), { key: 'ArrowLeft' });
+    expect(screen.getByLabelText('Image panes').firstElementChild?.getAttribute('aria-label')).toBe('Image: second.rvg');
+    fireEvent.click(screen.getByRole('button', { name: 'Export PNG' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('export_image', expect.objectContaining({ id: 'second.rvg', ellipses: [expect.objectContaining({ color: 'red' })] })));
+    customInvoke = command => command === 'open_patient' ? Promise.resolve(patient(['new-patient.rvg'])) : undefined;
+    submitPatient(); await screen.findByAltText('Enhanced: new-patient.rvg');
+    expect(document.querySelectorAll('.image-markup ellipse')).toHaveLength(0);
+  });
+  it('discards a late dark-region result after clearing and restores per-image sensitivity', async () => {
+    openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg');
+    let resolveReview!: (value: unknown) => void;
+    customInvoke = command => command === 'review_dark_regions' ? new Promise(resolve => { resolveReview = resolve; }) : undefined;
+    fireEvent.click(screen.getByRole('button', { name: 'Select tooth area' }));
+    startDrag(); moveDrag(200, 200); fireEvent.pointerUp(screen.getByTestId('image-viewport'), { pointerId: 1, clientX: 200, clientY: 200 });
+    await waitFor(() => expect(resolveReview).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'Clear region' }));
+    await act(async () => resolveReview({ url: 'data:image/png;base64,late', region: { x: 100, y: 100, width: 100, height: 100 } }));
+    expect(screen.queryByRole('button', { name: 'Hide overlay' })).toBeNull();
+    expect(document.querySelector('.image-markup image')).toBeNull();
+    customInvoke = (command, args) => command === 'review_dark_regions' ? Promise.resolve({ url: 'data:image/png;base64,test', region: args.region }) : undefined;
+    setSlider('Dark-area sensitivity', 75);
+    fireEvent.click(screen.getByRole('button', { name: 'Select tooth area' }));
+    startDrag(); moveDrag(200, 200); fireEvent.pointerUp(screen.getByTestId('image-viewport'), { pointerId: 1, clientX: 200, clientY: 200 });
+    await waitFor(() => expect(document.querySelector('.image-markup image')).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: '02 second.rvg' }));
+    expect(actualValue('Dark-area sensitivity')).toBe('50');
+    fireEvent.click(screen.getByRole('button', { name: '01 first.rvg' }));
+    expect(actualValue('Dark-area sensitivity')).toBe('75');
+  });
   it('replaces the strip with all patient radiographs and preserves leading-zero identity', async () => {
     render(<App />); await open();
     customInvoke = command => command === 'open_patient' ? Promise.resolve(patient(['selected-patient.rvg', 'another.rvg'], '0067589')) : undefined;
@@ -407,11 +475,11 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     openPaths = ['first.rvg', 'second.rvg'];
     customInvoke = (command, args) => command === 'import_image' && args.path === 'first.rvg' ? Promise.resolve({ ...info('first.rvg'), metadata: { ...info('first.rvg').metadata, imageDate: '2026-04-08', dateSource: 'ContentDate' } }) : undefined;
     render(<App />); await open(); await readyThumbnail('02 second.rvg');
-    expect(screen.getAllByText('08-Apr-2026')).toHaveLength(3);
+    expect(screen.getAllByText('08-Apr-2026')).toHaveLength(4);
     expect(screen.getAllByTitle('Image content date')).toHaveLength(3);
     expect(screen.getByRole('button', { name: '02 second.rvg' }).querySelector('time')?.textContent).toBe('Date unavailable');
     fireEvent.click(screen.getByRole('button', { name: '02 second.rvg' }));
-    expect(screen.getAllByText('Date unavailable')).toHaveLength(3);
+    expect(screen.getAllByText('Date unavailable')).toHaveLength(4);
     fireEvent.click(screen.getByRole('button', { name: 'Colorize Off' }));
     expect(screen.getByLabelText('Local contrast color legend').textContent).toContain('Darker than nearbyLighter than nearby');
   });
@@ -490,14 +558,15 @@ const pin = async (name: string) => {
 const selectThumbnail = (index: number, name: string) => fireEvent.click(screen.getByRole('button', { name: `${String(index).padStart(2, '0')} ${name}` }));
 
 describe('pinned panes', () => {
-  it('keeps pins while replacing one working pane and never duplicates a selected pin', async () => {
+  it('replaces the working pane from the filmstrip but preserves it when selecting a visible pin', async () => {
     openPaths = ['first.rvg', 'second.rvg', 'third.rvg']; render(<App />); await open(); await readyThumbnail('03 third.rvg');
     await pin('first.rvg'); selectThumbnail(2, 'second.rvg');
     expect(paneNames()).toEqual(['Image: first.rvg', 'Image: second.rvg']);
     selectThumbnail(3, 'third.rvg');
     expect(paneNames()).toEqual(['Image: first.rvg', 'Image: third.rvg']);
     fireEvent.click(screen.getByRole('button', { name: 'Select image first.rvg' }));
-    expect(paneNames()).toEqual(['Image: first.rvg']);
+    expect(paneNames()).toEqual(['Image: first.rvg', 'Image: third.rvg']);
+    await screen.findByRole('button', { name: 'Unpin image third.rvg' });
     expect(pane('first.rvg').getAttribute('data-selected')).toBe('true');
   });
   it('keeps existing panes in pin order when earlier strip images are pinned later', async () => {
@@ -528,7 +597,7 @@ describe('pinned panes', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Unpin image fourth.rvg' }));
     expect(paneNames()).toHaveLength(4);
     expect(screen.getByLabelText('Image panes').getAttribute('style')).toContain('repeat(2, minmax(0, 1fr))');
-    expect(screen.getByAltText('Enhanced: fifth.rvg').getAttribute('style')).not.toContain('scale(1)');
+    expect(screen.getByAltText('Enhanced: fifth.rvg').getAttribute('style')).toContain('scale(1)');
   });
   it('unpins inactive panes immediately, keeps the active working pane, and closes pins', async () => {
     openPaths = ['first.rvg', 'second.rvg']; render(<App />); await open(); await readyThumbnail('02 second.rvg');
@@ -655,6 +724,98 @@ describe('pane context gesture integration', () => {
 });
 
 describe('automatic newest patient pair', () => {
+  it('closes individual panes without deleting thumbnails or adjustments and allows reopening the last pane', async () => {
+    customInvoke = command => command === 'open_patient' ? Promise.resolve(patient(['one.rvg', 'two.rvg', 'older.rvg'])) : undefined;
+    render(<App />); submitPatient();
+    await screen.findByAltText('Enhanced: two.rvg');
+    setSlider('Processing level', 6);
+    fireEvent.click(screen.getByRole('button', { name: 'Close image one.rvg from viewer' }));
+    expect(paneNames()).toEqual(['Image: two.rvg']);
+    expect(actualValue('Processing level')).toBe('6');
+    fireEvent.click(screen.getByRole('button', { name: 'Close image two.rvg from viewer' }));
+    expect(screen.queryAllByRole('region', { name: /^Image:/ })).toHaveLength(0);
+    expect(screen.getByText('Select a thumbnail below to show a radiograph.')).toBeTruthy();
+    expect(document.title).toContain('Patient ID 00123');
+    selectThumbnail(2, 'two.rvg');
+    await screen.findByAltText('Enhanced: two.rvg');
+    expect(actualValue('Processing level')).toBe('6');
+    await pin('two.rvg');
+    selectThumbnail(1, 'one.rvg');
+    await screen.findByAltText('Enhanced: one.rvg');
+    fireEvent.click(screen.getByRole('button', { name: 'Close image one.rvg from viewer' }));
+    expect(paneNames()).toEqual(['Image: two.rvg']);
+    expect(pane('two.rvg').getAttribute('data-selected')).toBe('true');
+    expect(screen.getByRole('button', { name: '03 older.rvg' })).toBeTruthy();
+  });
+
+  it('opens every radiograph in the latest acquisition day for a launch patient', async () => {
+    const latest = ['one.rvg', 'two.rvg', 'three.rvg', 'four.rvg'];
+    customInvoke = command => command === 'launch_patient_number' ? Promise.resolve('00123') : command === 'open_patient' ? Promise.resolve({ ...patient([...latest, 'older.rvg']), latestDatePaths: latest }) : undefined;
+    render(<App />);
+    await screen.findByAltText('Enhanced: four.rvg');
+    expect(paneNames()).toEqual(latest.map(name => `Image: ${name}`));
+    expect(screen.queryByRole('region', { name: 'Image: older.rvg' })).toBeNull();
+    await readyThumbnail('05 older.rvg');
+  });
+
+  it('changes the hovered image enhancement with Ctrl+wheel and supports undo and level bounds', async () => {
+    customInvoke = command => command === 'open_patient' ? Promise.resolve(patient(['one.rvg', 'two.rvg'])) : undefined;
+    render(<App />); submitPatient();
+    await screen.findByAltText('Enhanced: two.rvg');
+    const viewport = within(pane('one.rvg')).getByTestId('image-viewport');
+    const transform = screen.getByAltText('Enhanced: one.rvg').style.transform;
+    fireEvent.wheel(viewport, { ctrlKey: true, deltaY: -120 });
+    expect(actualValue('Processing level')).toBe('5');
+    expect(pane('one.rvg').getAttribute('data-selected')).toBe('true');
+    expect(screen.getByAltText('Enhanced: one.rvg').style.transform).toBe(transform);
+    fireEvent.keyDown(viewport, { ctrlKey: true, code: 'KeyZ' });
+    expect(actualValue('Processing level')).toBe('4');
+    for (let i = 0; i < 10; i++) fireEvent.wheel(viewport, { ctrlKey: true, deltaY: -120 });
+    expect(actualValue('Processing level')).toBe('7');
+    for (let i = 0; i < 10; i++) fireEvent.wheel(viewport, { ctrlKey: true, deltaY: 120 });
+    expect(actualValue('Processing level')).toBe('1');
+    fireEvent.click(within(pane('two.rvg')).getByRole('button', { name: 'Select image two.rvg' }));
+    expect(actualValue('Processing level')).toBe('4');
+  });
+
+  it('toggles native image-only fullscreen with F11 and exits with Escape while retaining mouse controls', async () => {
+    render(<App />); await open();
+    const viewport = screen.getByTestId('image-viewport');
+    fireEvent.keyDown(slider('Processing level'), { key: 'F11' });
+    await waitFor(() => expect(document.querySelector('.radiographs-fullscreen')).toBeTruthy());
+    expect(mocks.invoke).toHaveBeenCalledWith('set_viewer_fullscreen', { fullscreen: true });
+    fireEvent.wheel(viewport, { ctrlKey: true, deltaY: -120 });
+    expect(actualValue('Processing level')).toBe('5');
+    const before = screen.getByAltText('Enhanced: first.rvg').style.transform;
+    fireEvent.wheel(viewport, { deltaY: -120 });
+    expect(screen.getByAltText('Enhanced: first.rvg').style.transform).not.toBe(before);
+    fireEvent.keyDown(viewport, { key: 'Escape' });
+    await waitFor(() => expect(document.querySelector('.radiographs-fullscreen')).toBeNull());
+    expect(mocks.invoke).toHaveBeenLastCalledWith('set_viewer_fullscreen', { fullscreen: false });
+    expect(actualValue('Processing level')).toBe('5');
+  });
+
+  it('serializes a rapid F11/Escape and ignores repeated F11 keydown events', async () => {
+    let finish!: () => void;
+    customInvoke = (command, args) => command === 'set_viewer_fullscreen' && args.fullscreen ? new Promise<void>(resolve => { finish = resolve; }) : undefined;
+    render(<App />); await open();
+    const viewport = screen.getByTestId('image-viewport');
+    fireEvent.keyDown(viewport, { key: 'F11' });
+    fireEvent.keyDown(viewport, { key: 'F11', repeat: true });
+    fireEvent.keyDown(viewport, { key: 'Escape' });
+    await act(async () => finish());
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === 'set_viewer_fullscreen').map(([, args]) => args.fullscreen)).toEqual([true, false]);
+    expect(document.querySelector('.radiographs-fullscreen')).toBeNull();
+  });
+
+  it('keeps controls visible and reports a failed native fullscreen request', async () => {
+    customInvoke = command => command === 'set_viewer_fullscreen' ? Promise.reject('Synthetic failure') : undefined;
+    render(<App />); await open();
+    fireEvent.keyDown(screen.getByTestId('image-viewport'), { key: 'F11' });
+    await screen.findByText(/Could not change fullscreen mode: Synthetic failure/);
+    expect(document.querySelector('.radiographs-fullscreen')).toBeNull();
+  });
+
   it('opens the newest two patient radiographs as a pinned first pane and selected second pane', async () => {
     customInvoke = command => command === 'open_patient' ? Promise.resolve(patient(['newest.rvg', 'previous.rvg', 'older.rvg'])) : undefined;
     render(<App />); submitPatient();
@@ -682,4 +843,18 @@ describe('automatic newest patient pair', () => {
     expect(screen.getByAltText('Enhanced: newest.rvg').getAttribute('style')).toBe(afterZoom);
     expect(screen.queryByRole('button', { name: /Unpin image/ })).toBeNull();
   });
+});
+
+it('exports only visible panes with restored processing and annotations', async () => {
+  customInvoke = (command,args) => {
+    if(command==='open_patient') return Promise.resolve(patient(['one.rvg','two.rvg']));
+    if(command==='import_image') return Promise.resolve({...info(String(args.path)),settingsKey:String(args.path),sourceSha256:'hash',settingsRevision:'r1',savedAppearance:{recipe:{...neutral,gamma:.73},rotationQuarterTurns:1,ellipses:[{x:10,y:20,width:30,height:40,color:'red'}]}});
+    if(command==='save_image_settings') return Promise.resolve('r2');
+    if(command==='export_jpg_image') return Promise.resolve({directory:'\\\\C04577\\incoming\\Example Person',path:'export.jpg'});
+  };
+  render(<App/>); submitPatient(); await screen.findByAltText('Enhanced: two.rvg');
+  fireEvent.click(screen.getByRole('button',{name:'Close image one.rvg from viewer'}));
+  fireEvent.click(screen.getByRole('button',{name:'Export all JPGs'})); await screen.findByText('Export complete');
+  const calls=mocks.invoke.mock.calls.filter(([command])=>command==='export_jpg_image'); expect(calls).toHaveLength(1);
+  expect(calls[0][1].patientName).toBe('Example Person'); expect(calls[0][1].item.path).toBe('two.rvg'); expect(calls[0][1].item.appearance.recipe.gamma).toBe(.73); expect(calls[0][1].item.appearance.rotationQuarterTurns).toBe(1); expect(calls[0][1].item.appearance.ellipses[0].color).toBe('red');
 });

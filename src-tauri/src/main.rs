@@ -2,6 +2,7 @@
 
 use image::ImageEncoder;
 use rad_core::processing::ProcessingSession;
+use rad_core::review::{dark_regions, draw_ellipses, Ellipse, Region};
 use rad_core::{decode, process, suggested_recipe, ImageMetadata, Recipe, SourceImage};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,10 +13,104 @@ use std::{
 };
 use tauri::{Manager, State};
 use tokio::sync::Semaphore;
+mod image_settings;
+mod jpg_export;
 mod launch;
 mod patient;
 
+#[derive(Clone)]
+struct SettingsTarget {
+    path: PathBuf,
+    hash: String,
+    width: u32,
+    height: u32,
+}
+
+#[tauri::command]
+async fn save_image_settings(
+    key: String,
+    expected_revision: Option<String>,
+    appearance: image_settings::Appearance,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let target = state
+        .settings
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned()
+        .ok_or("Image settings are no longer available")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        image_settings::save(
+            &target.path,
+            &target.hash,
+            target.width,
+            target.height,
+            expected_revision.as_deref(),
+            &appearance,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn finish_close(window: tauri::Window) -> Result<(), String> {
+    window.destroy().map_err(|e| e.to_string())
+}
+
 struct LaunchPatientNumber(Result<Option<String>, String>);
+
+#[tauri::command]
+fn set_viewer_fullscreen(window: tauri::Window, fullscreen: bool) -> Result<(), String> {
+    window.set_fullscreen(fullscreen).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_viewer_title(window: tauri::Window, title: String) -> Result<(), String> {
+    window
+        .set_title(&title.replace(['\r', '\n'], " "))
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct DarkRegionResult {
+    region: Region,
+    url: String,
+}
+
+#[tauri::command]
+async fn review_dark_regions(
+    id: String,
+    region: Region,
+    sensitivity: f32,
+    state: State<'_, AppState>,
+) -> Result<DarkRegionResult, String> {
+    let source = state
+        .images
+        .lock()
+        .unwrap()
+        .get(&id)
+        .ok_or("Image is closed")?
+        .source
+        .clone();
+    let permit = state
+        .workers
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let overlay = dark_regions(&source, region, sensitivity)?;
+        Ok(DarkRegionResult {
+            region,
+            url: snapshot_data_url(&png(&overlay)?),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 #[tauri::command]
 fn launch_patient_number(state: State<'_, LaunchPatientNumber>) -> Result<Option<String>, String> {
@@ -35,6 +130,7 @@ struct Cached {
     neutral: bool,
 }
 struct AppState {
+    settings: Mutex<HashMap<String, SettingsTarget>>,
     images: Mutex<HashMap<String, Entry>>,
     renders: Mutex<HashMap<String, Cached>>,
     source_paths: Arc<Mutex<Vec<PathBuf>>>,
@@ -43,6 +139,7 @@ struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            settings: Mutex::new(HashMap::new()),
             images: Mutex::new(HashMap::new()),
             renders: Mutex::new(HashMap::new()),
             source_paths: Arc::new(Mutex::new(Vec::new())),
@@ -61,6 +158,11 @@ struct ImageInfo {
     neutral: Recipe,
     suggested: Recipe,
     decode_ms: f64,
+    settings_key: String,
+    source_sha256: String,
+    saved_appearance: Option<image_settings::Appearance>,
+    settings_revision: Option<String>,
+    settings_error: Option<String>,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -154,17 +256,62 @@ fn patient_directory(root: &Path, patient_number: &str) -> Result<PathBuf, Strin
     Ok(root.join(&number[number.len() - 2..]).join(number))
 }
 
-fn existing_patient_directory(root: &Path, patient_number: &str) -> Result<PathBuf, String> {
-    let directory = patient_directory(root, patient_number)?;
+fn legacy_patient_directory(root: &Path, patient_number: &str) -> Result<PathBuf, String> {
+    let number = launch::validate_patient_number(patient_number)?;
+    let number = format!("{number:0>5}");
+    let split = number.len() - 4;
+    Ok(root
+        .join(format!("PN{}", &number[..split]))
+        .join(&number[split..split + 2])
+        .join(format!("{}IMGS", &number[split + 2..])))
+}
+
+fn existing_patient_directory(directory: PathBuf) -> Result<PathBuf, String> {
     match std::fs::metadata(&directory) {
         Ok(metadata) if metadata.is_dir() => Ok(directory),
-        Ok(_) => Err(format!("Patient location is not a folder: {}", directory.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
-            "Patient folder not found: {}. Check the patient number and that drive D: is available.",
+        Ok(_) => Err(format!(
+            "Patient location is not a folder: {}",
             directory.display()
         )),
-        Err(error) => Err(format!("Cannot open patient folder {}: {error}", directory.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "Patient folder not found: {}.",
+            directory.display()
+        )),
+        Err(error) => Err(format!(
+            "Cannot open patient folder {}: {error}",
+            directory.display()
+        )),
     }
+}
+
+fn discover_patient(
+    roots: &[&Path],
+    patient_number: &str,
+) -> Result<patient::PatientStudy, String> {
+    let number = launch::validate_patient_number(patient_number)?;
+    let mut failures = Vec::new();
+    // Prefer the current layout on every configured drive/share, then try the
+    // legacy PN-prefix / middle-pair / final-pair-IMGS layout. Never scan siblings.
+    for legacy in [false, true] {
+        for root in roots {
+            let directory = if legacy {
+                legacy_patient_directory(root, number)?
+            } else {
+                patient_directory(root, number)?
+            };
+            match existing_patient_directory(directory)
+                .and_then(|directory| patient::discover(&directory, number))
+            {
+                Ok(study) if !study.paths.is_empty() => return Ok(study),
+                Ok(study) => failures.push(format!("No radiographs found in {}.", study.directory)),
+                Err(error) => failures.push(error),
+            }
+        }
+    }
+    Err(format!(
+        "No radiographs could be opened for patient {number}. Checked current and older folder layouts. Verify the patient number and access to the local drive or network shares.\n{}",
+        failures.join("\n")
+    ))
 }
 
 #[tauri::command]
@@ -174,18 +321,14 @@ async fn open_patient(
 ) -> Result<patient::PatientStudy, String> {
     let protected_sources = state.source_paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let directory =
-            existing_patient_directory(Path::new(r"D:\ABELDent\DATA\NOTES"), &patient_number)
-                .or_else(|local_error| {
-                    existing_patient_directory(
-                        Path::new(r"\\C04577\ABELDent\DATA\NOTES"),
-                        &patient_number,
-                    )
-                    .map_err(|network_error| {
-                        format!("{local_error}\nNetwork fallback: {network_error}")
-                    })
-                })?;
-        let study = patient::discover(&directory, patient_number.trim())?;
+        let study = discover_patient(
+            &[
+                Path::new(r"D:\ABELDent\DATA\NOTES"),
+                Path::new(r"\\C04577\ABELDent\DATA\NOTES"),
+                Path::new(r"\\SERVER\ABELDent\DATA\NOTES"),
+            ],
+            &patient_number,
+        )?;
         let mut sources = protected_sources.lock().unwrap();
         for path in &study.paths {
             let path = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
@@ -229,18 +372,51 @@ async fn import_image(path: String, state: State<'_, AppState>) -> Result<ImageI
         .await
         .map_err(|e| e.to_string())?;
     let decode_path = path.clone();
-    let (source, suggested, elapsed) = tauri::async_runtime::spawn_blocking(move || {
-        let _permit = permit;
-        let start = Instant::now();
-        decode(&decode_path).map(|s| {
-            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            let suggested = suggested_recipe(&s);
-            (s, suggested, elapsed)
+    let (source, suggested, elapsed, hash, saved, settings_error) =
+        tauri::async_runtime::spawn_blocking(move || {
+            let _permit = permit;
+            let start = Instant::now();
+            decode(&decode_path).and_then(|s| {
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                let suggested = suggested_recipe(&s);
+                let hash = image_settings::fingerprint(&decode_path)?;
+                let settings_path = image_settings::sidecar(&decode_path)?;
+                let (mut saved, settings_error) =
+                    match image_settings::load(&settings_path, &hash, s.width, s.height) {
+                        Ok(saved) => (saved, None),
+                        Err(error) => (
+                            None,
+                            Some(format!("Could not restore saved adjustments: {error}")),
+                        ),
+                    };
+                if let Some((_, appearance)) = &mut saved {
+                    if let Some(overlay) = &mut appearance.overlay {
+                        let result = dark_regions(&s, overlay.region, overlay.sensitivity / 100.0)
+                            .and_then(|r| png(&r));
+                        if let Ok(bytes) = result {
+                            overlay.url = Some(snapshot_data_url(&bytes));
+                        }
+                    }
+                }
+                Ok((s, suggested, elapsed, hash, saved, settings_error))
+            })
         })
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+        .await
+        .map_err(|e| e.to_string())??;
     let id = uuid::Uuid::new_v4().to_string();
+    let settings_key = uuid::Uuid::new_v4().to_string();
+    state.settings.lock().unwrap().insert(
+        settings_key.clone(),
+        SettingsTarget {
+            path: image_settings::sidecar(&path)?,
+            hash: hash.clone(),
+            width: source.width,
+            height: source.height,
+        },
+    );
+    let (settings_revision, saved_appearance) = saved
+        .map(|(revision, appearance)| (Some(revision), Some(appearance)))
+        .unwrap_or_default();
     let info = ImageInfo {
         id: id.clone(),
         width: source.width,
@@ -249,6 +425,11 @@ async fn import_image(path: String, state: State<'_, AppState>) -> Result<ImageI
         suggested,
         metadata: source.metadata.clone(),
         decode_ms: elapsed,
+        settings_key,
+        source_sha256: hash,
+        saved_appearance,
+        settings_revision,
+        settings_error,
     };
     let mut images = state.images.lock().unwrap();
     if images.len() >= 24 {
@@ -545,6 +726,8 @@ async fn export_image(
     id: String,
     recipe: Recipe,
     rotation_quarter_turns: Option<u8>,
+    ellipses: Option<Vec<Ellipse>>,
+    annotation_stroke: Option<f32>,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
     let quarter_turns = rotation_quarter_turns.unwrap_or(0);
@@ -576,7 +759,13 @@ async fn export_image(
         else {
             return Ok(None);
         };
-        let bytes = export_png(&process(&source, &recipe)?, quarter_turns)?;
+        let mut render = process(&source, &recipe)?;
+        draw_ellipses(
+            &mut render,
+            &ellipses.unwrap_or_default(),
+            annotation_stroke.unwrap_or(3.0),
+        )?;
+        let bytes = export_png(&render, quarter_turns)?;
         let sources = source_paths.lock().unwrap();
         if protects_source(&path, &sources) {
             return Err("Choose a new file. Original images cannot be overwritten.".into());
@@ -642,6 +831,12 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             choose_images,
+            set_viewer_title,
+            set_viewer_fullscreen,
+            save_image_settings,
+            finish_close,
+            jpg_export::export_jpg_image,
+            review_dark_regions,
             launch_patient_number,
             open_patient,
             choose_reference,
@@ -693,23 +888,112 @@ mod tests {
     }
 
     #[test]
+    fn legacy_patient_paths_match_the_older_layout_and_validate_ids() {
+        let root = Path::new(r"\\SERVER\ABELDent\DATA\NOTES");
+        assert_eq!(
+            legacy_patient_directory(root, " 48486 ").unwrap(),
+            root.join("PN4").join("84").join("86IMGS")
+        );
+        assert_eq!(
+            legacy_patient_directory(root, "123456").unwrap(),
+            root.join("PN12").join("34").join("56IMGS")
+        );
+        assert_eq!(
+            legacy_patient_directory(root, "00102").unwrap(),
+            root.join("PN0").join("01").join("02IMGS")
+        );
+        assert_eq!(
+            legacy_patient_directory(root, "12").unwrap(),
+            root.join("PN0").join("00").join("12IMGS")
+        );
+        for invalid in ["", "1", "../48486", "48/486", "48\\486", "４８４８６"] {
+            assert!(legacy_patient_directory(root, invalid).is_err());
+            assert!(discover_patient(&[root], invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_lookup_falls_back_after_missing_or_empty_current_directories() {
+        let local = tempfile::tempdir().unwrap();
+        let network = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let roots = [local.path(), network.path(), server.path()];
+        let legacy = legacy_patient_directory(server.path(), "48486").unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("test.rvg"), []).unwrap();
+        let study = discover_patient(&roots, "48486").unwrap();
+        assert_eq!(Path::new(&study.directory), legacy);
+        assert_eq!(study.paths.len(), 1);
+        // A current patient record may exist while its radiograph directory is gone.
+        let current = patient_directory(local.path(), "48486").unwrap();
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(
+            current.join("PatientInfo.xml"),
+            r#"<patient><parameter key="directory" value="missing-images"/></patient>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(&discover_patient(&roots, "48486").unwrap().directory),
+            legacy
+        );
+        let error = discover_patient(&roots, "48487").unwrap_err();
+        for root in roots {
+            assert!(error.contains(
+                &patient_directory(root, "48487")
+                    .unwrap()
+                    .display()
+                    .to_string()
+            ));
+            assert!(error.contains(
+                &legacy_patient_directory(root, "48487")
+                    .unwrap()
+                    .display()
+                    .to_string()
+            ));
+        }
+        assert!(error.contains("current and older folder layouts"));
+    }
+
+    #[test]
+    fn current_layout_has_priority_over_legacy_and_other_patients_are_not_scanned() {
+        let local = tempfile::tempdir().unwrap();
+        let network = tempfile::tempdir().unwrap();
+        let roots = [local.path(), network.path()];
+        let legacy = legacy_patient_directory(local.path(), "48486").unwrap();
+        let current = patient_directory(network.path(), "48486").unwrap();
+        for directory in [&legacy, &current] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join("test.rvg"), []).unwrap();
+        }
+        assert_eq!(
+            Path::new(&discover_patient(&roots, "48486").unwrap().directory),
+            current
+        );
+        assert!(discover_patient(&roots, "48487").is_err());
+    }
+
+    #[test]
     fn patient_lookup_checks_only_the_requested_existing_directory() {
         let root = tempfile::tempdir().unwrap();
         let expected = root.path().join("89").join("67589");
-        assert!(existing_patient_directory(root.path(), "67589")
-            .unwrap_err()
-            .contains("not found"));
+        assert!(
+            existing_patient_directory(patient_directory(root.path(), "67589").unwrap())
+                .unwrap_err()
+                .contains("not found")
+        );
         std::fs::create_dir_all(&expected).unwrap();
         assert_eq!(
-            existing_patient_directory(root.path(), "67589").unwrap(),
+            existing_patient_directory(patient_directory(root.path(), "67589").unwrap()).unwrap(),
             expected
         );
         let file = root.path().join("89").join("67589-file");
         std::fs::write(&file, b"not a folder").unwrap();
         std::fs::write(root.path().join("89").join("12389"), b"not a folder").unwrap();
-        assert!(existing_patient_directory(root.path(), "12389")
-            .unwrap_err()
-            .contains("not a folder"));
+        assert!(
+            existing_patient_directory(patient_directory(root.path(), "12389").unwrap())
+                .unwrap_err()
+                .contains("not a folder")
+        );
     }
     #[test]
     fn superseded_cache_waiter_does_not_process_or_occupy_worker() {

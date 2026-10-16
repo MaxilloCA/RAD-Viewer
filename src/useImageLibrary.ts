@@ -3,6 +3,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { experimentalPreset, sameRecipe, withProcessingLevel } from './model';
 import type { History, ImageEntry, ImageInfo, PatientIdentity, Recipe, RenderInfo } from './model';
 import { nextRequest } from './useRenderedImage';
+import { SettingsWriter } from './settingsWriter';
+import type { Ellipse, ReviewOverlay } from './workspace';
+import type { SetStateAction } from 'react';
 
 export const DECODED_IMAGE_LIMIT = 8;
 let entrySerial = 0;
@@ -24,11 +27,21 @@ export function useImageLibrary(onError: (error: string) => void) {
   const running = useRef(false);
   const alive = useRef(true);
   const pumpRef = useRef<() => void>(() => {});
-  const autoPair = useRef<{ epoch: number; first?: string; second?: string; pinStarted: boolean } | null>(null);
+  const autoOpen = useRef<{ epoch: number; paths: Set<string>; first?: string; pinStarted: boolean } | null>(null);
   const pinJobs = useRef(new Map<string, PinJob>());
   const pinRunning = useRef(false);
   const releasing = useRef(new Map<string, Promise<void>>());
   const errorRef = useRef(onError); errorRef.current = onError;
+  const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved');
+  const writer = useRef<SettingsWriter | null>(null);
+  if (!writer.current) writer.current = new SettingsWriter(value => { if (alive.current) setSaveStatus(value); }, error => { if (alive.current) errorRef.current(error); });
+  const persist = useCallback((entry: ImageEntry) => {
+    if (!entry.settingsKey || entry.settingsBlocked || !entry.history) return;
+    const overlay = entry.overlay;
+    writer.current!.queue(entry.settingsKey, { recipe: entry.history.present, rotationQuarterTurns: entry.rotationQuarterTurns, ellipses: entry.ellipses ?? [], overlay: overlay && !overlay.error && overlay.region.width >= 16 && overlay.region.height >= 16 ? { region: overlay.region, sensitivity: overlay.sensitivity, visible: overlay.visible } : null });
+  }, []);
+  const flushSettings = useCallback(() => writer.current!.flush(), []);
+  const retrySettings = useCallback(() => writer.current!.retry(), []);
   const update = useCallback((operation: (previous: ImageEntry[]) => ImageEntry[]) => {
     entriesRef.current = operation(entriesRef.current);
     if (alive.current) setEntries(entriesRef.current);
@@ -98,7 +111,7 @@ export function useImageLibrary(onError: (error: string) => void) {
     const job = pinJobs.current.get(key);
     if (job) { job.desired = undefined; pinJobs.current.delete(key); settlePin(job); }
   }, []);
-  const togglePinEntry = useCallback(async (key: string) => {
+  const togglePinEntry = useCallback(async (key: string, visibleFrame?: RenderInfo | null) => {
     const entry = entriesRef.current.find(item => item.key === key);
     if (!entry || !alive.current) return;
     if (entry.pinned || entry.pinPending) {
@@ -108,12 +121,12 @@ export function useImageLibrary(onError: (error: string) => void) {
     }
     if (!entry.image || !entry.history) { errorRef.current('Wait for the image to open before pinning it.'); return; }
     const pinOrder = ++tick.current;
-    update(previous => previous.map(item => item.key === key ? { ...item, pinOrder } : item));
+    update(previous => previous.map(item => item.key === key ? { ...item, pinOrder, pinnedRender: visibleFrame?.id === item.details?.id ? visibleFrame ?? undefined : item.pinnedRender } : item));
     pinJobs.current.set(key, { epoch: epoch.current, waiters: [] });
     await requestPinSnapshot(key);
   }, [cancelPin, requestPinSnapshot, update]);
-  const cancelAutoPair = useCallback(() => {
-    const pending = autoPair.current; autoPair.current = null;
+  const cancelAutoOpen = useCallback(() => {
+    const pending = autoOpen.current; autoOpen.current = null;
     if (pending?.pinStarted && pending.first) {
       const first = entriesRef.current.find(entry => entry.key === pending.first);
       if (first?.pinPending && !first.pinned) {
@@ -122,29 +135,31 @@ export function useImageLibrary(onError: (error: string) => void) {
       }
     }
   }, [cancelPin, update]);
-  const togglePin = useCallback(async (key: string) => {
-    const cancelledInitialPin = autoPair.current?.pinStarted && autoPair.current.first === key && entriesRef.current.some(entry => entry.key === key && entry.pinPending && !entry.pinned);
-    cancelAutoPair();
-    if (!cancelledInitialPin) await togglePinEntry(key);
-  }, [cancelAutoPair, togglePinEntry]);
+  const togglePin = useCallback(async (key: string, visibleFrame?: RenderInfo | null) => {
+    const cancelledInitialPin = autoOpen.current?.pinStarted && autoOpen.current.first === key && entriesRef.current.some(entry => entry.key === key && entry.pinPending && !entry.pinned);
+    cancelAutoOpen();
+    if (!cancelledInitialPin) await togglePinEntry(key, visibleFrame);
+  }, [cancelAutoOpen, togglePinEntry]);
   const selectEntry = useCallback((key: string | null) => {
     selectedRef.current = key; setSelectedKey(key);
     update(previous => previous.map(entry => entry.key === key ? { ...entry, error: undefined, lastUsed: ++tick.current } : entry));
     pumpRef.current();
   }, [update]);
-  const advanceAutoPair = useCallback((key: string) => {
-    const pending = autoPair.current;
-    if (!pending || pending.epoch !== epoch.current || pending.pinStarted) return;
+  const advanceAutoOpen = useCallback(async (key: string) => {
+    const pending = autoOpen.current;
+    const candidate = entriesRef.current.find(entry => entry.key === key);
+    if (!pending || pending.epoch !== epoch.current || !candidate || !pending.paths.has(candidate.path)) return;
     if (!pending.first) { pending.first = key; selectEntry(key); return; }
     if (pending.first === key) return;
-    pending.second = key; pending.pinStarted = true;
-    void togglePinEntry(pending.first).then(() => {
-      if (!alive.current || autoPair.current !== pending || pending.epoch !== epoch.current) return;
-      autoPair.current = null;
-      const first = entriesRef.current.find(entry => entry.key === pending.first);
-      const second = entriesRef.current.find(entry => entry.key === pending.second);
-      if (first?.pinnedRender && second?.image) selectEntry(second.key);
-    });
+    pending.pinStarted = true;
+    // Finish each snapshot before advancing. Large latest-day studies stay within
+    // the decoded-source limit, while completed panes survive cache eviction.
+    await togglePinEntry(pending.first);
+    if (!alive.current || autoOpen.current !== pending || pending.epoch !== epoch.current) return;
+    const first = entriesRef.current.find(entry => entry.key === pending.first);
+    if (!first?.pinnedRender) { autoOpen.current = null; return; }
+    pending.first = key; pending.pinStarted = false;
+    selectEntry(key);
   }, [selectEntry, togglePinEntry]);
   const refreshPinned = useCallback((key: string): Promise<void> => {
     const entry = entriesRef.current.find(item => item.key === key);
@@ -157,7 +172,7 @@ export function useImageLibrary(onError: (error: string) => void) {
       while (alive.current) {
         const selected = entriesRef.current.find(entry => entry.key === selectedRef.current);
         const target = selected && !selected.image && !selected.error ? selected : entriesRef.current.find(entry => !entry.thumbnail && !entry.error);
-        if (!target) { if (autoPair.current && !autoPair.current.pinStarted) autoPair.current = null; break; }
+        if (!target) { autoOpen.current = null; break; }
         const operationEpoch = epoch.current;
         const current = () => alive.current && epoch.current === operationEpoch && entriesRef.current.some(entry => entry.key === target.key);
         setLoading(target.key === selectedRef.current ? `Opening ${target.name}…` : `Preparing previews · ${entriesRef.current.filter(entry => entry.thumbnail).length} of ${entriesRef.current.length}`);
@@ -169,7 +184,7 @@ export function useImageLibrary(onError: (error: string) => void) {
             continue;
           }
           if (decoded.length >= DECODED_IMAGE_LIMIT) {
-            const victim = decoded.filter(entry => entry.key !== selectedRef.current && entry.key !== autoPair.current?.second).sort((a, b) => Number(pinBusy(pinJobs.current.get(a.key))) - Number(pinBusy(pinJobs.current.get(b.key))) || a.lastUsed - b.lastUsed)[0];
+            const victim = decoded.filter(entry => entry.key !== selectedRef.current).sort((a, b) => Number(pinBusy(pinJobs.current.get(a.key))) - Number(pinBusy(pinJobs.current.get(b.key))) || a.lastUsed - b.lastUsed)[0];
             if (!victim?.image) throw new Error('No decoded-image cache slot is available.');
             const pinJob = pinJobs.current.get(victim.key);
             if (pinJob && pinBusy(pinJob)) { await waitForPin(pinJob); continue; }
@@ -182,18 +197,33 @@ export function useImageLibrary(onError: (error: string) => void) {
           const info = await invoke<ImageInfo>('import_image', { path: target.path });
           importedId = info.id;
           if (!current()) { await release(info.id); continue; }
+          if (!target.details && info.settingsKey) {
+            writer.current!.register(info.settingsKey, info.settingsRevision ?? null);
+            if (info.settingsError) errorRef.current(`${target.name}: ${info.settingsError}. Automatic saving is disabled for this image to protect its existing settings.`);
+            update(previous => previous.map(entry => entry.key === target.key ? { ...entry, settingsKey: info.settingsKey, settingsBlocked: Boolean(info.settingsError), rotationQuarterTurns: info.savedAppearance?.rotationQuarterTurns ?? entry.rotationQuarterTurns, ellipses: info.savedAppearance?.ellipses ?? [], overlay: info.savedAppearance?.overlay ?? undefined, history: info.savedAppearance ? { past: [], present: info.savedAppearance.recipe, future: [] } : entry.history } : entry));
+          }
           const defaultRecipe = target.defaultRecipe ?? withProcessingLevel(experimentalPreset('med', info.neutral, info.suggested, info.metadata.photometric), info.suggested ?? info.neutral, 4);
-          const history = target.history ?? { past: [], present: defaultRecipe, future: [] };
-          const initial = await invoke<RenderInfo>('render_image', { id: info.id, recipe: history.present, requestId: nextRequest() });
-          if (!current()) { await release(info.id); continue; }
-          const thumbnail = await invoke<string>('image_thumbnail', { id: info.id, requestId: initial.requestId });
-          if (typeof thumbnail !== 'string' || !thumbnail.startsWith('data:image/')) throw new Error('The image preview could not be prepared.');
+          let history = entriesRef.current.find(entry => entry.key === target.key)?.history ?? { past: [], present: defaultRecipe, future: [] };
+          let initial: RenderInfo;
+          let thumbnail: string;
+          // Ctrl+wheel can edit a pinned pane while its evicted source reloads.
+          // Never overwrite those newer settings with the import's older recipe.
+          while (true) {
+            initial = await invoke<RenderInfo>('render_image', { id: info.id, recipe: history.present, requestId: nextRequest() });
+            if (!current()) break;
+            thumbnail = await invoke<string>('image_thumbnail', { id: info.id, requestId: initial.requestId });
+            if (typeof thumbnail !== 'string' || !thumbnail.startsWith('data:image/')) throw new Error('The image preview could not be prepared.');
+            const latestHistory = entriesRef.current.find(entry => entry.key === target.key)?.history;
+            if (!latestHistory || sameRecipe(history.present, latestHistory.present)) { history = latestHistory ?? history; break; }
+            history = latestHistory;
+          }
           if (!current()) { await release(info.id); continue; }
           update(previous => previous.map(entry => entry.key === target.key ? {
-            ...entry, details: info, defaultRecipe, history, thumbnail, error: undefined,
+            ...entry, details: info, defaultRecipe, history, thumbnail: thumbnail!, error: undefined,
             lastUsed: ++tick.current, image: { info, path: target.path, initial, defaultRecipe, history },
           } : entry));
-          advanceAutoPair(target.key);
+          if (pinJobs.current.has(target.key)) void requestPinSnapshot(target.key);
+          await advanceAutoOpen(target.key);
         } catch (error) {
           if (importedId) await release(importedId);
           if (current()) {
@@ -204,59 +234,78 @@ export function useImageLibrary(onError: (error: string) => void) {
         }
       }
     } finally { running.current = false; if (alive.current) setLoading(null); }
-  }, [advanceAutoPair, release, update]);
+  }, [advanceAutoOpen, release, requestPinSnapshot, update]);
   pumpRef.current = () => { void pump(); };
-  const select = useCallback((key: string | null) => { cancelAutoPair(); selectEntry(key); }, [cancelAutoPair, selectEntry]);
-  const append = useCallback((paths: string[], patient?: PatientIdentity, pairLatest = false) => {
+  const select = useCallback((key: string | null) => { cancelAutoOpen(); selectEntry(key); }, [cancelAutoOpen, selectEntry]);
+  const append = useCallback((paths: string[], patient?: PatientIdentity, latestDatePaths?: string[]) => {
     if (!paths.length) return;
-    cancelAutoPair();
-    if (pairLatest) autoPair.current = { epoch: epoch.current, pinStarted: false };
+    cancelAutoOpen();
+    if (latestDatePaths) autoOpen.current = { epoch: epoch.current, paths: new Set(latestDatePaths), pinStarted: false };
     const added = paths.map(path => ({ key: `image-${++entrySerial}`, path, name: path.split(/[\\/]/).pop() ?? path, patient, lastUsed: ++tick.current, rotationQuarterTurns: 0 }));
     update(previous => [...previous, ...added]); selectEntry(added[0].key);
-  }, [cancelAutoPair, selectEntry, update]);
-  const replace = useCallback(async (paths: string[], patient: PatientIdentity) => {
+  }, [cancelAutoOpen, selectEntry, update]);
+  const replace = useCallback(async (paths: string[], patient: PatientIdentity, latestDatePaths: string[] = paths) => {
     if (!paths.length) throw new Error('No radiographs were found for this patient.');
-    cancelAutoPair();
+    if (!await flushSettings()) throw new Error('Save pending adjustments or retry saving before switching patients.');
+    cancelAutoOpen();
     const replacementEpoch = ++epoch.current;
     const old = entriesRef.current;
     for (const key of pinJobs.current.keys()) cancelPin(key);
     update(() => []); selectedRef.current = null; setSelectedKey(null);
     await Promise.all(old.flatMap(entry => entry.image ? [release(entry.image.info.id)] : []));
     if (!alive.current || epoch.current !== replacementEpoch) return;
-    append(paths, patient, true);
-  }, [append, cancelAutoPair, cancelPin, release, update]);
-  const changeHistory = useCallback((operation: (history: History) => History) => {
-    cancelAutoPair();
-    const key = selectedRef.current;
+    append(paths, patient, latestDatePaths);
+  }, [append, cancelAutoOpen, cancelPin, flushSettings, release, update]);
+  const changeHistory = useCallback((operation: (history: History) => History, key: string | null = selectedRef.current) => {
+    cancelAutoOpen();
     update(previous => previous.map(entry => {
       if (entry.key !== key || !entry.history) return entry;
       const history = operation(entry.history);
       return { ...entry, history, image: entry.image ? { ...entry.image, history } : undefined };
     }));
     if (key && pinJobs.current.has(key)) void requestPinSnapshot(key);
-  }, [cancelAutoPair, requestPinSnapshot, update]);
+    const changed = entriesRef.current.find(entry => entry.key === key); if (changed) persist(changed);
+  }, [cancelAutoOpen, persist, requestPinSnapshot, update]);
+  const setEllipses = useCallback((operation: SetStateAction<Record<string, Ellipse[]>>) => {
+    const before = Object.fromEntries(entriesRef.current.map(entry => [entry.key, entry.ellipses ?? []]));
+    const after = typeof operation === 'function' ? operation(before) : operation;
+    update(previous => previous.map(entry => { const ellipses = after[entry.key] ?? []; if (JSON.stringify(ellipses) === JSON.stringify(entry.ellipses ?? [])) return entry; const next = { ...entry, ellipses }; persist(next); return next; }));
+  }, [persist, update]);
+  const setOverlays = useCallback((operation: SetStateAction<Record<string, ReviewOverlay>>) => {
+    const before = Object.fromEntries(entriesRef.current.filter(entry => entry.overlay).map(entry => [entry.key, entry.overlay!]));
+    const after = typeof operation === 'function' ? operation(before) : operation;
+    update(previous => previous.map(entry => { if (entry.overlay === after[entry.key]) return entry; const next = { ...entry, overlay: after[entry.key] }; if (!next.overlay?.error) persist(next); return next; }));
+  }, [persist, update]);
+  const dismissPane = useCallback((key: string, nextVisibleKey: string | null) => {
+    cancelAutoOpen();
+    cancelPin(key);
+    update(previous => previous.map(entry => entry.key === key ? { ...entry, pinned: false, pinPending: false, pinError: undefined, pinOrder: undefined, pinnedRender: undefined } : entry));
+    if (selectedRef.current === key) selectEntry(nextVisibleKey);
+  }, [cancelAutoOpen, cancelPin, selectEntry, update]);
   const close = useCallback(async () => {
-    cancelAutoPair();
     const current = entriesRef.current.find(entry => entry.key === selectedRef.current);
     if (!current) return;
+    if (!await flushSettings()) { errorRef.current('Could not save adjustments. Retry saving before closing this image.'); return; }
+    cancelAutoOpen();
     cancelPin(current.key);
     update(previous => previous.filter(entry => entry.key !== current.key));
     const released = current.image ? release(current.image.info.id) : Promise.resolve();
-    select(entriesRef.current[0]?.key ?? null);
+    if (selectedRef.current === current.key) select(entriesRef.current[0]?.key ?? null);
     await released;
-  }, [cancelAutoPair, cancelPin, release, select, update]);
+  }, [cancelAutoOpen, cancelPin, flushSettings, release, select, update]);
   const rotate = useCallback((key: string | null = selectedRef.current) => {
-    cancelAutoPair();
+    cancelAutoOpen();
     update(previous => previous.map(entry => entry.key === key ? { ...entry, rotationQuarterTurns: (entry.rotationQuarterTurns + 1) % 4 } : entry));
-  }, [cancelAutoPair, update]);
+    const changed = entriesRef.current.find(entry => entry.key === key); if (changed) persist(changed);
+  }, [cancelAutoOpen, persist, update]);
   useEffect(() => {
     alive.current = true;
     return () => {
-      alive.current = false; ++epoch.current; autoPair.current = null;
+      alive.current = false; ++epoch.current; autoOpen.current = null;
       for (const key of pinJobs.current.keys()) cancelPin(key);
       for (const entry of entriesRef.current) if (entry.image) void release(entry.image.info.id);
       entriesRef.current = [];
     };
   }, [cancelPin, release]);
-  return { entries, selectedKey, loading, select, append, replace, changeHistory, close, rotate, togglePin, refreshPinned, cancelAutoPair };
+  return { entries, selectedKey, loading, select, append, replace, changeHistory, close, dismissPane, rotate, togglePin, refreshPinned, cancelAutoOpen, setEllipses, setOverlays, saveStatus, flushSettings, retrySettings };
 }

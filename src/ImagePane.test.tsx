@@ -27,6 +27,68 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
+describe('explicit image tools and pane movement', () => {
+  it('routes Ctrl+wheel to enhancement and prevents page zoom without changing image zoom', () => {
+    const values = { ...props(), onEnhance: vi.fn() };
+    const { getByTestId } = render(<ImagePane {...values} />);
+    const viewport = getByTestId('image-viewport');
+    const wheel = new WheelEvent('wheel', { deltaY: -120, ctrlKey: true, bubbles: true, cancelable: true });
+    fireEvent(viewport, wheel);
+    expect(wheel.defaultPrevented).toBe(true);
+    expect(values.onEnhance).toHaveBeenLastCalledWith(1);
+    fireEvent.wheel(viewport, { deltaY: 120, ctrlKey: true });
+    expect(values.onEnhance).toHaveBeenLastCalledWith(-1);
+    expect(values.setView).not.toHaveBeenCalled();
+    fireEvent.wheel(viewport, { deltaY: -120 });
+    expect(values.setView).toHaveBeenCalledOnce();
+  });
+  it('draws source-anchored red and yellow ellipses with a constant three-pixel stroke', () => {
+    const onEllipse = vi.fn(); const p = props();
+    const screen = render(<ImagePane {...p} tool="ellipse" onEllipse={onEllipse} view={{ scale: 1, x: 0, y: 0, fit: false }} />);
+    const viewport = screen.getByTestId('image-viewport');
+    fireEvent.pointerDown(viewport, { button: 0, pointerId: 1, clientX: 10, clientY: 20 });
+    fireEvent.pointerMove(viewport, { pointerId: 1, clientX: 60, clientY: 70 });
+    fireEvent.pointerUp(viewport, { button: 0, pointerId: 1, clientX: 60, clientY: 70 });
+    expect(onEllipse).toHaveBeenCalledWith({ x: 610, y: 470, width: 50, height: 50, color: 'red' });
+    expect(p.onAdjustMove).not.toHaveBeenCalled();
+    screen.rerender(<ImagePane {...p} tool="ellipse" ellipseColor="yellow" onEllipse={onEllipse} ellipses={[onEllipse.mock.calls[0][0]]} view={{ scale: 1, x: 0, y: 0, fit: false }} />);
+    const drawn = screen.container.querySelector('ellipse')!;
+    expect(drawn.getAttribute('stroke-width')).toBe('3'); expect(drawn.getAttribute('vector-effect')).toBe('non-scaling-stroke');
+    fireEvent.pointerDown(viewport, { button: 0, pointerId: 2, clientX: 100, clientY: 100 });
+    fireEvent.pointerUp(viewport, { button: 0, pointerId: 2, clientX: 20, clientY: 30 });
+    expect(onEllipse).toHaveBeenLastCalledWith({ x: 620, y: 480, width: 80, height: 70, color: 'yellow' });
+  });
+  it('cancels incomplete marks and does not fit on an ellipse double click', () => {
+    const p = props(), onEllipse = vi.fn(); const screen = render(<ImagePane {...p} tool="ellipse" onEllipse={onEllipse} />);
+    const viewport = screen.getByTestId('image-viewport');
+    fireEvent.pointerDown(viewport, { button: 0, pointerId: 1, clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(viewport, { pointerId: 1, clientX: 100, clientY: 100 });
+    fireEvent.pointerCancel(viewport, { pointerId: 1 });
+    fireEvent.pointerUp(viewport, { pointerId: 1, clientX: 100, clientY: 100 });
+    fireEvent.doubleClick(viewport, { button: 0 });
+    expect(onEllipse).not.toHaveBeenCalled(); expect(p.setView).not.toHaveBeenCalled();
+  });
+  it('uses explicit pan without touching adjustments and can disable right-click shortcuts', () => {
+    const p = props(); const screen = render(<ImagePane {...p} tool="pan" mouseShortcuts={false} />);
+    const viewport = screen.getByTestId('image-viewport');
+    fireEvent.pointerDown(viewport, { button: 0, pointerId: 1, clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(viewport, { pointerId: 1, clientX: 40, clientY: 20 });
+    fireEvent.pointerUp(viewport, { pointerId: 1 }); rightClick(viewport); advance(500);
+    expect(p.setView).toHaveBeenCalledOnce(); expect(p.onAdjustStart).not.toHaveBeenCalled(); expect(p.onRotate).not.toHaveBeenCalled();
+  });
+  it('swaps on handle release over another pane and cancels outside it', () => {
+    const p = props(), onSwap = vi.fn(), onMoveOver = vi.fn();
+    const screen = render(<ImagePane {...p} onSwap={onSwap} onMoveOver={onMoveOver} />);
+    const target = document.createElement('section'); target.dataset.paneKey = 'other';
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: vi.fn(() => target) });
+    const handle = screen.getByRole('button', { name: 'Move image Synthetic image' });
+    fireEvent.pointerDown(handle, { button: 0, pointerId: 9 }); fireEvent.pointerMove(handle, { pointerId: 9, clientX: 500, clientY: 200 }); fireEvent.pointerUp(handle, { pointerId: 9, clientX: 500, clientY: 200 });
+    expect(onSwap).toHaveBeenCalledWith('pane-1', 'other'); expect(onMoveOver).toHaveBeenLastCalledWith(null, null);
+    fireEvent.pointerDown(handle, { button: 0, pointerId: 10 }); fireEvent.pointerCancel(handle, { pointerId: 10 }); fireEvent.pointerUp(handle, { pointerId: 10 });
+    expect(onSwap).toHaveBeenCalledOnce(); expect(p.onSelect).not.toHaveBeenCalled();
+  });
+});
+
 describe('image right-click gestures', () => {
   it('defers a single right click, rotates once, and suppresses the context menu', () => {
     const p = props(); const screen = render(<ImagePane {...p} />);

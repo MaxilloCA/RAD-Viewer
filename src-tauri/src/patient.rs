@@ -19,14 +19,19 @@ fn recency_key(path: &Path) -> (i64, i64) {
     (image_day, modified)
 }
 
-fn newest_first(paths: &mut [String]) {
+fn newest_first(paths: &mut [String]) -> Vec<String> {
     // Cache each header read: sorting must not repeatedly access network files.
-    paths.sort_by_cached_key(|path| {
-        (
-            std::cmp::Reverse(recency_key(Path::new(path))),
-            path.to_lowercase(),
-        )
-    });
+    let dates: HashMap<_, _> = paths
+        .iter()
+        .map(|path| (path.clone(), recency_key(Path::new(path))))
+        .collect();
+    paths.sort_by_cached_key(|path| (std::cmp::Reverse(dates[path]), path.to_lowercase()));
+    let latest_day = paths.first().map(|path| dates[path].0);
+    paths
+        .iter()
+        .take_while(|path| Some(dates[*path].0) == latest_day)
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -36,6 +41,7 @@ pub struct PatientStudy {
     pub patient_name: Option<String>,
     pub directory: String,
     pub paths: Vec<String>,
+    pub latest_date_paths: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -217,12 +223,13 @@ pub fn discover(local: &Path, number: &str) -> Result<PatientStudy, String> {
         paths.clear();
         scan(&directory, &mut paths, &mut warnings)?;
     }
-    newest_first(&mut paths);
+    let latest_date_paths = newest_first(&mut paths);
     Ok(PatientStudy {
         patient_number: number.into(),
         patient_name: (!name.is_empty()).then_some(name),
         directory: directory.to_string_lossy().into_owned(),
         paths,
+        latest_date_paths,
         warnings,
     })
 }
@@ -257,6 +264,57 @@ mod tests {
                     .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn latest_day_includes_every_acquisition_on_that_date_only() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, date) in [
+            ("a.rvg", "20261014"),
+            ("b.rvg", "20261014"),
+            ("c.rvg", "20261014"),
+            ("old.rvg", "20261013"),
+        ] {
+            let path = root.path().join(name);
+            dated_header(&path, date);
+            modified_at(
+                &path,
+                if name == "old.rvg" {
+                    2_000_000_000
+                } else {
+                    1_000
+                },
+            );
+        }
+        let study = discover(root.path(), "12").unwrap();
+        let names: Vec<_> = study
+            .latest_date_paths
+            .iter()
+            .map(|p| Path::new(p).file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["a.rvg", "b.rvg", "c.rvg"]);
+        assert_eq!(study.paths.len(), 4);
+    }
+
+    #[test]
+    fn latest_day_falls_back_to_modification_day_for_undated_files() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, seconds) in [("a.png", 100_000), ("b.png", 100_500), ("old.png", 1_000)] {
+            let path = root.path().join(name);
+            fs::write(&path, []).unwrap();
+            modified_at(&path, seconds);
+        }
+        let study = discover(root.path(), "12").unwrap();
+        assert_eq!(study.latest_date_paths.len(), 2);
+        assert!(study
+            .latest_date_paths
+            .iter()
+            .all(|path| !path.ends_with("old.png")));
+        let empty = tempfile::tempdir().unwrap();
+        assert!(discover(empty.path(), "12")
+            .unwrap()
+            .latest_date_paths
+            .is_empty());
     }
 
     #[test]
