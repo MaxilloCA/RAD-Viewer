@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { experimentalPreset, sameRecipe, withProcessingLevel } from './model';
+import { commit, defaultContrast, defaultGamma, experimentalPreset, isDeletedPath, sameRecipe, withContrast, withProcessingLevel, withRadiographDetail } from './model';
 import type { History, ImageEntry, ImageInfo, PatientIdentity, Recipe, RenderInfo } from './model';
 import { nextRequest } from './useRenderedImage';
 import { SettingsWriter } from './settingsWriter';
-import type { Ellipse, ReviewOverlay } from './workspace';
+import type { Ellipse } from './workspace';
 import type { SetStateAction } from 'react';
 
 export const DECODED_IMAGE_LIMIT = 8;
@@ -30,6 +30,7 @@ export function useImageLibrary(onError: (error: string) => void) {
   const autoOpen = useRef<{ epoch: number; paths: Set<string>; first?: string; pinStarted: boolean } | null>(null);
   const pinJobs = useRef(new Map<string, PinJob>());
   const pinRunning = useRef(false);
+  const refreshKeys = useRef(new Set<string>());
   const releasing = useRef(new Map<string, Promise<void>>());
   const errorRef = useRef(onError); errorRef.current = onError;
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved');
@@ -125,20 +126,17 @@ export function useImageLibrary(onError: (error: string) => void) {
     pinJobs.current.set(key, { epoch: epoch.current, waiters: [] });
     await requestPinSnapshot(key);
   }, [cancelPin, requestPinSnapshot, update]);
+  const ensurePinned = useCallback((key: string) => {
+    const entry = entriesRef.current.find(item => item.key === key);
+    return entry?.pinned || entry?.pinPending ? requestPinSnapshot(key) : togglePinEntry(key);
+  }, [requestPinSnapshot, togglePinEntry]);
   const cancelAutoOpen = useCallback(() => {
-    const pending = autoOpen.current; autoOpen.current = null;
-    if (pending?.pinStarted && pending.first) {
-      const first = entriesRef.current.find(entry => entry.key === pending.first);
-      if (first?.pinPending && !first.pinned) {
-        cancelPin(first.key);
-        update(previous => previous.map(entry => entry.key === first.key ? { ...entry, pinPending: false, pinOrder: undefined, pinError: undefined } : entry));
-      }
-    }
-  }, [cancelPin, update]);
+    // Stop advancing the study, but preserve the pane already being pinned.
+    autoOpen.current = null;
+  }, []);
   const togglePin = useCallback(async (key: string, visibleFrame?: RenderInfo | null) => {
-    const cancelledInitialPin = autoOpen.current?.pinStarted && autoOpen.current.first === key && entriesRef.current.some(entry => entry.key === key && entry.pinPending && !entry.pinned);
     cancelAutoOpen();
-    if (!cancelledInitialPin) await togglePinEntry(key, visibleFrame);
+    await togglePinEntry(key, visibleFrame);
   }, [cancelAutoOpen, togglePinEntry]);
   const selectEntry = useCallback((key: string | null) => {
     selectedRef.current = key; setSelectedKey(key);
@@ -154,13 +152,13 @@ export function useImageLibrary(onError: (error: string) => void) {
     pending.pinStarted = true;
     // Finish each snapshot before advancing. Large latest-day studies stay within
     // the decoded-source limit, while completed panes survive cache eviction.
-    await togglePinEntry(pending.first);
+    await ensurePinned(pending.first);
     if (!alive.current || autoOpen.current !== pending || pending.epoch !== epoch.current) return;
     const first = entriesRef.current.find(entry => entry.key === pending.first);
     if (!first?.pinnedRender) { autoOpen.current = null; return; }
     pending.first = key; pending.pinStarted = false;
     selectEntry(key);
-  }, [selectEntry, togglePinEntry]);
+  }, [selectEntry, ensurePinned]);
   const refreshPinned = useCallback((key: string): Promise<void> => {
     const entry = entriesRef.current.find(item => item.key === key);
     return entry?.pinned || entry?.pinPending ? requestPinSnapshot(key) : Promise.resolve();
@@ -171,7 +169,7 @@ export function useImageLibrary(onError: (error: string) => void) {
     try {
       while (alive.current) {
         const selected = entriesRef.current.find(entry => entry.key === selectedRef.current);
-        const target = selected && !selected.image && !selected.error ? selected : entriesRef.current.find(entry => !entry.thumbnail && !entry.error);
+        const target = selected && !selected.image && !selected.error ? selected : entriesRef.current.find(entry => refreshKeys.current.has(entry.key) && !entry.image && !entry.error) ?? entriesRef.current.find(entry => !entry.thumbnail && !entry.error);
         if (!target) { autoOpen.current = null; break; }
         const operationEpoch = epoch.current;
         const current = () => alive.current && epoch.current === operationEpoch && entriesRef.current.some(entry => entry.key === target.key);
@@ -197,12 +195,20 @@ export function useImageLibrary(onError: (error: string) => void) {
           const info = await invoke<ImageInfo>('import_image', { path: target.path });
           importedId = info.id;
           if (!current()) { await release(info.id); continue; }
+          if (target.details && (target.details.sourceSha256 !== info.sourceSha256 || target.details.width !== info.width || target.details.height !== info.height)) {
+            throw new Error('The radiograph changed on disk. Close and reopen it before applying the existing adjustments.');
+          }
           if (!target.details && info.settingsKey) {
             writer.current!.register(info.settingsKey, info.settingsRevision ?? null);
             if (info.settingsError) errorRef.current(`${target.name}: ${info.settingsError}. Automatic saving is disabled for this image to protect its existing settings.`);
-            update(previous => previous.map(entry => entry.key === target.key ? { ...entry, settingsKey: info.settingsKey, settingsBlocked: Boolean(info.settingsError), rotationQuarterTurns: info.savedAppearance?.rotationQuarterTurns ?? entry.rotationQuarterTurns, ellipses: info.savedAppearance?.ellipses ?? [], overlay: info.savedAppearance?.overlay ?? undefined, history: info.savedAppearance ? { past: [], present: info.savedAppearance.recipe, future: [] } : entry.history } : entry));
+            update(previous => previous.map(entry => entry.key === target.key ? { ...entry, settingsKey: info.settingsKey, settingsBlocked: Boolean(info.settingsError), rotationQuarterTurns: info.savedAppearance?.rotationQuarterTurns ?? entry.rotationQuarterTurns, ellipses: info.savedAppearance?.ellipses ?? [], overlay: undefined, history: info.savedAppearance ? { past: [], present: withRadiographDetail(info.savedAppearance.recipe), future: [] } : entry.history } : entry));
           }
-          const defaultRecipe = target.defaultRecipe ?? withProcessingLevel(experimentalPreset('med', info.neutral, info.suggested, info.metadata.photometric), info.suggested ?? info.neutral, 4);
+          const base = info.suggested ?? info.neutral;
+          const defaultRecipe = target.defaultRecipe ?? withContrast(
+            withProcessingLevel({ ...experimentalPreset('med', info.neutral, base, info.metadata.photometric), gamma: defaultGamma }, base, 4),
+            base,
+            defaultContrast,
+          );
           let history = entriesRef.current.find(entry => entry.key === target.key)?.history ?? { past: [], present: defaultRecipe, future: [] };
           let initial: RenderInfo;
           let thumbnail: string;
@@ -220,8 +226,9 @@ export function useImageLibrary(onError: (error: string) => void) {
           if (!current()) { await release(info.id); continue; }
           update(previous => previous.map(entry => entry.key === target.key ? {
             ...entry, details: info, defaultRecipe, history, thumbnail: thumbnail!, error: undefined,
-            lastUsed: ++tick.current, image: { info, path: target.path, initial, defaultRecipe, history },
+            lastUsed: ++tick.current, image: { info, path: target.path, initial, initialRecipe: history.present, defaultRecipe, history },
           } : entry));
+          refreshKeys.current.delete(target.key);
           if (pinJobs.current.has(target.key)) void requestPinSnapshot(target.key);
           await advanceAutoOpen(target.key);
         } catch (error) {
@@ -229,7 +236,8 @@ export function useImageLibrary(onError: (error: string) => void) {
           if (current()) {
             const detail = error instanceof Error ? error.message : String(error);
             update(previous => previous.map(entry => entry.key === target.key ? { ...entry, error: detail, image: undefined } : entry));
-            if (selectedRef.current === target.key) errorRef.current(`${target.name}: ${detail}`);
+            if (refreshKeys.current.delete(target.key)) update(previous => previous.map(entry => entry.key === target.key ? { ...entry, pinPending: false, pinError: detail } : entry));
+            if (selectedRef.current === target.key || target.pinned) errorRef.current(`${target.name}: ${detail}`);
           }
         }
       }
@@ -238,6 +246,7 @@ export function useImageLibrary(onError: (error: string) => void) {
   pumpRef.current = () => { void pump(); };
   const select = useCallback((key: string | null) => { cancelAutoOpen(); selectEntry(key); }, [cancelAutoOpen, selectEntry]);
   const append = useCallback((paths: string[], patient?: PatientIdentity, latestDatePaths?: string[]) => {
+    paths = paths.filter(path => !isDeletedPath(path));
     if (!paths.length) return;
     cancelAutoOpen();
     if (latestDatePaths) autoOpen.current = { epoch: epoch.current, paths: new Set(latestDatePaths), pinStarted: false };
@@ -245,10 +254,12 @@ export function useImageLibrary(onError: (error: string) => void) {
     update(previous => [...previous, ...added]); selectEntry(added[0].key);
   }, [cancelAutoOpen, selectEntry, update]);
   const replace = useCallback(async (paths: string[], patient: PatientIdentity, latestDatePaths: string[] = paths) => {
+    paths = paths.filter(path => !isDeletedPath(path));
     if (!paths.length) throw new Error('No radiographs were found for this patient.');
     if (!await flushSettings()) throw new Error('Save pending adjustments or retry saving before switching patients.');
     cancelAutoOpen();
     const replacementEpoch = ++epoch.current;
+    refreshKeys.current.clear();
     const old = entriesRef.current;
     for (const key of pinJobs.current.keys()) cancelPin(key);
     update(() => []); selectedRef.current = null; setSelectedKey(null);
@@ -256,25 +267,54 @@ export function useImageLibrary(onError: (error: string) => void) {
     if (!alive.current || epoch.current !== replacementEpoch) return;
     append(paths, patient, latestDatePaths);
   }, [append, cancelAutoOpen, cancelPin, flushSettings, release, update]);
+  const mergePatient = useCallback((paths: string[], patient: PatientIdentity) => {
+    paths = paths.filter(path => !isDeletedPath(path));
+    cancelAutoOpen();
+    const normalize = (path: string) => path.replace(/\\/g, '/').toLowerCase();
+    const known = new Set(entriesRef.current.map(entry => normalize(entry.path)));
+    const added = paths.filter(path => !known.has(normalize(path))).map(path => ({ key: `image-${++entrySerial}`, path, name: path.split(/[\\/]/).pop() ?? path, patient, lastUsed: ++tick.current, rotationQuarterTurns: 0 }));
+    update(previous => [...previous.map(entry => entry.patient?.patientNumber === patient.patientNumber ? { ...entry, patient } : entry), ...added]);
+    if (!selectedRef.current && added.length) selectEntry(added[0].key); else pumpRef.current();
+    return added.length;
+  }, [cancelAutoOpen, selectEntry, update]);
   const changeHistory = useCallback((operation: (history: History) => History, key: string | null = selectedRef.current) => {
     cancelAutoOpen();
     update(previous => previous.map(entry => {
       if (entry.key !== key || !entry.history) return entry;
-      const history = operation(entry.history);
+      const next = operation(entry.history);
+      const present = withRadiographDetail(next.present);
+      const history = present === next.present ? next : { ...next, present };
       return { ...entry, history, image: entry.image ? { ...entry.image, history } : undefined };
     }));
     if (key && pinJobs.current.has(key)) void requestPinSnapshot(key);
     const changed = entriesRef.current.find(entry => entry.key === key); if (changed) persist(changed);
+    if (key && changed?.pinned && !changed.image) {
+      refreshKeys.current.add(key);
+      update(previous => previous.map(entry => entry.key === key ? { ...entry, error: undefined, pinError: undefined, pinPending: true } : entry));
+      pumpRef.current();
+    }
   }, [cancelAutoOpen, persist, requestPinSnapshot, update]);
+  const commitRecipes = useCallback((recipes: Record<string, Recipe>) => {
+    const normalized = Object.fromEntries(Object.entries(recipes).map(([key, value]) => [key, withRadiographDetail(value)]));
+    const targets = entriesRef.current.filter(entry => entry.history && normalized[entry.key]);
+    if (!targets.some(entry => !sameRecipe(entry.history!.present, normalized[entry.key]))) return;
+    for (const entry of targets) changeHistory(history => {
+      const value = normalized[entry.key];
+      // Keep one undo boundary for every member, even if this image already
+      // had the chosen value, so group Undo never reaches an unrelated edit.
+      if (targets.length > 1 && sameRecipe(history.present, value)) return { past: [...history.past, history.present].slice(-100), present: value, future: [] };
+      return commit(history, value);
+    }, entry.key);
+  }, [changeHistory]);
+  const editRecipes = useCallback((keys: string[], edit: (recipe: Recipe, info: ImageInfo, defaultRecipe: Recipe) => Recipe) => {
+    const recipes: Record<string, Recipe> = {};
+    for (const entry of entriesRef.current) if (keys.includes(entry.key) && entry.history && entry.details && entry.defaultRecipe) recipes[entry.key] = edit(entry.history.present, entry.details, entry.defaultRecipe);
+    commitRecipes(recipes);
+  }, [commitRecipes]);
   const setEllipses = useCallback((operation: SetStateAction<Record<string, Ellipse[]>>) => {
     const before = Object.fromEntries(entriesRef.current.map(entry => [entry.key, entry.ellipses ?? []]));
     const after = typeof operation === 'function' ? operation(before) : operation;
     update(previous => previous.map(entry => { const ellipses = after[entry.key] ?? []; if (JSON.stringify(ellipses) === JSON.stringify(entry.ellipses ?? [])) return entry; const next = { ...entry, ellipses }; persist(next); return next; }));
-  }, [persist, update]);
-  const setOverlays = useCallback((operation: SetStateAction<Record<string, ReviewOverlay>>) => {
-    const before = Object.fromEntries(entriesRef.current.filter(entry => entry.overlay).map(entry => [entry.key, entry.overlay!]));
-    const after = typeof operation === 'function' ? operation(before) : operation;
-    update(previous => previous.map(entry => { if (entry.overlay === after[entry.key]) return entry; const next = { ...entry, overlay: after[entry.key] }; if (!next.overlay?.error) persist(next); return next; }));
   }, [persist, update]);
   const dismissPane = useCallback((key: string, nextVisibleKey: string | null) => {
     cancelAutoOpen();
@@ -297,7 +337,22 @@ export function useImageLibrary(onError: (error: string) => void) {
     cancelAutoOpen();
     update(previous => previous.map(entry => entry.key === key ? { ...entry, rotationQuarterTurns: (entry.rotationQuarterTurns + 1) % 4 } : entry));
     const changed = entriesRef.current.find(entry => entry.key === key); if (changed) persist(changed);
+    if (key && changed?.pinned && !changed.image) {
+      refreshKeys.current.add(key);
+      update(previous => previous.map(entry => entry.key === key ? { ...entry, error: undefined, pinError: undefined, pinPending: true } : entry));
+      pumpRef.current();
+    }
   }, [cancelAutoOpen, persist, update]);
+  const removePaths = useCallback(async (paths: string[]) => {
+    const normalize = (path: string) => path.replace(/\\/g, '/').toLowerCase();
+    const removedPaths = new Set(paths.map(normalize));
+    const removed = entriesRef.current.filter(entry => removedPaths.has(normalize(entry.path)));
+    cancelAutoOpen();
+    for (const entry of removed) { cancelPin(entry.key); refreshKeys.current.delete(entry.key); }
+    update(previous => previous.filter(entry => !removedPaths.has(normalize(entry.path))));
+    if (removed.some(entry => entry.key === selectedRef.current)) selectEntry(entriesRef.current[0]?.key ?? null);
+    await Promise.all(removed.flatMap(entry => entry.image ? [release(entry.image.info.id)] : []));
+  }, [cancelAutoOpen, cancelPin, release, selectEntry, update]);
   useEffect(() => {
     alive.current = true;
     return () => {
@@ -307,5 +362,5 @@ export function useImageLibrary(onError: (error: string) => void) {
       entriesRef.current = [];
     };
   }, [cancelPin, release]);
-  return { entries, selectedKey, loading, select, append, replace, changeHistory, close, dismissPane, rotate, togglePin, refreshPinned, cancelAutoOpen, setEllipses, setOverlays, saveStatus, flushSettings, retrySettings };
+  return { entries, selectedKey, loading, select, append, replace, mergePatient, changeHistory, commitRecipes, editRecipes, close, dismissPane, rotate, togglePin, ensurePinned, refreshPinned, cancelAutoOpen, setEllipses, saveStatus, flushSettings, retrySettings, removePaths };
 }

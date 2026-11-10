@@ -5,7 +5,7 @@ import type { OpenImage, Recipe, RenderInfo } from './model';
 
 let requestCounter = 0;
 export const nextRequest = () => ++requestCounter;
-type Work = { id: string; recipe: Recipe; preview: boolean };
+type Work = { id: string; recipe: Recipe; preview: boolean; initial: RenderInfo };
 const sameWork = (a: Work, b: Work) => a.id === b.id && a.preview === b.preview && sameRecipe(a.recipe, b.recipe);
 
 /** One render in flight; newest adjustment wins. Drafts use bounded previews,
@@ -14,7 +14,9 @@ export function useRenderedImage(active: OpenImage | undefined, recipe: Recipe |
   const [rendered, setRendered] = useState<RenderInfo | null>(null);
   const [processing, setProcessing] = useState(false);
   const latest = useRef<Work | null>(null);
-  const cache = useRef(new Map<string, { recipe: Recipe; rendered: RenderInfo }>());
+  // The library owns initial frames: eviction/close releases their cache entries
+  // automatically, while switching between loaded images retains exact frames.
+  const cache = useRef(new WeakMap<RenderInfo, { recipe: Recipe; rendered: RenderInfo }>());
   const busy = useRef(false);
   const alive = useRef(true);
   const pumpRef = useRef<() => void>(() => {});
@@ -24,7 +26,7 @@ export function useRenderedImage(active: OpenImage | undefined, recipe: Recipe |
   const pump = useCallback(() => {
     if (!alive.current || busy.current || !latest.current) return;
     const work = latest.current;
-    const cached = cache.current.get(work.id);
+    const cached = cache.current.get(work.initial);
     if (cached && sameRecipe(cached.recipe, work.recipe)) {
       setRendered(cached.rendered); setProcessing(false); return;
     }
@@ -32,7 +34,7 @@ export function useRenderedImage(active: OpenImage | undefined, recipe: Recipe |
     const requestId = nextRequest();
     void invoke<RenderInfo>('render_image', { id: work.id, recipe: work.recipe, requestId, preview: work.preview }).then(result => {
       if (!alive.current || result.requestId !== requestId) return;
-      if (!work.preview) cache.current.set(work.id, { recipe: work.recipe, rendered: result });
+      if (!work.preview) cache.current.set(work.initial, { recipe: work.recipe, rendered: result });
       if (latest.current?.id === work.id && latest.current.preview === work.preview) {
         setRendered(result);
         setProcessing(!sameWork(latest.current, work));
@@ -55,9 +57,9 @@ export function useRenderedImage(active: OpenImage | undefined, recipe: Recipe |
 
   useEffect(() => {
     if (!active || !recipe) { latest.current = null; setRendered(null); setProcessing(false); return; }
-    if (!cache.current.has(active.info.id)) cache.current.set(active.info.id, { recipe: active.history.present, rendered: active.initial });
-    latest.current = { id: active.info.id, recipe, preview: interactive };
-    const previous = cache.current.get(active.info.id)!;
+    if (!cache.current.has(active.initial)) cache.current.set(active.initial, { recipe: active.initialRecipe, rendered: active.initial });
+    latest.current = { id: active.info.id, recipe, preview: interactive, initial: active.initial };
+    const previous = cache.current.get(active.initial)!;
     setRendered(current => current?.id === active.info.id ? current : previous.rendered);
     setProcessing(!sameRecipe(previous.recipe, recipe));
     pump();

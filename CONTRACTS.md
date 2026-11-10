@@ -1,4 +1,30 @@
+# Windows 0.9.10 selected JPEG export
+
+The former Export Selected action is now Export to JPEG. It prompts once for a
+folder for the selection, defaulting on Windows to
+`\\server\Incoming\Lastname, Firstname - RAD Export` when patient identity is
+available. A local or other folder can be chosen; cancellation writes no image.
+A suggested empty folder may be created to initialize the native folder picker.
+Selections spanning multiple patients must be separated before exporting.
+
+Each selected image is independently reprocessed at full resolution from its
+source with its current recipe (including contrast, sharpening and colorization),
+rotation and ellipse annotations, and encoded as JPEG at exactly quality 70.
+Filenames use image date plus an atomic sequence number. Existing exports and
+source images are never overwritten. Zoom/pan do not crop exported images;
+measurement marks remain session only. Frozen macOS source 0.9.3 is unchanged.
+
 # Phase A integration contract
+
+## Version 0.8.0 Midtone Contrast
+
+`Recipe.colorMode` is optional (`local`, `midtone`, `midtoneContrast`); absent/null retains legacy mode selection from `midtoneLevel`. `midtoneWidth` defaults to 0.15 and validates 0.02–0.30; the existing reference level validates 0.05–0.95. New import/reset recipes select Midtone Contrast at center 0.5, width 0.15 and strength 0.4, with Colorize off. Existing saved recipes retain their mode and strength.
+
+Midtone Contrast computes signed evidence from display-positive floating-point values before fine sharpening. For d=(tone−center)/width, evidence=d×exp((1−d²)/2). The existing final-brightness gate, amber/cyan palette and gamut-limited display-brightness blend apply this evidence to the final sharpened image. Exact reference values remain grayscale; large deviations fade smoothly. Histogram/clipping and source pixels are unchanged. New parameters affect final render equality only, not the prepared-stage cache.
+
+`sample_reference { id, recipe, x, y } -> number` averages a clipped 5×5 full-resolution source-coordinate patch in the same pre-sharpen, display-positive domain. Outside-image coordinates fail. The UI clamps the resulting center to 0.05–0.95, ignores stale results, and commits only the clicked image. Temporarily imported sources for evicted panes are released after sampling. Main and A/B viewers share mode/center/sensitivity/amount controls. Sensitivity maps increasing slider values to decreasing width (30–2 percentage points).
+
+Hold for grayscale renders an ephemeral snapshot with Colorize enabled and strength zero, preserving processing even for RGB inputs. It never changes history, saved recipes, pins or exports. Release, cancellation, lost capture/focus, window blur and source changes restore the enhanced frame. Neutral comparison remains separate.
 
 ## Version 0.3.10 additions
 
@@ -78,7 +104,7 @@ This section supersedes older UI descriptions. One enhanced viewport replaces or
 
 `Recipe.colorize: bool` / `colorize: boolean` defaults to false for older serialized recipes. Colorize requires version 2; the UI upgrades explicitly when toggled. It is part of full recipe equality for the final PNG cache but is absent from the upstream floating-stage cache key because only the display stage uses it. Histogram/clipping remain pre-colorization intensity values. Exports and display share the final lookup. Version 2 sharpness validates through 10; version 1 retains its previous maximum 3 and gamma validation remains 0.1–5 for legacy compatibility.
 
-UI gamma bounds are 0.1–0.9, sharpness 5–10. Stored presets outside these ranges retain their exact recipe until edited and are labeled accordingly. Tone/Contrast expose relative -100…100 scales against each image's initial window. Horizontal left-drag changes tone and vertical left-drag gamma; Shift-left/middle drag pans. Pointer release/cancellation ends one history transaction. During changes, bounded/coalesced full-resolution rendering retains the last completed image with a processing indication. Switching/closing images cannot attach an old response to another source. The histogram uses linear counts and monochrome fill, with a black-to-white intensity strip. Colorize shows an intensity legend.
+UI gamma bounds are 0.1–0.9, sharpness 0–12. Stored presets outside these ranges retain their exact recipe until edited and are labeled accordingly. Tone/Contrast expose relative -100…100 scales against each image's initial window. Horizontal left-drag changes contrast and vertical left-drag gamma; Shift-left/middle drag pans. Pointer release/cancellation ends one history transaction. During changes, bounded/coalesced full-resolution rendering retains the last completed image with a processing indication. Switching/closing images cannot attach an old response to another source. The histogram uses linear counts and monochrome fill, with a black-to-white intensity strip. Colorize shows an intensity legend.
 
 ## 0.2.0 contract extension (historical UI)
 
@@ -108,3 +134,35 @@ Root frontend src/ owned by UI agent, package.json, tsconfig*, index.html, vite.
 `choose_images {}` -> string[] opens native multi-select dialog (cancel = []). `choose_reference {}` -> string|null; imports via same import_image and neutral rendering. `save_presets {presets: CustomPreset[]}` / `load_presets {}` where CustomPreset { name:string, recipe:Recipe }. `export_image {id,recipe}` -> string|null saves full resolution processed PNG with native dialog. `save_review {review:object}` -> string|null saves comparison settings/metadata to user selected JSON. No print/workspace features in Phase A.
 
 UI comparison: neutral + adjusted + optional independently imported Carestream reference. Shared source-coordinate zoom/pan with fit and 100%, bypass, histogram/clipping, presets labeled experimental, expandable advanced, reset and undo/redo, per-image recipes, reference capture notes (preset, Sharpness, orientation, zoom, appearance confirmed). Dark restrained clinical tool, no remote resources, no fabricated reference images. Browser mode clearly states desktop required; can use a synthetic ramp only for browser testing, never pretend samples opened. Desktop drag/drop through Tauri event API.
+
+
+## 0.8.1 combined JPEG export
+
+`export_viewer_jpg` accepts patientName, patientId and the composed PNG. The backend generates a six-digit decimal hash of its timestamp and atomically reserves an unused filename directly in `\\server\incoming`. Collisions advance the suffix; existing files are never overwritten. Patient-name sanitization and image-size limits remain enforced. The canvas composites the supplied transparent office logo over black, with white letterhead text and patient identity. Local color is no longer selectable, but legacy serialized recipes remain compatible.
+
+
+## 0.8.2 export confirmation
+
+JPEG export preparation and preview perform no destination writes. The JPEG preview and confirmed save share the quality-70 encoder and retained PNG composition. Confirmation is required before invoking export_viewer_jpg. Escape cancels the modal and pending preparation, with stale responses discarded. A confirmed write is allowed to finish and reports its result; repeated confirmation cannot create duplicate writes.
+
+
+## 0.8.3 shared image grids
+
+Viewer, JPEG composition and Print use 2 rows × 2 columns for 3–4 images, 2 × 3 for 5–6, 3 × 3 for 7–9 and 3 × 4 for 10–12. Images retain row-major viewer order and unused final cells stay empty. Print uses a common fit scale within these cells to preserve relative magnification without cropping.
+
+## 0.8.4 JPEG sidebar
+
+The Main Viewer JPEG canvas has a white practice sidebar occupying 22% of the width, a cyan divider, and a radiograph grid with consistent outer margins and gutters. It composites the existing office-logo.png without replacement or generated imagery. The sidebar contains patient name and office contacts; neither patient ID nor doctors' names are drawn. Names wrap using measured glyph widths and shrink when needed to avoid the contacts. Each original prepared bitmap is drawn at its aspect ratio, with retained pan/zoom and a separate date band. Backend full-resolution processing, source fingerprint validation, preview/save encoder, filename patient ID and atomic destination writes are unchanged.
+
+## 0.8.5 friend demo
+
+The combined export's visible action and dialog title are Export for Letter. `open_demo_patient {}` extracts five embedded metadata-minimized DICOMs and generic PatientInfo.xml into the user's local app data Samples/John Smith directory. It returns PatientStudy with John Smith, firstName John, lastName Smith, patientNumber DEMO and all five paths selected for initial display, and registers these paths for source-protected rendering/export. Reopening preserves sidecars and rejects changed bundled image/XML files instead of overwriting them. Demo refresh invokes this command without patient-number lookup. For patientId DEMO only, confirmed composite export uses Pictures/RAD Viewer/John Smith; ordinary exports remain on the office share. Preview wording reflects the destination. Demo packaging includes only the six explicitly named sample files, the installer, instructions and checksums.
+
+## 0.8.6 fixed viewer detail method
+
+The main viewer and A/B comparison expose Radiograph multiscale as a read-only detail-method label. withRadiographDetail normalizes restored sidecar recipes, committed edits, applied presets and comparison initial/reset recipes to version 2 / detailMode radiograph while preserving all other fields. Already-normalized recipes retain their object identity. The library normalizes incoming commit recipes before equality/undo checks so a legacy method alone cannot create an empty adjustment step or reappear in displayed/persisted history. Full-resolution display, pins, print and exports consume these same viewer recipes. The core retains its existing versioned recipe compatibility and unenhanced neutral-reference pipeline; original source samples are unchanged.
+## Version 0.8.8 processing and deletion
+
+The seven processing stops now span former level 2 through one stop above former level 7. New levels 1–6 retain those old recipes; level 7 uses sharpness 11.5, contrast 40, local contrast 0.8 and CLAHE 0.36. New imports/Reset use level 4 (sharpness 7, contrast −30); centered detail controls match these defaults. Version-2 sharpness validation and detail sliders extend to 12; version 1 stays bounded to 3. Existing saved recipe values are preserved.
+
+`delete_images { items: [{ path, directory: string | null, sourceSha256 }] } -> [{ path, destination: string | null, error: string | null, warning: string | null }]` moves confirmed files into each canonical patient directory's DELETED folder, or the source parent for manual files. Fingerprints are checked before creating the folder; moves cannot overwrite existing destinations. A sidecar move failure is reported separately after a successful image move. Only successfully moved paths are removed from the library, including duplicate references, decoded sources and pin jobs. Failures stay in the review and viewer. Flushing adjustments precedes the move. The fullscreen modal traps focus, defaults to Cancel, blocks closing while moving, and never moves files merely by opening the review. Patient scans, manual imports and demo reloads exclude DELETED.

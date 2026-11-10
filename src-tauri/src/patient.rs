@@ -39,6 +39,8 @@ fn newest_first(paths: &mut [String]) -> Vec<String> {
 pub struct PatientStudy {
     pub patient_number: String,
     pub patient_name: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
     pub directory: String,
     pub paths: Vec<String>,
     pub latest_date_paths: Vec<String>,
@@ -113,6 +115,9 @@ fn scan(
     paths: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) -> Result<(), String> {
+    if crate::deleted::is_deleted(directory) {
+        return Ok(());
+    }
     let mut pending = vec![directory.to_path_buf()];
     while let Some(folder) = pending.pop() {
         let entries = match fs::read_dir(&folder) {
@@ -156,7 +161,9 @@ fn scan(
                 continue;
             }
             if metadata.is_dir() {
-                pending.push(path);
+                if !crate::deleted::is_deleted(&path) {
+                    pending.push(path);
+                }
             } else if metadata.is_file() && is_radiograph(&path) {
                 paths.push(path.to_string_lossy().into_owned());
             }
@@ -227,6 +234,12 @@ pub fn discover(local: &Path, number: &str) -> Result<PatientStudy, String> {
     Ok(PatientStudy {
         patient_number: number.into(),
         patient_name: (!name.is_empty()).then_some(name),
+        first_name: values
+            .get("first_name")
+            .map(|s| s.trim().trim_end_matches(',').trim().to_owned()),
+        last_name: values
+            .get("last_name")
+            .map(|s| s.trim().trim_end_matches(',').trim().to_owned()),
         directory: directory.to_string_lossy().into_owned(),
         paths,
         latest_date_paths,

@@ -27,6 +27,16 @@ pub struct Recipe {
     pub color_strength: f32,
     #[serde(default = "default_color_scale")]
     pub color_scale: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midtone_level: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_mode: Option<String>,
+    #[serde(default = "default_midtone_width")]
+    pub midtone_width: f32,
+}
+
+fn default_midtone_width() -> f32 {
+    0.15
 }
 
 fn default_color_strength() -> f32 {
@@ -67,10 +77,28 @@ impl Recipe {
             colorize: false,
             color_strength: default_color_strength(),
             color_scale: default_color_scale(),
+            midtone_level: None,
+            color_mode: None,
+            midtone_width: default_midtone_width(),
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if !matches!(
+            self.color_mode.as_deref(),
+            None | Some("local" | "midtone" | "midtoneContrast")
+        ) {
+            return Err("Unsupported color mode".into());
+        }
+        if !self.midtone_width.is_finite() || !(0.02..=0.30).contains(&self.midtone_width) {
+            return Err("Midtone width must be between 0.02 and 0.30".into());
+        }
+        if self
+            .midtone_level
+            .is_some_and(|v| !v.is_finite() || !(0.05..=0.95).contains(&v))
+        {
+            return Err("Midtone level must be between 0.05 and 0.95".into());
+        }
         if !matches!(self.version, 1 | 2) {
             return Err("Unsupported processing recipe version".into());
         }
@@ -92,7 +120,7 @@ impl Recipe {
                 "sharpen",
                 self.sharpen,
                 0.0,
-                if self.version == 2 { 10.0 } else { 3.0 },
+                if self.version == 2 { 12.0 } else { 3.0 },
             ),
             ("radius", self.radius, 0.35, 12.0),
             ("threshold", self.threshold, 0.0, 0.25),
@@ -130,14 +158,46 @@ pub struct ProcessingSession {
     source: Arc<SourceImage>,
     prepared: Option<([u32; 9], Vec<f32>)>,
     preview: Option<SourceImage>,
+    preview_prepared: Option<([u32; 9], Vec<f32>)>,
 }
 
 impl ProcessingSession {
+    /// A source-coordinate patch in the same display-positive, pre-sharpen domain
+    /// used by Midtone Contrast. Never sample an 8-bit or reduced preview.
+    pub fn sample_reference(&self, recipe: &Recipe, x: u32, y: u32) -> Result<f32, String> {
+        validate_source(&self.source, recipe)?;
+        let (w, h) = (self.source.width, self.source.height);
+        if x >= w || y >= h {
+            return Err("Reference point is outside the image".into());
+        }
+        let computed;
+        let values = if let Some((_, values)) = self
+            .prepared
+            .as_ref()
+            .filter(|(key, _)| *key == preparation_key(recipe))
+        {
+            values
+        } else {
+            computed = prepare(&self.source, recipe)?;
+            &computed
+        };
+        let mut sum = 0.0;
+        let mut count = 0;
+        for py in y.saturating_sub(2)..=y.saturating_add(2).min(h - 1) {
+            for px in x.saturating_sub(2)..=x.saturating_add(2).min(w - 1) {
+                let v = values[(py * w + px) as usize];
+                sum += if recipe.invert { 1.0 - v } else { v }.clamp(0.0, 1.0);
+                count += 1;
+            }
+        }
+        Ok(sum / count as f32)
+    }
     pub fn new(source: Arc<SourceImage>) -> Self {
         Self {
             source,
             prepared: None,
             preview: None,
+            preview_prepared: None,
         }
     }
 
@@ -158,41 +218,59 @@ impl ProcessingSession {
         let mut preview_recipe = recipe.clone();
         preview_recipe.radius = (recipe.radius * scale).max(0.35);
         preview_recipe.color_scale = (recipe.color_scale * scale).max(2.0);
-        let values = prepare_scaled(source, &preview_recipe, scale)?;
+        let key = preparation_key(&preview_recipe);
+        let values = if let Some((_, values)) = self
+            .preview_prepared
+            .as_ref()
+            .filter(|(old, _)| *old == key)
+        {
+            values.clone()
+        } else {
+            let values = prepare_scaled(source, &preview_recipe, scale)?;
+            self.preview_prepared = Some((key, values.clone()));
+            values
+        };
         Ok(finish_render(source, &preview_recipe, values))
     }
 
     pub fn process(&mut self, recipe: &Recipe) -> Result<RenderedImage, String> {
         validate_source(&self.source, recipe)?;
-        let mut key = [0u32; 9];
-        key[0] = recipe.version;
-        key[1..6].copy_from_slice(
-            &[
-                recipe.window_center,
-                recipe.window_width,
-                recipe.gamma,
-                recipe.denoise,
-                recipe.clahe,
-            ]
-            .map(f32::to_bits),
-        );
-        if recipe.version == 2 && recipe.local_contrast > 0.0 {
-            key[6..].copy_from_slice(
-                &[recipe.local_contrast, recipe.threshold, recipe.halo].map(f32::to_bits),
-            );
-        }
+        let key = preparation_key(recipe);
         let values =
             if let Some((_, values)) = self.prepared.as_ref().filter(|(old, _)| *old == key) {
                 values.clone()
             } else {
                 let values = prepare(&self.source, recipe)?;
-                // At most 32 MiB per open source (768 MiB for the desktop's 24-image
-                // cap). Larger sources still work, using the uncached pipeline.
+                // At most 32 MiB per decoded source; larger images use the
+                // uncached pipeline. The library retains eight decoded sources.
                 self.prepared = (values.len() <= 8 * 1024 * 1024).then(|| (key, values.clone()));
                 values
             };
         Ok(finish_render(&self.source, recipe, values))
     }
+}
+
+// Only parameters consumed before fine detail/color belong in this key.
+// Full-resolution and preview stages keep separate storage and spatial scales.
+fn preparation_key(recipe: &Recipe) -> [u32; 9] {
+    let mut key = [0u32; 9];
+    key[0] = recipe.version;
+    key[1..6].copy_from_slice(
+        &[
+            recipe.window_center,
+            recipe.window_width,
+            recipe.gamma,
+            recipe.denoise,
+            recipe.clahe,
+        ]
+        .map(f32::to_bits),
+    );
+    if recipe.version == 2 && recipe.local_contrast > 0.0 {
+        key[6..].copy_from_slice(
+            &[recipe.local_contrast, recipe.threshold, recipe.halo].map(f32::to_bits),
+        );
+    }
+    key
 }
 
 /// Average every source sample into a bounded floating-point preview. Integer
@@ -330,7 +408,26 @@ fn finish_render(source: &SourceImage, recipe: &Recipe, mut values: Vec<f32>) ->
     let m = &source.metadata;
     // Analyze the prepared image before fine sharpening can create overshoots.
     // These final-display settings deliberately do not invalidate the tone cache.
-    let color_evidence = (recipe.colorize && recipe.color_strength > 0.0)
+    let mode = recipe
+        .color_mode
+        .as_deref()
+        .unwrap_or(if recipe.midtone_level.is_some() {
+            "midtone"
+        } else {
+            "local"
+        });
+    let midtone_evidence =
+        (recipe.colorize && mode == "midtoneContrast" && recipe.color_strength > 0.0).then(|| {
+            values
+                .iter()
+                .map(|&v| {
+                    let v = if recipe.invert { 1.0 - v } else { v }.clamp(0.0, 1.0);
+                    let d = (v - recipe.midtone_level.unwrap_or(0.5)) / recipe.midtone_width;
+                    d * (0.5 - 0.5 * d * d).exp()
+                })
+                .collect::<Vec<_>>()
+        });
+    let color_evidence = (recipe.colorize && mode == "local" && recipe.color_strength > 0.0)
         .then(|| density_color_evidence(&values, w, h, recipe.color_scale));
     if recipe.sharpen > 0.0 {
         values = if recipe.version == 2 && recipe.detail_mode == "radiograph" {
@@ -360,9 +457,22 @@ fn finish_render(source: &SourceImage, recipe: &Recipe, mut values: Vec<f32>) ->
         if recipe.colorize {
             let evidence = color_evidence.as_ref().map_or(0.0, |e| e[i]);
             let evidence = if recipe.invert { -evidence } else { evidence };
-            rendered
-                .rgba
-                .extend(density_color(y, evidence, recipe.color_strength).map(quantize));
+            rendered.rgba.extend(
+                match mode {
+                    "midtoneContrast" => density_color(
+                        y,
+                        midtone_evidence.as_ref().map_or(0.0, |e| e[i]),
+                        recipe.color_strength,
+                    ),
+                    "midtone" => midtone_color(
+                        y,
+                        recipe.midtone_level.unwrap_or(0.5),
+                        recipe.color_strength,
+                    ),
+                    _ => density_color(y, evidence, recipe.color_strength),
+                }
+                .map(quantize),
+            );
         } else if let Some(colors) = &source.color {
             let rgb = colors[i].map(|v| v / color_scale);
             let channels = recolor(rgb, y);
@@ -377,6 +487,11 @@ fn finish_render(source: &SourceImage, recipe: &Recipe, mut values: Vec<f32>) ->
 
 fn quantize(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn midtone_color(y: f32, level: f32, strength: f32) -> [f32; 3] {
+    let amount = strength * (-0.5 * ((y - level) / 0.08).powi(2)).exp();
+    recolor([1.0, 0.55, 0.02], y).map(|channel| y + amount * (channel - y))
 }
 
 /// Signed local density-change evidence, not a diagnostic or anatomical map.
@@ -885,6 +1000,158 @@ fn detail(input: &[f32], w: usize, h: usize, recipe: &Recipe) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::ImageMetadata;
+
+    #[test]
+    fn midtone_contrast_ramp_preserves_brightness_cache_histogram_and_source() {
+        let s = Arc::new(source(
+            256,
+            8,
+            (0..2048).map(|i| (i % 256) as f32).collect(),
+        ));
+        let original = s.samples.clone();
+        let mut r = Recipe::neutral(&s);
+        r.version = 2;
+        let mut session = ProcessingSession::new(s.clone());
+        let gray = session.process(&r).unwrap();
+        let allocation = session.prepared.as_ref().unwrap().1.as_ptr();
+        r.colorize = true;
+        r.color_mode = Some("midtoneContrast".into());
+        r.midtone_level = Some(128.0 / 255.0);
+        r.color_strength = 0.4;
+        let color = session.process(&r).unwrap();
+        assert_eq!(allocation, session.prepared.as_ref().unwrap().1.as_ptr());
+        assert_eq!(color.rgba, process(&s, &r).unwrap().rgba);
+        assert_eq!(color.histogram, gray.histogram);
+        assert_eq!(
+            (color.clipped_low, color.clipped_high),
+            (gray.clipped_low, gray.clipped_high)
+        );
+        let pixel = |i: usize| &color.rgba[i * 4..i * 4 + 3];
+        assert!(pixel(110)[0] > pixel(110)[2]);
+        assert!(pixel(146)[2] > pixel(146)[0]);
+        assert_eq!(pixel(128), &[128, 128, 128]);
+        assert_eq!(pixel(0), &[0, 0, 0]);
+        assert_eq!(pixel(255), &[255, 255, 255]);
+        for (rgb, mono) in color
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(gray.rgba.as_chunks::<4>().0.iter())
+        {
+            let y = rgb[0] as f32 * 0.2126 + rgb[1] as f32 * 0.7152 + rgb[2] as f32 * 0.0722;
+            assert!((y - mono[0] as f32).abs() <= 1.0);
+        }
+        r.midtone_width = 0.05;
+        let sensitive = session.process(&r).unwrap();
+        let chroma = |p: &[u8]| (p[0] as i32 - p[2] as i32).abs();
+        assert!(chroma(&sensitive.rgba[120 * 4..120 * 4 + 3]) > chroma(pixel(120)));
+        assert!(chroma(&sensitive.rgba[60 * 4..60 * 4 + 3]) < chroma(pixel(60)));
+        assert_eq!(allocation, session.prepared.as_ref().unwrap().1.as_ptr());
+        r.color_strength = 0.0;
+        assert_eq!(session.process(&r).unwrap().rgba, gray.rgba);
+        assert_eq!(s.samples, original);
+    }
+
+    #[test]
+    fn midtone_hue_and_reference_sampling_ignore_fine_sharpening() {
+        let s = Arc::new(source(
+            35,
+            35,
+            (0..1225).map(|i| 100.0 + ((i * 17) % 55) as f32).collect(),
+        ));
+        let mut r = Recipe::neutral(&s);
+        r.version = 2;
+        r.window_center = 128.0;
+        r.window_width = 256.0;
+        r.colorize = true;
+        r.color_mode = Some("midtoneContrast".into());
+        r.midtone_level = Some(0.5);
+        let session = ProcessingSession::new(s.clone());
+        let level = session.sample_reference(&r, 0, 0).unwrap();
+        let expected: f32 = (0..3)
+            .flat_map(|y| (0..3).map(move |x| (y * 35 + x) as usize))
+            .map(|i| s.samples[i] / 255.0)
+            .sum::<f32>()
+            / 9.0;
+        assert!((level - expected).abs() < 1e-6);
+        assert!(session.sample_reference(&r, 35, 0).is_err());
+        let prepared = prepare(&s, &r).unwrap();
+        for invert in [false, true] {
+            r.invert = invert;
+            r.sharpen = 10.0;
+            r.detail_mode = "radiograph".into();
+            let rendered = process(&s, &r).unwrap();
+            for (i, rgb) in rendered.rgba.as_chunks::<4>().0.iter().enumerate() {
+                let tone = if invert {
+                    1.0 - prepared[i]
+                } else {
+                    prepared[i]
+                };
+                if rgb[0] != rgb[2] {
+                    assert_eq!(rgb[0] > rgb[2], tone < 0.5);
+                }
+            }
+            let sampled = session.sample_reference(&r, 0, 0).unwrap();
+            assert!((sampled - if invert { 1.0 - level } else { level }).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn midtone_fields_validate_and_legacy_modes_retain_pixels() {
+        let s = source(64, 64, (0..4096).map(|i| (i % 256) as f32).collect());
+        let mut r = Recipe::neutral(&s);
+        r.version = 2;
+        r.colorize = true;
+        for (level, mode) in [(None, "local"), (Some(0.5), "midtone")] {
+            r.midtone_level = level;
+            r.color_mode = None;
+            let legacy = process(&s, &r).unwrap();
+            r.color_mode = Some(mode.into());
+            assert_eq!(legacy.rgba, process(&s, &r).unwrap().rgba);
+        }
+        let mut json = serde_json::to_value(&r).unwrap();
+        json.as_object_mut().unwrap().remove("colorMode");
+        json.as_object_mut().unwrap().remove("midtoneWidth");
+        let old: Recipe = serde_json::from_value(json).unwrap();
+        assert_eq!(old.color_mode, None);
+        assert_eq!(old.midtone_width, 0.15);
+        r.color_mode = Some("rainbow".into());
+        assert!(r.validate().is_err());
+        r.color_mode = Some("midtoneContrast".into());
+        for width in [f32::NAN, f32::INFINITY, 0.0, 0.019, 0.301] {
+            r.midtone_width = width;
+            assert!(r.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn midtone_highlight_moves_with_level_and_preserves_processing_histogram() {
+        let input = source(256, 1, (0..256).map(|v| v as f32).collect());
+        let mut recipe = Recipe::neutral(&input);
+        recipe.version = 2;
+        recipe.gamma = 0.8;
+        let gray = process(&input, &recipe).unwrap();
+        recipe.colorize = true;
+        recipe.midtone_level = Some(0.35);
+        let colored = process(&input, &recipe).unwrap();
+        assert_eq!(colored.histogram, gray.histogram);
+        assert_ne!(colored.rgba, gray.rgba);
+        let saturation = |c: [f32; 3]| {
+            c.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                - c.iter().copied().fold(f32::INFINITY, f32::min)
+        };
+        assert!(
+            saturation(midtone_color(0.35, 0.35, 1.0))
+                > saturation(midtone_color(0.35, 0.7, 1.0)) * 20.0
+        );
+        recipe.midtone_level = Some(0.7);
+        assert_ne!(process(&input, &recipe).unwrap().rgba, colored.rgba);
+        recipe.colorize = false;
+        assert_eq!(process(&input, &recipe).unwrap().rgba, gray.rgba);
+        recipe.midtone_level = Some(f32::NAN);
+        assert!(recipe.validate().is_err());
+    }
 
     fn source(w: u32, h: u32, values: Vec<f32>) -> SourceImage {
         let min = values.iter().copied().fold(f32::INFINITY, f32::min);
@@ -1495,7 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn version_two_sharpness_six_through_ten_remains_finite_and_version_one_is_bounded() {
+    fn version_two_sharpness_through_twelve_remains_finite_and_version_one_is_bounded() {
         let (w, h) = (65, 33);
         let samples: Vec<f32> = (0..w * h)
             .map(|i| {
@@ -1504,7 +1771,7 @@ mod tests {
             .collect();
         let s = source(w as u32, h as u32, samples.clone());
         let mut r = radiograph_recipe();
-        for strength in [6.0, 8.0, 10.0] {
+        for strength in [6.0, 8.0, 10.0, 11.5, 12.0] {
             r.sharpen = strength;
             assert!(r.validate().is_ok());
             for halo in [0.0, 0.35, 0.8, 1.0] {
@@ -1523,7 +1790,7 @@ mod tests {
                 }
             }
         }
-        r.sharpen = 10.01;
+        r.sharpen = 12.01;
         assert!(r.validate().is_err());
         r.version = 1;
         r.detail_mode = "unsharp".into();
@@ -1815,6 +2082,47 @@ mod tests {
     }
 
     #[test]
+    fn preview_cache_reuses_tone_stage_and_invalidates_every_tone_parameter() {
+        let s = Arc::new(source(
+            769,
+            257,
+            (0..769 * 257).map(|i| (i * 37 % 4096) as f32).collect(),
+        ));
+        let mut session = ProcessingSession::new(s.clone());
+        let mut recipe = radiograph_recipe();
+        session.process_preview(&recipe).unwrap();
+        let prepared = session.preview_prepared.as_ref().unwrap().1.as_ptr();
+        for i in 0..12 {
+            match i {
+                0 => recipe.sharpen += 0.1,
+                1 => recipe.colorize = true,
+                2 => recipe.color_strength = 0.3,
+                3 => recipe.invert = true,
+                4 => recipe.gamma = 0.7,
+                5 => recipe.window_center += 10.0,
+                6 => recipe.window_width += 20.0,
+                7 => recipe.denoise = 0.2,
+                8 => recipe.clahe = 0.2,
+                9 => recipe.local_contrast = 0.3,
+                10 => recipe.threshold = 0.02,
+                _ => recipe.halo = 0.8,
+            }
+            let cached = session.process_preview(&recipe).unwrap();
+            let fresh = ProcessingSession::new(s.clone())
+                .process_preview(&recipe)
+                .unwrap();
+            assert_eq!(cached.rgba, fresh.rgba, "adjustment {i}");
+            assert_eq!(cached.histogram, fresh.histogram);
+            if i < 4 {
+                assert_eq!(
+                    prepared,
+                    session.preview_prepared.as_ref().unwrap().1.as_ptr()
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "manual local-sample interaction performance comparison"]
     fn benchmark_interaction_preview() {
         use image::ImageEncoder;
@@ -1869,6 +2177,24 @@ mod tests {
             full.sort_by(f64::total_cmp);
             reduced.sort_by(f64::total_cmp);
             eprintln!("INTERACTION+PNG {name} {}x{} -> {}x{}: full median {:.2} ms; preview median {:.2} ms; first {:.2} ms; {:.1}x speedup", baseline.width, baseline.height, preview.width, preview.height, full[3], reduced[3], first, full[3] / reduced[3]);
+            let mut uncached = Vec::new();
+            let mut cached = Vec::new();
+            for i in 0..11 {
+                recipe.sharpen = 5.0 + i as f32 * 0.1;
+                session.preview_prepared = None;
+                let start = std::time::Instant::now();
+                let expected = session.process_preview(&recipe).unwrap();
+                encode(&expected);
+                uncached.push(start.elapsed().as_secs_f64() * 1000.0);
+                let start = std::time::Instant::now();
+                let actual = session.process_preview(&recipe).unwrap();
+                encode(&actual);
+                cached.push(start.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(expected.rgba, actual.rgba);
+            }
+            uncached.sort_by(f64::total_cmp);
+            cached.sort_by(f64::total_cmp);
+            eprintln!("DETAIL+PNG {name}: uncached tone median {:.2} ms; cached tone median {:.2} ms; {:.2}x speedup, identical pixels", uncached[5], cached[5], uncached[5] / cached[5]);
         }
     }
 

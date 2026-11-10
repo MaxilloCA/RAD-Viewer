@@ -8,7 +8,7 @@ import { useRenderedImage } from './useRenderedImage';
 
 const recipe: Recipe = { version: 2, windowCenter: 2048, windowWidth: 4096, gamma: .5, denoise: 0, clahe: .12, localContrast: .4, sharpen: 6, radius: 2.2, threshold: .0015, halo: .35, detailMode: 'radiograph', invert: false, colorize: false };
 const render = (id: string, requestId = 0, preview = false): RenderInfo => ({ id, requestId, preview, url: `${id}/${requestId}`, histogram: [1], clippedLow: 0, clippedHigh: 0, renderMs: 1 });
-const image = (id: string): OpenImage => ({ info: { id, width: 1500, height: 1000, neutral: recipe, decodeMs: 1, metadata: { name: id, format: 'DICOM', bitsStored: 12, signed: false, photometric: 'MONOCHROME2', slope: 1, intercept: 0, windowCenter: null, windowWidth: null, min: 0, max: 4095 } }, path: id, initial: render(id), defaultRecipe: recipe, history: { past: [], present: recipe, future: [] } });
+const image = (id: string): OpenImage => ({ info: { id, width: 1500, height: 1000, neutral: recipe, decodeMs: 1, metadata: { name: id, format: 'DICOM', bitsStored: 12, signed: false, photometric: 'MONOCHROME2', slope: 1, intercept: 0, windowCenter: null, windowWidth: null, min: 0, max: 4095 } }, path: id, initial: render(id), initialRecipe: recipe, defaultRecipe: recipe, history: { past: [], present: recipe, future: [] } });
 type Pending = { args: { id: string; requestId: number; preview: boolean; recipe: Recipe }; resolve: (value: RenderInfo) => void; reject: (error: Error) => void };
 let pending: Pending[];
 beforeEach(() => {
@@ -17,6 +17,28 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 const complete = async (i: number) => act(async () => { const { args, resolve } = pending[i]; resolve(render(args.id, args.requestId, args.preview)); await Promise.resolve(); });
+
+it('does not mistake the initial frame for a recipe edited before mounting', async () => {
+  const active = image('one');
+  active.history = { ...active.history, present: { ...recipe, gamma: .8 } };
+  const { result } = renderHook(() => useRenderedImage(active, active.history.present, vi.fn()));
+  expect(pending).toHaveLength(1);
+  expect(pending[0].args.recipe.gamma).toBe(.8);
+  await complete(0);
+  expect(result.current.processing).toBe(false);
+});
+
+it('reuses the exact edited frame when returning to a still-loaded image', async () => {
+  const first = image('one'); const second = image('two');
+  const edited = { ...recipe, gamma: .6 };
+  const { result, rerender } = renderHook(({ active, value }) => useRenderedImage(active, value, vi.fn()), { initialProps: { active: first, value: edited } });
+  await complete(0);
+  const exact = result.current.rendered;
+  rerender({ active: second, value: recipe });
+  rerender({ active: first, value: edited });
+  expect(pending).toHaveLength(1);
+  expect(result.current.rendered).toBe(exact);
+});
 
 it('coalesces drag positions, removes the 100ms throttle, and refines the final recipe after release', async () => {
   const active = image('one'); const error = vi.fn();

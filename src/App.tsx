@@ -1,22 +1,38 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Dispatch, SetStateAction } from 'react';
+import type { CSSProperties, SetStateAction } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import ComparisonView from './ComparisonView';
+import Icon from './Icon';
+import CalibrationDialog from './CalibrationDialog';
+import { isMac, modifierLabel, selectionModifier, supportsPatientLookup, supportsPrinting, patientLookupUnavailable, printingUnavailable } from './platform';
+import AboutDialog from './AboutDialog';
+import ColorControls from './ColorControls';
+import { useGrayscalePreview, useReferencePicker } from './useColorTools';
+import { colorModeName, withColorMode } from './model';
+import { groupByDate } from './filmstrip';
+import PrintDialog from './PrintDialog';
+import type { PrintImage } from './printLayout';
 import ExportAllDialog from './ExportAllDialog';
+import DeleteDialog from './DeleteDialog';
+import type { DeletePreview } from './DeleteDialog';
+import type { DeleteResult } from './model';
 import type { ExportItem } from './ExportAllDialog';
-import { clamp, commit, contrastValue, dateSourceLabel, dragAdjustment, processingLevel, withProcessingLevel, formatImageDate, orientedDimensions, redo, sameRecipe, sliderPosition, sliderValue, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
-import type { CustomPreset, History, ImageEntry, PatientDiscovery, Recipe, RenderInfo } from './model';
+import { clamp, contrastValue, defaultContrast, defaultGamma, dateSourceLabel, dragAdjustment, processingLevel, withProcessingLevel, formatImageDate, orientedDimensions, redo, sameRecipe, sliderPosition, sliderValue, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
+import type { CustomPreset, History, ImageEntry, ImageInfo, PatientDiscovery, Recipe, RenderInfo } from './model';
 import { useRenderedImage } from './useRenderedImage';
 import { useImageLibrary } from './useImageLibrary';
 import ImagePane, { defaultPaneView, paneGrid } from './ImagePane';
+import { transferChanges, transferRecipe } from './selection';
 import type { PaneView } from './ImagePane';
 import { reconcilePaneOrder, swapPanes } from './workspace';
-import type { Ellipse, ImageTool, Region, ReviewOverlay } from './workspace';
+import type { Calibration, Ellipse, ImageTool, Measurement } from './workspace';
 
 const desktop = isTauri();
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 type View = PaneView;
+type RecipeEdit = (recipe: Recipe, info: ImageInfo) => Recipe;
 
 function PatientOpenDialog({ onClose, onOpen, inline = false }: { onClose: () => void; onOpen: (patient: PatientDiscovery) => Promise<void>; inline?: boolean }) {
   const dialog = useRef<HTMLDialogElement>(null);
@@ -37,12 +53,12 @@ function PatientOpenDialog({ onClose, onOpen, inline = false }: { onClose: () =>
     input.current?.focus();
     return () => { alive.current = false; element?.close(); previousFocus?.focus(); };
   }, []);
-  const submit = async () => {
+  const submit = async (demo = false) => {
     if (pending.current) return;
-    if (!valid) { setError('Enter a patient number containing 2–64 digits only.'); input.current?.focus(); return; }
+    if (!demo && !valid) { setError('Enter a patient number containing 2–64 digits only.'); input.current?.focus(); return; }
     pending.current = true; setBusy('Finding patient radiographs…'); setError(null);
     try {
-      const patient = await invoke<PatientDiscovery>('open_patient', { patientNumber: trimmed });
+      const patient = demo ? await invoke<PatientDiscovery>('open_demo_patient') : await invoke<PatientDiscovery>('open_patient', { patientNumber: trimmed });
       if (!alive.current) return;
       if (!patient.paths.length) throw new Error('No radiographs were found for this patient. Your current images remain open.');
       setBusy('Opening patient…');
@@ -62,6 +78,7 @@ function PatientOpenDialog({ onClose, onOpen, inline = false }: { onClose: () =>
       {error && <p id="patient-number-error" className="patient-dialog-error" role="alert">{error}</p>}
       {busy && <p className="patient-dialog-status" role="status"><span className="spinner" />{busy}</p>}
       <div className="patient-dialog-actions">{!inline && <button type="button" disabled={Boolean(busy)} onClick={onClose}>Cancel</button>}<button type="submit" className="primary" disabled={Boolean(busy) || !desktop}>Open all radiographs</button></div>
+      <button className="demo-open-button" type="button" disabled={Boolean(busy) || !desktop} onClick={() => void submit(true)}>Open John Smith demo</button>
     </form>;
   return inline ? <section className="patient-start" aria-busy={Boolean(busy)}>{form}</section> : <dialog ref={dialog} className="patient-dialog" aria-labelledby="patient-dialog-title" aria-describedby="patient-dialog-description" aria-busy={Boolean(busy)}
     onCancel={event => { event.preventDefault(); if (!pending.current) onClose(); }}
@@ -88,6 +105,7 @@ function Slider({ label, value, min, max, step = .01, center, onChange, onCommit
     <span className={`slider-track ${centered ? 'centered' : ''}`}>
       {centered && <span className="slider-center-tick" aria-hidden="true" />}
       <input type="range" min={centered ? 0 : min} max={centered ? 100 : max} step={centered ? 'any' : step} value={centered ? sliderPosition(value, min, center, max) : clamp(value, min, max)} aria-label={label}
+        style={{ "--range-progress": `${centered ? sliderPosition(value, min, center!, max) : (clamp(value, min, max) - min) / (max - min) * 100}%` } as CSSProperties}
         aria-valuemin={min} aria-valuemax={max} aria-valuenow={value} aria-valuetext={display}
         onChange={event => onChange(centered ? snap(sliderValue(Number(event.target.value), min, center, max)) : Number(event.target.value))}
         onKeyDown={event => {
@@ -107,22 +125,58 @@ export default function App() {
   const [draft, setDraft] = useState<Recipe | null>(null);
   const draftRef = useRef<Recipe | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { entries: images, selectedKey: selected, loading, select: selectImage, append: appendImages, replace: replaceImages, changeHistory: updateHistory, close: closeLibraryImage, dismissPane, rotate: rotateImage, togglePin, cancelAutoOpen, setEllipses, setOverlays, saveStatus, flushSettings, retrySettings } = useImageLibrary(setError);
+  const { entries: images, selectedKey: selected, loading, select: selectImage, append: appendImages, replace: replaceImages, mergePatient, changeHistory: updateHistory, commitRecipes, editRecipes, close: closeLibraryImage, dismissPane, rotate: rotateImage, togglePin, ensurePinned, cancelAutoOpen, setEllipses, saveStatus, flushSettings, retrySettings, removePaths } = useImageLibrary(setError);
+  const [selection, setSelection] = useState<string[]>([]);
+  const draftGroup = useRef<Record<string, Recipe>>({});
+  const commitDraft = useCallback(() => {
+    commitRecipes(draftGroup.current);
+    draftGroup.current = {}; draftRef.current = null; setDraft(null);
+  }, [commitRecipes]);
+  const [comparison, setComparison] = useState<ImageEntry | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshPending = useRef(false);
+  const refreshGeneration = useRef(0);
   const [presets, setPresets] = useState<CustomPreset[]>([]);
   const [presetName, setPresetName] = useState('');
   const [advanced, setAdvanced] = useState(false);
+  const [annotationsVisible, setAnnotationsVisible] = useState(true);
+  const [annotationSelection, setAnnotationSelection] = useState<{ key: string; kind: 'ellipse' | 'measurement' | 'calibration'; value: Ellipse | Measurement | Calibration } | null>(null);
   const [tool, setTool] = useState<ImageTool>('adjust');
+  const [calibrations, setCalibrations] = useState<Record<string, Calibration | undefined>>({});
+  const [calibrationDraft, setCalibrationDraft] = useState<{ key: string; name: string; reference: Measurement } | null>(null);
+  const [measurements, setMeasurements] = useState<Record<string, Measurement[]>>({});
   const [ellipseColor, setEllipseColor] = useState<'red' | 'yellow'>('red');
   const ellipses: Record<string, Ellipse[]> = Object.fromEntries(images.map(entry => [entry.key, entry.ellipses ?? []]));
-  const overlays: Record<string, ReviewOverlay> = Object.fromEntries(images.filter(entry => entry.overlay).map(entry => [entry.key, entry.overlay!]));
-  const [exportJob, setExportJob] = useState<{ items: ExportItem[]; patientName: string } | null>(null);
+  const annotationItems = annotationSelection ? annotationSelection.kind === 'ellipse' ? ellipses[annotationSelection.key] ?? [] : annotationSelection.kind === 'measurement' ? measurements[annotationSelection.key] ?? [] : calibrations[annotationSelection.key] ? [calibrations[annotationSelection.key]!] : [] : [];
+  const annotationIndex = annotationSelection ? (annotationItems as unknown[]).indexOf(annotationSelection.value) : -1;
+  const deleteAnnotation = () => {
+    if (!annotationSelection || annotationIndex < 0) return;
+    const { key, kind, value } = annotationSelection;
+    if (kind === 'ellipse') setEllipses(previous => ({ ...previous, [key]: (previous[key] ?? []).filter(item => item !== value) }));
+    else if (kind === 'measurement') setMeasurements(previous => ({ ...previous, [key]: (previous[key] ?? []).filter(item => item !== value) }));
+    else setCalibrations(previous => ({ ...previous, [key]: undefined }));
+    setAnnotationSelection(null);
+  };
+  useEffect(() => { setAnnotationSelection(null); }, [tool, annotationsVisible, selected]);
+  const [adjustmentsOpen, setAdjustmentsOpen] = useState(true);
+  const [previewsOpen, setPreviewsOpen] = useState(true);
+  const [printImages, setPrintImages] = useState<PrintImage[] | null>(null);
+  const [preparingPrint, setPreparingPrint] = useState(false);
+  const printBusy = useRef(false);
+  const [exportJob, setExportJob] = useState<{ items: ExportItem[]; patientName: string; patientId: string } | null>(null);
+  const [deleteJob, setDeleteJob] = useState<DeletePreview[] | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [preparingDelete, setPreparingDelete] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const deletePending = useRef(false);
+  const previousFullscreen = useRef(false);
+  const deletionReviewOpen = useRef(false);
+  deletionReviewOpen.current = Boolean(deleteJob) || preparingDelete;
   const exportBusy = useRef(false);
   const setExportBusy = useCallback((busy: boolean) => { exportBusy.current = busy; }, []);
   const [closeBlocked, setCloseBlocked] = useState(false);
-  const overlayRequests = useRef<Record<string, number>>({});
-  useEffect(() => () => { overlayRequests.current = {}; }, []);
-  const [sensitivity, setSensitivity] = useState(50);
   const [mouseShortcuts, setMouseShortcuts] = useState(true);
   const [compareHeld, setCompareHeld] = useState(false);
   const [neutralFrame, setNeutralFrame] = useState<RenderInfo | null>(null);
@@ -132,6 +186,7 @@ export default function App() {
   const [move, setMove] = useState<{ source: string | null; target: string | null }>({ source: null, target: null });
   const [dragging, setDragging] = useState(false);
   const [patientDialogOpen, setPatientDialogOpen] = useState(false);
+  const [fullscreenImage, setFullscreenImage] = useState<string | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const fullscreenMode = useRef({ desired: false, applied: false, running: false });
   const requestFullscreen = useCallback(async (next: boolean) => {
@@ -143,10 +198,10 @@ export default function App() {
       while (mode.applied !== mode.desired) {
         const target = mode.desired;
         if (desktop) await invoke('set_viewer_fullscreen', { fullscreen: target });
-        mode.applied = target; setFullscreen(target);
+        mode.applied = target; setFullscreen(target); if (!target) setFullscreenImage(null);
       }
     } catch (problem) {
-      mode.desired = mode.applied;
+      mode.desired = mode.applied; if (!mode.applied) setFullscreenImage(null);
       setError(`Could not change fullscreen mode: ${message(problem)}`);
     } finally { mode.running = false; }
   }, []);
@@ -169,8 +224,10 @@ export default function App() {
   const photometric = active?.info.metadata.photometric ?? 'MONOCHROME2';
   const activeRef = useRef(active); activeRef.current = active;
   const recipeRef = useRef(recipe); recipeRef.current = recipe;
-  const dragRecipe = useRef<{ id: string; start: Recipe; base: Recipe; photometric: string } | null>(null);
+  const dragRecipe = useRef<{ key: string; entries: { key: string; recipe: Recipe; info: ImageInfo }[] } | null>(null);
   const { rendered, processing } = useRenderedImage(active, recipe, setError, Boolean(draft));
+  const gray = useGrayscalePreview(active?.info.id, recipe, setError);
+  const picker = useReferencePicker(JSON.stringify([selected, recipe, comparison?.key, images.map(entry => [entry.key, entry.image?.info.id, entry.history?.present])]), setError);
   useEffect(() => {
     if (!compareHeld || !active) { setNeutralBusy(false); return; }
     const id = active.info.id;
@@ -193,28 +250,46 @@ export default function App() {
     const stored = paneViews[entry.key] ?? defaultPaneView;
     const size = paneSizes[entry.key] ?? { width: 500, height: 500 };
     const dimensions = entry.details ? orientedDimensions(entry.details.width, entry.details.height, entry.rotationQuarterTurns) : null;
-    const fitScale = dimensions ? Math.min((size.width - 28) / dimensions.width, (size.height - 28) / dimensions.height) : 1;
+    const fitScale = dimensions ? Math.min((size.width - 6) / dimensions.width, (size.height - 6) / dimensions.height) : 1;
     return { ...stored, scale: stored.fit ? Math.max(.025, fitScale) : stored.scale };
   };
   const view = selected ? paneViews[selected] ?? defaultPaneView : defaultPaneView;
   const effectiveView = activeEntry ? viewFor(activeEntry) : defaultPaneView;
-  const setView: Dispatch<SetStateAction<View>> = update => {
-    cancelAutoOpen();
-    if (!selected) return;
-    setPaneViews(previous => ({ ...previous, [selected]: typeof update === 'function' ? update(previous[selected] ?? defaultPaneView) : update }));
-  };
-  const updatePaneView = (entry: ImageEntry, update: SetStateAction<View>) => {
+  const updatePaneView = (entry: ImageEntry, update: SetStateAction<View>, group = false) => {
     cancelAutoOpen();
     const current = viewFor(entry);
-    setPaneViews(previous => ({ ...previous, [entry.key]: typeof update === 'function' ? update(current) : update }));
+    const changed = typeof update === 'function' ? update(current) : update;
+    const targets = group && selectedKeys.includes(entry.key) ? selectedEntries : [entry];
+    setPaneViews(previous => {
+      const next = { ...previous, [entry.key]: changed };
+      for (const target of targets) if (target.key !== entry.key) {
+        const other = viewFor(target);
+        next[target.key] = { ...other, fit: changed.fit, scale: clamp(other.scale * changed.scale / current.scale, .025, 8), x: other.x + changed.x - current.x, y: other.y + changed.y - current.y };
+      }
+      return next;
+    });
   };
+  // Pin each newly opened active pane once; respect a subsequent manual unpin.
+  const defaultPinnedSelection = useRef<string | null>(null);
+  useEffect(() => {
+    if (!selected) { defaultPinnedSelection.current = null; return; }
+    if (defaultPinnedSelection.current !== selected && activeEntry?.image) {
+      defaultPinnedSelection.current = selected;
+      void ensurePinned(selected);
+    }
+  }, [selected, activeEntry?.image, ensurePinned]);
   const nativePixelScale = sourcePixelScale(pixelRatio);
   const candidates = [...images.filter(image => image.pinned || image.pinPending).sort((a, b) => (a.pinOrder ?? 0) - (b.pinOrder ?? 0)), ...activeEntry && !activeEntry.pinned && !activeEntry.pinPending ? [activeEntry] : []];
   const orderedKeys = reconcilePaneOrder(paneOrder, candidates.map(entry => entry.key));
   const visibleEntries = orderedKeys.map(key => candidates.find(entry => entry.key === key)!);
   const orderSignature = JSON.stringify(orderedKeys);
   useEffect(() => { setPaneOrder(JSON.parse(orderSignature) as string[]); }, [orderSignature]);
-  const grid = paneGrid(visibleEntries.length, gridSize.width, gridSize.height);
+  const selectedKeys = selection.includes(selected ?? '') ? selection.filter(key => visibleEntries.some(entry => entry.key === key)) : selected ? [selected] : [];
+  const selectedEntries = images.filter(entry => selectedKeys.includes(entry.key));
+  const selectionRef = useRef(selectedKeys); selectionRef.current = selectedKeys;
+  const selectionReady = selectedEntries.length > 0 && selectedEntries.every(entry => entry.history && entry.details);
+  const displayedEntries = fullscreen && fullscreenImage ? visibleEntries.filter(entry => entry.key === fullscreenImage) : visibleEntries;
+  const grid = paneGrid(displayedEntries.length, gridSize.width, gridSize.height);
   const swap = (source: string, target: string) => { cancelAutoOpen(); commitDraft(); setPaneOrder(swapPanes(orderedKeys, source, target)); };
   useEffect(() => {
     const element = gridRef.current;
@@ -234,23 +309,26 @@ export default function App() {
   useEffect(() => { if (desktop) void invoke<CustomPreset[]>('load_presets').then(setPresets).catch(problem => setError(`Could not load saved presets: ${message(problem)}`)); }, []);
 
   const importPaths = useCallback(async (paths: string[]) => {
+    if (deletePending.current || deletionReviewOpen.current) return;
     if (!paths.length) return;
+    refreshGeneration.current++;
     startupCancelled.current = true; setCurrentPatient(null);
-    if (draftRef.current) { const value = draftRef.current; updateHistory(history => commit(history, value)); }
+    commitDraft(); setSelection([]);
     setError(null); setDraft(null); draftRef.current = null; dragRecipe.current = null;
     appendImages(paths);
-  }, [appendImages, updateHistory]);
+  }, [appendImages, commitDraft]);
   const openPatient = useCallback(async (patient: PatientDiscovery) => {
-    if (draftRef.current) { const value = draftRef.current; updateHistory(history => commit(history, value)); }
+    refreshGeneration.current++;
+    commitDraft(); setSelection([]);
     if (!await flushSettings()) throw new Error('Could not save image adjustments. Retry saving before changing patients.');
     setCurrentPatient(patient);
     setError(null); setDraft(null); draftRef.current = null; dragRecipe.current = null;
-    setPaneViews({}); setPaneSizes({}); setPaneOrder([]); overlayRequests.current = {}; setCompareHeld(false); setSensitivity(50); neutralCache.current.clear();
-    await replaceImages(patient.paths, { patientNumber: patient.patientNumber, patientName: patient.patientName, directory: patient.directory }, patient.latestDatePaths);
+    setPaneViews({}); setPaneSizes({}); setPaneOrder([]); setCompareHeld(false); neutralCache.current.clear();
+    await replaceImages(patient.paths, { patientNumber: patient.patientNumber, patientName: patient.patientName, firstName: patient.firstName, lastName: patient.lastName, directory: patient.directory }, patient.latestDatePaths);
     setNotice(patient.warnings.length ? patient.warnings.join('\n') : null);
-  }, [flushSettings, replaceImages, updateHistory]);
+  }, [flushSettings, replaceImages, commitDraft]);
   useEffect(() => {
-    if (!desktop) return;
+    if (!desktop || !supportsPatientLookup) return;
     let cancelled = false;
     const available = () => !cancelled && !startupCancelled.current;
     void (async () => {
@@ -280,68 +358,205 @@ export default function App() {
   const changeHistory = useCallback((operation: (history: History) => History) => {
     if (!activeRef.current) return;
     draftRef.current = null; setDraft(null);
-    updateHistory(operation);
+    draftGroup.current = {};
+    for (const key of selectionRef.current) updateHistory(operation, key);
   }, [updateHistory]);
-  const commitDraft = () => { if (draftRef.current) { const value = draftRef.current; changeHistory(history => commit(history, value)); } };
-  const activateImage = (key: string) => {
+  const activateImage = (key: string, toggle = false) => {
+    commitDraft();
+    if (toggle && selectedKeys.includes(key)) {
+      const remaining = selectedKeys.filter(item => item !== key);
+      if (!remaining.length) return;
+      setSelection(remaining);
+      if (key === selected) {
+        if (activeEntry?.image && !activeEntry.pinned && !activeEntry.pinPending) void togglePin(key, rendered);
+        selectImage(remaining[0]);
+      }
+      return;
+    }
+    setSelection(toggle ? [...selectedKeys, key] : [key]);
     setCompareHeld(false);
-    setSensitivity(overlays[key]?.sensitivity ?? 50);
     // Selecting another visible pane must not remove the working image beside it.
-    if (activeEntry && activeEntry.key !== key && activeEntry.image && !activeEntry.pinned && !activeEntry.pinPending && visibleEntries.some(entry => entry.key === key)) void togglePin(activeEntry.key, rendered);
+    if (activeEntry && activeEntry.key !== key && activeEntry.image && !activeEntry.pinned && !activeEntry.pinPending && (toggle || visibleEntries.some(entry => entry.key === key))) void togglePin(activeEntry.key, rendered);
     commitDraft(); dragRecipe.current = null; selectImage(key); setDraft(null); draftRef.current = null; setError(null);
   };
-  const updateDraft = (value: Recipe) => { cancelAutoOpen(); draftRef.current = value; setDraft(value); };
-  const changeValue = (key: keyof Recipe, value: number | string | boolean) => {
-    if (recipe) updateDraft({ ...recipe, [key]: value, version: key === 'localContrast' || key === 'sharpen' || key === 'colorStrength' || key === 'colorScale' ? 2 : recipe.version });
+  const updateDraft = (value: Recipe, edit?: RecipeEdit) => {
+    cancelAutoOpen();
+    if (!active || !selectionReady) return;
+    for (const entry of selectedEntries) {
+      const current = draftGroup.current[entry.key] ?? entry.history!.present;
+      draftGroup.current[entry.key] = entry.key === selected ? value : edit
+        ? edit(current, entry.details!) : transferChanges(active.history.present, value, active.info, current, entry.details!);
+    }
+    draftRef.current = value; setDraft(value);
   };
-  const applyRecipe = (value: Recipe) => changeHistory(history => commit(history, value));
+  const applyEdit = (edit: RecipeEdit) => {
+    commitDraft();
+    editRecipes(selectedKeys, edit);
+  };
+  const editViews = (update: (view: View) => View) => {
+    cancelAutoOpen(); setPaneViews(previous => { const next = { ...previous }; for (const key of selectedKeys) next[key] = update(previous[key] ?? defaultPaneView); return next; });
+  };
+  const rotateSelection = () => {
+    commitDraft(); for (const key of selectedKeys) rotateImage(key);
+    editViews(previous => ({ ...previous, fit: true, x: 0, y: 0 }));
+  };
+  const resetSelection = () => {
+    commitDraft(); editRecipes(selectedKeys, (_current, _info, defaultRecipe) => defaultRecipe);
+  };
+  const showImageFullscreen = (key: string) => {
+    commitDraft(); setFullscreenImage(key); void requestFullscreen(true);
+  };
+  const changeValue = (key: keyof Recipe, value: number | string | boolean) => {
+    if (recipe) updateDraft({ ...recipe, [key]: value, version: key === 'localContrast' || key === 'sharpen' || key === 'colorStrength' || key === 'colorScale' || key === 'midtoneLevel' ? 2 : recipe.version }, current => ({ ...current, [key]: value, version: key === 'localContrast' || key === 'sharpen' || key === 'colorStrength' || key === 'colorScale' || key === 'midtoneLevel' ? 2 : current.version }));
+  };
+  const applyRecipe = (value: Recipe) => { if (active) applyEdit((_current, info) => transferRecipe(value, active.info, info)); };
   const stepEnhancement = (entry: ImageEntry, direction: number) => {
     if (!entry.details || compareHeld) return;
     commitDraft();
-    const entryBase = entry.details.suggested ?? entry.details.neutral;
-    updateHistory(history => commit(history, withProcessingLevel(history.present, entryBase, processingLevel(history.present, entryBase).level + direction)), entry.key);
-    if (entry.key !== selected) activateImage(entry.key);
-  };
-  const reviewRegion = async (entry: ImageEntry, region: Region, value = sensitivity) => {
-    if (!entry.image) return;
-    const current = overlays[entry.key];
-    if (current && !current.error && (current.url || current.busy) && current.sensitivity === value && JSON.stringify(current.region) === JSON.stringify(region)) return;
-    const request = Date.now() + Math.random(); overlayRequests.current[entry.key] = request;
-    setOverlays(previous => ({ ...previous, [entry.key]: { region, sensitivity: value, visible: true, busy: true } }));
-    try {
-      const result = await invoke<{ url: string; region: Region }>('review_dark_regions', { id: entry.image.info.id, region, sensitivity: value / 100 });
-      if (overlayRequests.current[entry.key] !== request) return;
-      setOverlays(previous => ({ ...previous, [entry.key]: { region: result.region, url: result.url, sensitivity: value, visible: true } }));
-    } catch (problem) { if (overlayRequests.current[entry.key] === request) setOverlays(previous => ({ ...previous, [entry.key]: { region, sensitivity: value, visible: true, error: message(problem) } })); }
+    const targets = selectedKeys.includes(entry.key) ? selectedEntries : [entry];
+    editRecipes(targets.map(target => target.key), (current, info) => {
+      const entryBase = info.suggested ?? info.neutral;
+      return withProcessingLevel(current, entryBase, processingLevel(current, entryBase).level + direction);
+    });
+    if (!selectedKeys.includes(entry.key)) activateImage(entry.key);
   };
   useEffect(() => {
     const down = (event: KeyboardEvent) => {
+      if (comparison || deleteJob || preparingDelete || aboutOpen || patientDialogOpen || calibrationDraft || exportJob || printImages || preparingPrint) return;
       if (event.key === 'F11') {
         event.preventDefault();
         if (!event.repeat && (fullscreenMode.current.desired || (images.length > 0 && !patientDialogOpen))) void requestFullscreen(!fullscreenMode.current.desired);
         return;
       }
       if (event.key === 'Escape' && (fullscreenMode.current.desired || fullscreenMode.current.applied)) { event.preventDefault(); void requestFullscreen(false); return; }
-      if (event.target instanceof Element && event.target.closest('input, textarea, select, dialog')) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (event.defaultPrevented || target?.closest('input:not([type="range"]), textarea, select, dialog, [contenteditable="true"], [role="dialog"]')) return;
+      if (event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && /^[0-7]$/.test(event.key)) {
+        const button = document.querySelector<HTMLButtonElement>(`button[data-processing-stop="${event.key}"]`);
+        if (!button) return;
+        event.preventDefault();
+        if (!event.repeat) button.click();
+        return;
+      }
+      if (target?.closest('input')) return;
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey) {
+        const key = event.key.toLowerCase();
+        if (['a', 'f', 'c', 'q', 'e', 'p', 'o', 'r'].includes(key)) {
+          event.preventDefault();
+          if (!event.repeat) document.querySelector<HTMLButtonElement>(`button[data-shortcut="${key}"]:not(:disabled)`)?.click();
+          return;
+        }
+      }
       if ((event.ctrlKey || event.metaKey) && event.code === 'KeyZ') { event.preventDefault(); changeHistory(event.shiftKey ? redo : undo); }
       if ((event.ctrlKey || event.metaKey) && event.code === 'KeyY') { event.preventDefault(); changeHistory(redo); }
     };
     window.addEventListener('keydown', down); return () => window.removeEventListener('keydown', down);
-  }, [changeHistory, images.length, patientDialogOpen, requestFullscreen]);
+  }, [changeHistory, images.length, patientDialogOpen, requestFullscreen, comparison, deleteJob, preparingDelete, aboutOpen, calibrationDraft, exportJob, printImages, preparingPrint]);
   useEffect(() => {
-    if (fullscreen) document.querySelector<HTMLElement>('.selected-pane .image-viewport')?.focus();
-  }, [fullscreen]);
+    if (fullscreen && !comparison) document.querySelector<HTMLElement>('.image-pane:not([hidden]) .image-viewport')?.focus();
+  }, [fullscreen, comparison]);
+  const refreshPatient = async () => {
+    if (!headerPatient || refreshPending.current) return;
+    const generation = refreshGeneration.current;
+    const identity = headerPatient;
+    refreshPending.current = true; setRefreshing(true); commitDraft();
+    try {
+      const found = identity.patientNumber === 'DEMO' ? await invoke<PatientDiscovery>('open_demo_patient') : await invoke<PatientDiscovery>('open_patient', { patientNumber: identity.patientNumber });
+      if (generation !== refreshGeneration.current) return;
+      const added = mergePatient(found.paths, found);
+      setCurrentPatient(found);
+      setNotice(`${added} new radiograph${added === 1 ? '' : 's'} found.${found.warnings.length ? ' ' + found.warnings.join(' ') : ''}`);
+    } catch (problem) { if (generation === refreshGeneration.current) setError(`Refresh failed: ${message(problem)}`); }
+    finally { refreshPending.current = false; setRefreshing(false); }
+  };
+  const startComparison = async () => {
+    if (!activeEntry?.image) return;
+    commitDraft(); setSelection([activeEntry.key]);
+    setComparison({ ...activeEntry, ellipses: annotationsVisible ? activeEntry.ellipses : [], history: { ...activeEntry.history!, present: recipe! } });
+    await requestFullscreen(true);
+  };
+  const endComparison = () => { setComparison(null); void requestFullscreen(false); };
   const chooseImages = async () => { try { await importPaths(await invoke<string[]>('choose_images')); } catch (problem) { setError(message(problem)); } };
+  const closeDelete = () => {
+    if (deletePending.current) return;
+    setDeleteJob(null); setDeleteError(null);
+    void requestFullscreen(previousFullscreen.current);
+  };
+  const reviewDelete = async () => {
+    if (deletePending.current || deleteJob || preparingDelete || !selectedEntries.length) return;
+    deletePending.current = true; setPreparingDelete(true); commitDraft(); setCompareHeld(false);
+    try {
+      const items: DeletePreview[] = [];
+      const includedPaths = new Set<string>();
+      for (const entry of selectedEntries) {
+        const normalized = entry.path.replace(/\\/g, '/').toLowerCase();
+        if (includedPaths.has(normalized)) continue;
+        includedPaths.add(normalized);
+        if (!entry.details?.sourceSha256 || !entry.history) throw new Error('Wait for selected radiographs to finish loading.');
+        const frame = entry.image
+          ? await invoke<RenderInfo>('render_snapshot', { id: entry.image.info.id, recipe: entry.key === selected ? recipe! : entry.history.present, requestId: Date.now() })
+          : entry.pinnedRender;
+        if (!frame || frame.preview || entry.pinPending || entry.pinError) throw new Error('Wait for selected radiographs to finish updating.');
+        items.push({ entry, url: frame.url });
+      }
+      previousFullscreen.current = fullscreenMode.current.desired;
+      setDeleteError(null); setDeleteJob(items); await requestFullscreen(true);
+    } catch (problem) { setError(`Could not prepare deletion: ${message(problem)}`); }
+    finally { deletePending.current = false; setPreparingDelete(false); }
+  };
+  const confirmDelete = async () => {
+    if (!deleteJob || deletePending.current) return;
+    deletePending.current = true; setDeleteBusy(true); setDeleteError(null);
+    try {
+      if (!await flushSettings()) throw new Error('Could not save adjustments. Retry saving before deleting.');
+      // Invalidate any patient refresh started before this move.
+      refreshGeneration.current++;
+      const results = await invoke<DeleteResult[]>('delete_images', { items: deleteJob.map(({ entry }) => ({ path: entry.path, directory: entry.patient?.directory ?? null, sourceSha256: entry.details!.sourceSha256! })) });
+      const moved = results.filter(result => result.destination).map(result => result.path);
+      await removePaths(moved);
+      setSelection([]); neutralCache.current.clear();
+      const failures = results.filter(result => result.error);
+      const warnings = results.flatMap(result => result.warning ? [result.warning] : []);
+      setNotice(`${moved.length} radiograph${moved.length === 1 ? '' : 's'} moved to DELETED.${warnings.length ? ' ' + warnings.join(' ') : ''}`);
+      if (failures.length) {
+        const failedPaths = new Set(failures.map(result => result.path));
+        setDeleteJob(deleteJob.filter(item => failedPaths.has(item.entry.path)));
+        setDeleteError(failures.map(result => `${result.path}: ${result.error}`).join('\n'));
+      } else {
+        setDeleteJob(null); await requestFullscreen(previousFullscreen.current);
+      }
+    } catch (problem) { setDeleteError(message(problem)); }
+    finally { deletePending.current = false; setDeleteBusy(false); }
+  };
   const exportAll = () => {
     if (exportJob || !visibleEntries.length) return;
     const patientNumbers = new Set(visibleEntries.map(entry => entry.patient?.patientNumber ?? ''));
     if (patientNumbers.size > 1) { setError('Export one patient at a time. Close images from other patients before exporting.'); return; }
     commitDraft();
-    setExportJob({ patientName: visibleEntries[0].patient?.patientName ?? '', items: visibleEntries.map(entry => ({ path: entry.path, sourceSha256: entry.details!.sourceSha256!, appearance: { recipe: entry.key === selected ? recipe! : entry.history!.present, rotationQuarterTurns: entry.rotationQuarterTurns, ellipses: entry.ellipses ?? [], overlay: entry.overlay && !entry.overlay.busy && !entry.overlay.error && entry.overlay.url ? { region: entry.overlay.region, sensitivity: entry.overlay.sensitivity, visible: entry.overlay.visible } : null }, annotationStroke: 3 / viewFor(entry).scale })) });
+    const identity = visibleEntries[0].patient;
+    const exportName = identity?.lastName && identity?.firstName ? `${identity.lastName}, ${identity.firstName}` : identity?.patientName ?? '';
+    setExportJob({ patientName: exportName, patientId: identity?.patientNumber ?? '', items: visibleEntries.map(entry => ({ path: entry.path, sourceSha256: entry.details!.sourceSha256!, appearance: { recipe: entry.key === selected ? recipe! : entry.history!.present, rotationQuarterTurns: entry.rotationQuarterTurns, ellipses: entry.ellipses ?? [], overlay: null }, annotationStroke: 3 / viewFor(entry).scale, view: viewFor(entry) })) });
+  };
+  const preparePrint = async () => {
+    if (preparingPrint || !visibleEntries.length) return;
+    commitDraft(); setPreparingPrint(true); printBusy.current = true;
+    try {
+      const items: PrintImage[] = [];
+      for (const entry of visibleEntries) {
+        const frame = entry.key === selected && entry.image && recipe
+          ? await invoke<RenderInfo>('render_snapshot', { id: entry.image.info.id, recipe, requestId: Date.now() })
+          : entry.pinnedRender;
+        if (!frame || frame.preview || !entry.details || entry.pinError) throw new Error('Wait for all visible images to finish updating before printing.');
+        items.push({ url: frame.url, width: entry.details.width, height: entry.details.height, rotation: entry.rotationQuarterTurns, scale: viewFor(entry).scale, ellipses: entry.ellipses ?? [] });
+      }
+      setPrintImages(items);
+    } catch (problem) { setError(`Print preparation failed: ${message(problem)}`); }
+    finally { setPreparingPrint(false); printBusy.current = false; }
   };
   const closeHandler = useRef<() => Promise<void>>(async () => {});
   closeHandler.current = async () => {
-    if (exportBusy.current) { setNotice('Export is still running. Please wait for it to finish before closing the viewer.'); return; }
+    if (deletePending.current || deleteJob) { setNotice('Finish or cancel the deletion review before closing the viewer.'); return; }
+    if (exportBusy.current || printBusy.current) { setNotice('Printing or export is still running. Please wait before closing the viewer.'); return; }
     commitDraft();
     if (await flushSettings()) await invoke('finish_close'); else { await requestFullscreen(false); setCloseBlocked(true); }
   };
@@ -351,18 +566,37 @@ export default function App() {
     void getCurrentWindow().onCloseRequested(event => { event.preventDefault(); void closeHandler.current().catch(problem => setError(message(problem))); }).then(unlisten => { if (cancelled) unlisten(); else stop = unlisten; }).catch(problem => setError(`Could not enable save-on-close: ${message(problem)}`));
     return () => { cancelled = true; stop?.(); };
   }, []);
-  const restoredSensitivity = overlays[selected ?? '']?.sensitivity ?? 50;
-  useEffect(() => { setSensitivity(restoredSensitivity); }, [selected, restoredSensitivity]);
   const exportImage = async () => {
-    if (!active || !recipe) return;
-    try { const path = await invoke<string | null>('export_image', { id: active.info.id, recipe, rotationQuarterTurns, ellipses: ellipses[selected!] ?? [], annotationStroke: 3 / effectiveView.scale }); if (path) setNotice(`Full-resolution PNG saved with ellipse annotations: ${path}${overlays[selected!]?.visible ? '\nExperimental dark-area overlay is screen-only and is not exported.' : ''}`); }
-    catch (problem) { setError(`Export failed: ${message(problem)}`); }
+    if (!selectionReady || exportBusy.current) return;
+    const patientNumbers = new Set(selectedEntries.map(entry => entry.patient?.patientNumber ?? ''));
+    if (patientNumbers.size > 1) { setError('Export one patient at a time. Select images from only one patient.'); return; }
+    const identity = selectedEntries[0].patient;
+    const patientName = identity?.lastName && identity?.firstName ? `${identity.lastName}, ${identity.firstName}` : identity?.patientName ?? '';
+    commitDraft(); exportBusy.current = true;
+    try {
+      const directory = await invoke<string | null>('choose_jpeg_export_directory', { patientName });
+      if (!directory) return;
+      let count = 0;
+      for (const entry of selectedEntries) {
+        let imported: ImageInfo | undefined;
+        try {
+          if (!entry.image) imported = await invoke<ImageInfo>('import_image', { path: entry.path });
+          const id = entry.image?.info.id ?? imported!.id;
+          if (imported && entry.details?.sourceSha256 && imported.sourceSha256 !== entry.details.sourceSha256) throw new Error(`${entry.name} changed on disk. Reload it before exporting.`);
+          const path = await invoke<string | null>('export_image', { id, directory, recipe: entry.key === selected ? recipe : entry.history!.present, rotationQuarterTurns: entry.rotationQuarterTurns, ellipses: entry.ellipses ?? [], annotationStroke: 3 / viewFor(entry).scale });
+          if (!path) break;
+          count++;
+          setNotice(selectedEntries.length === 1 ? `Full-resolution JPEG (70% quality) saved with adjustments and annotations: ${path}` : `${count} selected radiographs exported as full-resolution JPEGs at 70% quality.`);
+        } finally { if (imported) await invoke('release_image', { id: imported.id }); }
+      }
+    } catch (problem) { setError(`Export failed: ${message(problem)}`); }
+    finally { exportBusy.current = false; }
   };
   const saveReview = async () => {
     if (!active) return;
     try {
       const path = await invoke<string | null>('save_review', { review: { version: 1, processingVersion: recipe?.version ?? 2, createdAt: new Date().toISOString(), qualityAcceptance: 'Pending user review', selectedImageId: active.info.id,
-        paneOrder: visibleEntries.map(image => image.path), images: images.map(image => ({ source: image.path, pinned: Boolean(image.pinned), pinOrder: image.pinOrder, view: viewFor(image), ellipses: ellipses[image.key] ?? [], darkAreaReview: overlays[image.key] ? { region: overlays[image.key].region, sensitivity: overlays[image.key].sensitivity, experimental: true } : null, rotationQuarterTurns: image.rotationQuarterTurns, patient: image.patient, metadata: image.details?.metadata, width: image.details?.width, height: image.details?.height, recipe: image.key === selected ? recipe : image.history?.present ?? null })), view: effectiveView } });
+        paneOrder: visibleEntries.map(image => image.path), images: images.map(image => ({ source: image.path, pinned: Boolean(image.pinned), pinOrder: image.pinOrder, view: viewFor(image), ellipses: ellipses[image.key] ?? [], rotationQuarterTurns: image.rotationQuarterTurns, patient: image.patient, metadata: image.details?.metadata, width: image.details?.width, height: image.details?.height, recipe: image.key === selected ? recipe : image.history?.present ?? null })), view: effectiveView } });
       if (path) setNotice(`Viewer settings saved: ${path}`);
     } catch (problem) { setError(`Save failed: ${message(problem)}`); }
   };
@@ -379,94 +613,126 @@ export default function App() {
     setDraft(null); draftRef.current = null; dragRecipe.current = null;
     setCompareHeld(false);
     if (selected) {
-      delete overlayRequests.current[selected];
       if (active) neutralCache.current.delete(active.info.id);
     }
     await closeLibraryImage();
   };
   const range = (key: keyof Recipe, label: string, min: number, max: number, step?: number, center?: number) => recipe && <Slider label={label} center={center} value={recipe[key] as number} min={min} max={max} step={step} onChange={value => changeValue(key, value)} onCommit={commitDraft} />;
 
-  return <main className={`app-shell${fullscreen ? ' radiographs-fullscreen' : ''}`} onPointerDownCapture={event => { startupCancelled.current = true; if (!(event.target as HTMLElement).closest('.pin-button')) cancelAutoOpen(); }} onKeyDownCapture={event => { if (event.key === 'F11' || event.key === 'Escape') return; startupCancelled.current = true; if (!(event.target as HTMLElement).closest('.pin-button')) cancelAutoOpen(); }} onWheelCapture={cancelAutoOpen}><header className="app-header">
-    <div className="brand"><span className="brand-symbol" aria-hidden="true">R</span><div><strong>RAD <span>Viewer</span></strong><small>RADIOGRAPH VIEWER</small></div></div>
+  return <main className={`app-shell${images.length ? ' has-images' : ''}${fullscreen ? ' radiographs-fullscreen' : ''}`} onPointerDownCapture={event => { startupCancelled.current = true; if (!(event.target as HTMLElement).closest('.pin-button')) cancelAutoOpen(); }} onKeyDownCapture={event => { if (event.key === 'F11' || event.key === 'Escape') return; startupCancelled.current = true; if (!(event.target as HTMLElement).closest('.pin-button')) cancelAutoOpen(); }} onWheelCapture={cancelAutoOpen}><header className="app-header">
+    <div className="brand"><img className="brand-symbol" src="/rad-viewer-icon.svg" alt="" aria-hidden="true" /><div><strong>RAD <span>Viewer</span></strong><small>RADIOGRAPH VIEWER</small></div></div>
     <div className="header-divider" />{headerPatient ? <div className="patient-identity" aria-label="Current patient"><strong title={headerPatient.patientName || 'Name unavailable'}>{headerPatient.patientName || (launchBusy ? 'Loading patient…' : 'Name unavailable')}</strong><small>Patient ID <b>{headerPatient.patientNumber}</b></small></div> : <div className="header-context"><span className="status-dot" />Local processing<small>Original files preserved</small></div>}
-    <div className="header-actions"><button onClick={exportAll} disabled={!visibleEntries.length || compareHeld || visibleEntries.some(entry => !entry.history || !entry.details?.sourceSha256 || entry.overlay?.busy)} title="Export visible radiographs as native-resolution JPGs, quality 7/10">Export all JPGs</button><button onClick={() => void saveReview()} disabled={!active}>Save settings</button><button onClick={() => void exportImage()} disabled={!active}>Export PNG</button><button onClick={() => void chooseImages()} disabled={!desktop}>＋ Open images</button><button className="primary" onClick={() => setPatientDialogOpen(true)} disabled={!desktop}>Open patient</button></div></header>
+    <div className="header-actions">
+      <button data-shortcut="r" title="Reload Images (Ctrl+R)" onClick={() => void refreshPatient()} disabled={!headerPatient || refreshing || preparingDelete}><Icon name="reload" />{refreshing ? 'Reloading…' : 'Reload Images'}</button>
+      <span className="action-separator" role="separator" aria-orientation="vertical" />
+      <button data-shortcut="p" onClick={() => void preparePrint()} title={supportsPrinting ? undefined : printingUnavailable} disabled={!supportsPrinting || !visibleEntries.length || compareHeld || preparingPrint || processing || visibleEntries.some(entry => entry.pinPending || entry.pinError)}><Icon name="print" />{preparingPrint ? 'Preparing…' : 'Print Current View'}</button>
+      <button data-shortcut="e" onClick={exportAll} disabled={!visibleEntries.length || compareHeld || visibleEntries.some(entry => !entry.history || !entry.details?.sourceSha256)} title="Export the visible radiographs together with dates and office logo"><Icon name="letter" />Export for Letter</button>
+      <button onClick={() => void exportImage()} disabled={!selectionReady || compareHeld}><Icon name="export" />Export to JPEG</button>
+      <span className="action-separator" role="separator" aria-orientation="vertical" />
+      <button className="danger" onClick={() => void reviewDelete()} disabled={!desktop || !selectionReady || compareHeld || processing || preparingDelete || selectedEntries.some(entry => !entry.details?.sourceSha256 || entry.pinPending || entry.pinError)}><Icon name="trash" />{preparingDelete ? 'Preparing…' : 'Delete'}</button>
+      <span className="action-separator" role="separator" aria-orientation="vertical" />
+      <button data-shortcut="o" title="Open Images (Ctrl+O)" onClick={() => void chooseImages()} disabled={!desktop || preparingDelete}><Icon name="folder" />Open Images</button>
+      <button className="primary" onClick={() => setPatientDialogOpen(true)} title={supportsPatientLookup ? undefined : patientLookupUnavailable} disabled={!desktop || !supportsPatientLookup || preparingDelete}><Icon name="patient" />Open Patient</button>
+    </div></header>
     {!desktop && <div className="browser-banner"><strong>Desktop application required.</strong> Open RAD Viewer to import local radiographs and use the Rust processing engine. This browser view is the interface only.</div>}
     {error && <div role="alert" className="notice error"><span>{error}</span><button onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
+    {calibrationDraft && <CalibrationDialog imageName={calibrationDraft.name} reference={calibrationDraft.reference} onCancel={() => setCalibrationDraft(null)} onApply={value => { setCalibrations(previous => ({ ...previous, [calibrationDraft.key]: value })); setCalibrationDraft(null); }} />}
     {notice && <div role="status" className="notice"><span>{notice}</span><button onClick={() => setNotice(null)} aria-label="Dismiss notification">×</button></div>}
     <div className="main-body"><div className="workspace"><div className="toolbar">
-      <div className="document-title"><strong>{active?.info.metadata.name ?? activeEntry?.name ?? 'Radiograph workspace'}</strong>{activeEntry && <time className="image-date" title={dateSourceLabel(activeEntry.details?.metadata.dateSource)}>{formatImageDate(activeEntry.details?.metadata.imageDate)}</time>}<span>{active ? `${active.info.metadata.format} · ${active.info.metadata.bitsStored}-bit · ${active.info.metadata.photometric}` : 'Enhanced, full-resolution viewing'}</span></div>
-      <div className="view-tools"><button disabled={!active} aria-label="Rotate 90 degrees clockwise" title="Rotate clockwise; separate from adjustment undo" onClick={() => { commitDraft(); rotateImage(); setView(previous => ({ ...previous, fit: true, x: 0, y: 0 })); }}>↻ Rotate 90°{rotationQuarterTurns ? ` · ${rotationQuarterTurns * 90}°` : ''}</button><button className={view.fit ? 'active' : ''} disabled={!active} onClick={() => setView(previous => ({ ...previous, fit: true, x: 0, y: 0 }))}>Fit</button><button className={!view.fit && Math.abs(view.scale - nativePixelScale) < .00001 ? 'active' : ''} disabled={!active} title="One source pixel per physical display pixel" onClick={() => setView({ scale: nativePixelScale, x: 0, y: 0, fit: false })}>100%</button><span className="zoom-label" title="Source pixels relative to physical display pixels">{active ? `${Math.round(effectiveView.scale * pixelRatio * 100)}%` : '—'}</span></div></div>
-      {activeEntry && <div className="interaction-toolbar" aria-label="Image tools">
-        <div className="tool-modes">{(['adjust', 'pan', 'magnify', 'ellipse'] as const).map(mode => <button key={mode} className={tool === mode ? 'active' : ''} aria-pressed={tool === mode} onClick={() => { commitDraft(); setTool(mode); }}>{({ adjust: 'Adjust', pan: 'Pan', magnify: 'Magnify', ellipse: 'Ellipse' })[mode]}</button>)}</div>
-        {tool === 'ellipse' ? <div className="annotation-tools"><button className={`color-choice red ${ellipseColor === 'red' ? 'active' : ''}`} aria-pressed={ellipseColor === 'red'} onClick={() => setEllipseColor('red')}>Red</button><button className={`color-choice yellow ${ellipseColor === 'yellow' ? 'active' : ''}`} aria-pressed={ellipseColor === 'yellow'} onClick={() => setEllipseColor('yellow')}>Yellow</button><span>3 px</span><button disabled={!ellipses[selected!]?.length} onClick={() => setEllipses(previous => ({ ...previous, [selected!]: (previous[selected!] ?? []).slice(0, -1) }))}>Remove last</button><button disabled={!ellipses[selected!]?.length} onClick={() => setEllipses(previous => ({ ...previous, [selected!]: [] }))}>Clear ellipses</button></div> : <span className="tool-hint">{tool === 'pan' ? 'Drag to move within the image' : tool === 'magnify' ? 'Click to zoom in · Alt-click to zoom out' : tool === 'region' ? 'Draw a rectangle around the tooth area to review' : 'Drag ↔ tone · ↕ gamma'}</span>}
-        <button className="fit-all" disabled={!active} onClick={() => setPaneViews(previous => { const next = { ...previous }; for (const entry of visibleEntries) next[entry.key] = { ...defaultPaneView }; return next; })}>Fit all</button>
-      </div>}
+      <div className="view-tools" aria-label="Image tools">
+        <div className="adjust-tool-group" role="group" aria-label="Image adjustment"><button disabled={!active} className={tool === 'adjust' ? 'active' : ''} aria-pressed={tool === 'adjust'} onClick={() => { commitDraft(); setTool('adjust'); }}><Icon name="adjust" />Adjust</button></div>
+        <div className="tool-modes annotation-tool-group" role="group" aria-label="Annotation controls">{(isMac ? ['ellipse'] as const : ['ellipse', 'measure'] as const).map(mode => <button disabled={!active} key={mode} className={tool === mode ? 'active' : ''} aria-pressed={tool === mode} onClick={() => { commitDraft(); setAnnotationsVisible(true); setTool(mode); }}><Icon name={mode} />{({ ellipse: 'Ellipse', measure: 'Measure' })[mode]}</button>)}
+          <button disabled={!active} aria-pressed={annotationsVisible} title="Show or hide marks in the viewer. Saved annotations and exports are unchanged." onClick={() => { setAnnotationsVisible(value => !value); setTool('adjust'); }}>{annotationsVisible ? 'Hide annotations' : 'Show annotations'}</button>
+          <button disabled={!active} aria-pressed={tool === 'selectAnnotation'} onClick={() => { commitDraft(); setAnnotationsVisible(true); setTool(tool === 'selectAnnotation' ? 'adjust' : 'selectAnnotation'); }}>Select annotation</button>
+          <button disabled={!annotationsVisible || tool !== 'selectAnnotation' || annotationIndex < 0} onClick={deleteAnnotation}>Delete selected annotation</button>
+        </div>
+<button data-shortcut="q" disabled={!active} aria-label="Rotate 90 degrees clockwise" title="Rotate clockwise; separate from adjustment undo" onClick={rotateSelection}><Icon name="rotate" />Rotate 90°{rotationQuarterTurns ? ` · ${rotationQuarterTurns * 90}°` : ''}</button><button className={view.fit ? 'active' : ''} disabled={!active} onClick={() => editViews(previous => ({ ...previous, fit: true, x: 0, y: 0 }))}><Icon name="fit" />Fit</button><button className={!view.fit && Math.abs(view.scale - nativePixelScale) < .00001 ? 'active' : ''} disabled={!active} title="One source pixel per physical display pixel" onClick={() => editViews(() => ({ scale: nativePixelScale, x: 0, y: 0, fit: false }))}>100%</button><button disabled={!active} onClick={() => setPaneViews({})}><Icon name="fitAll" />Fit all</button><button data-shortcut="f" className="fullscreen-button" disabled={!visibleEntries.length} title="Fullscreen (Ctrl+F or F11); Escape returns to the viewer" onClick={() => { commitDraft(); void requestFullscreen(true); }}><Icon name="fullscreen" />Fullscreen</button><button data-shortcut="a" title="A/B comparison (Ctrl+A)" disabled={!active} onClick={() => void startComparison()}><Icon name="compare" />A/B compare</button><span className="zoom-label" title="Source pixels relative to physical display pixels">{active ? `${Math.round(effectiveView.scale * pixelRatio * 100)}%` : '—'}</span></div></div>
+        <div className="annotation-selection-hint">          {tool === 'selectAnnotation' && <span>{annotationIndex >= 0 ? annotationSelection?.kind === 'calibration' ? 'Deleting this reference returns measurements to uncalibrated values.' : 'Selected mark highlighted; delete removes only this mark.' : 'Click an ellipse or measurement to select it.'}</span>}</div>
+        {activeEntry && tool === 'ellipse' && <div className="annotation-tools"><button className={`color-choice red ${ellipseColor === 'red' ? 'active' : ''}`} aria-pressed={ellipseColor === 'red'} onClick={() => setEllipseColor('red')}>Red</button><button className={`color-choice yellow ${ellipseColor === 'yellow' ? 'active' : ''}`} aria-pressed={ellipseColor === 'yellow'} onClick={() => setEllipseColor('yellow')}>Yellow</button><span>3 px</span><button disabled={!ellipses[selected!]?.length} onClick={() => setEllipses(previous => ({ ...previous, [selected!]: (previous[selected!] ?? []).slice(0, -1) }))}>Remove last</button><button disabled={!ellipses[selected!]?.length} onClick={() => setEllipses(previous => ({ ...previous, [selected!]: [] }))}>Clear ellipses</button></div>}
+      {activeEntry && (tool === 'measure' || tool === 'calibrate') && <div className="annotation-tools measurement-tools"><span>{tool === 'calibrate' ? 'Drag across a structure of known length' : calibrations[selected!] ? 'Drag to measure · Calibrated estimates' : 'Drag to measure · Uncalibrated (temporary 1 mm/pixel)'}</span><button aria-pressed={tool === 'calibrate'} onClick={() => { commitDraft(); setTool(tool === 'calibrate' ? 'measure' : 'calibrate'); }}>{tool === 'calibrate' ? 'Cancel calibration' : calibrations[selected!] ? 'Recalibrate' : 'Calibrate'}</button><button disabled={!calibrations[selected!]} onClick={() => setCalibrations(previous => ({ ...previous, [selected!]: undefined }))}>Clear calibration</button><button disabled={!measurements[selected!]?.length} onClick={() => setMeasurements(previous => ({ ...previous, [selected!]: (previous[selected!] ?? []).slice(0, -1) }))}>Remove last</button><button disabled={!measurements[selected!]?.length} onClick={() => setMeasurements(previous => ({ ...previous, [selected!]: [] }))}>Clear measurements</button><span>Session only · not saved, exported or printed</span></div>}
       {visibleEntries.length > 0 ? <div ref={gridRef} className="image-grid" aria-label="Image panes" style={{ gridTemplateColumns: `repeat(${grid.columns}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${grid.rows}, minmax(0, 1fr))` }}>
         {visibleEntries.map(entry => {
           const isActive = entry.key === selected;
-          const paneRender = isActive ? comparing ? neutralFrame : rendered ?? entry.pinnedRender : entry.pinnedRender;
-          return <ImagePane key={entry.key} entry={entry} render={paneRender} active={isActive} view={viewFor(entry)} setView={update => updatePaneView(entry, update)} processing={(isActive && processing) || Boolean(entry.pinPending)} onSize={onPaneSize} pixelRatio={pixelRatio}
-            tool={tool} ellipseColor={ellipseColor} ellipses={ellipses[entry.key]} overlay={overlays[entry.key]} comparing={isActive && compareHeld} mouseShortcuts={mouseShortcuts}
+          const paneRender = isActive ? comparing ? neutralFrame : gray.render ?? rendered ?? entry.pinnedRender : entry.pinnedRender;
+          return <ImagePane key={entry.key} entry={entry} render={paneRender} active={isActive} highlighted={selectedKeys.includes(entry.key)} hidden={fullscreen && Boolean(fullscreenImage) && entry.key !== fullscreenImage} onToggleSelect={() => activateImage(entry.key, true)} onFullscreen={() => showImageFullscreen(entry.key)} view={viewFor(entry)} setView={update => updatePaneView(entry, update, true)} processing={(isActive && processing) || Boolean(entry.pinPending)} onSize={onPaneSize} pixelRatio={pixelRatio}
+            pickingReference={picker.picking} onPickReference={point => { if (!entry.history) return; const original = entry.history.present; const source = entry.image?.info.id ?? (async () => { const info = await invoke<ImageInfo>('import_image', { path: entry.path }); return { id: info.id, dispose: () => invoke('release_image', { id: info.id }) }; }); void picker.sample(source, original, point, level => commitRecipes({ [entry.key]: { ...withColorMode(original, 'midtoneContrast'), colorize: true, midtoneLevel: level } })); }}
+            annotationsVisible={annotationsVisible} selectedAnnotation={annotationSelection?.key === entry.key && annotationIndex >= 0 ? { kind: annotationSelection.kind, index: annotationIndex } : null}
+            onAnnotationSelect={mark => { const value = mark?.kind === 'ellipse' ? entry.ellipses?.[mark.index] : mark?.kind === 'measurement' ? measurements[entry.key]?.[mark.index] : mark ? calibrations[entry.key] : undefined; setAnnotationSelection(mark && value ? { key: entry.key, kind: mark.kind, value } : null); }}
+            tool={tool} ellipseColor={ellipseColor} ellipses={ellipses[entry.key]} comparing={isActive && (compareHeld || gray.held)} mouseShortcuts={mouseShortcuts}
+            measurements={measurements[entry.key]} calibration={calibrations[entry.key]} calibrationReference={calibrationDraft?.key === entry.key ? calibrationDraft.reference : undefined} onMeasurement={line => { if (tool === 'calibrate') { setCalibrationDraft({ key: entry.key, name: entry.name, reference: line }); setTool('measure'); } else setMeasurements(previous => ({ ...previous, [entry.key]: [...(previous[entry.key] ?? []), line] })); }}
             onEllipse={ellipse => setEllipses(previous => ({ ...previous, [entry.key]: [...(previous[entry.key] ?? []), ellipse] }))}
-            onRegion={region => { void reviewRegion(entry, region); setTool('pan'); }}
             onSwap={swap} onMoveOver={(source, target) => { cancelAutoOpen(); setMove({ source, target }); }} moveSource={move.source} moveTarget={move.target}
             onMoveStep={(key, direction) => { const index = orderedKeys.indexOf(key); const target = orderedKeys[index + direction]; if (target) swap(key, target); }}
-            badge={isActive && comparing ? 'Neutral comparison' : isActive ? `${currentPreset ?? 'Enhanced'}${recipe?.colorize ? ' · Local color' : ''}` : 'Enhanced'}
-            onClose={() => { if (isActive) { commitDraft(); setCompareHeld(false); dragRecipe.current = null; } dismissPane(entry.key, orderedKeys.find(key => key !== entry.key) ?? null); }}
-            onEnhance={direction => stepEnhancement(entry, direction)} onSelect={() => activateImage(entry.key)} onRotate={() => { if (isActive) commitDraft(); rotateImage(entry.key); updatePaneView(entry, previous => ({ ...previous, fit: true, x: 0, y: 0 })); }} onPin={() => { if (isActive) commitDraft(); void togglePin(entry.key); }}
-            onAdjustStart={() => { if (isActive && activeRef.current && recipeRef.current) dragRecipe.current = { id: activeRef.current.info.id, start: recipeRef.current, base: activeRef.current.info.suggested ?? activeRef.current.info.neutral, photometric: activeRef.current.info.metadata.photometric }; }}
-            onAdjustMove={(dx, dy) => { const snapshot = dragRecipe.current; if (isActive && snapshot && snapshot.id === activeRef.current?.info.id) updateDraft(dragAdjustment(snapshot.start, snapshot.base, dx, dy, snapshot.photometric)); }}
-            onAdjustEnd={() => { const snapshot = dragRecipe.current; dragRecipe.current = null; if (isActive && snapshot?.id === activeRef.current?.info.id) commitDraft(); }} />;
+            badge={isActive && comparing ? 'Neutral comparison' : isActive ? `${currentPreset ?? 'Enhanced'}${gray.render ? ' · Grayscale preview' : recipe?.colorize ? ` · ${colorModeName(recipe)}` : ''}` : 'Enhanced'}
+            onReset={() => { commitDraft(); editRecipes([entry.key], (_current, _info, defaults) => defaults); }}
+            onClose={() => { setAnnotationSelection(null); setSelection(previous => previous.filter(key => key !== entry.key)); if (isActive) { commitDraft(); setCompareHeld(false); dragRecipe.current = null; } dismissPane(entry.key, orderedKeys.find(key => key !== entry.key) ?? null); }}
+            onEnhance={direction => stepEnhancement(entry, direction)} onSelect={() => activateImage(entry.key)} onRotate={() => { if (isActive) commitDraft(); rotateImage(entry.key); updatePaneView(entry, previous => ({ ...previous, fit: true, x: 0, y: 0 })); }} onPin={() => { if (isActive) commitDraft(); if (entry.pinned && !isActive) setSelection(previous => previous.filter(key => key !== entry.key)); void togglePin(entry.key); }}
+            onAdjustStart={() => {
+              if (!selectionReady || !selectedKeys.includes(entry.key)) return;
+              dragRecipe.current = { key: entry.key, entries: selectedEntries.map(item => ({ key: item.key, recipe: item.key === selected ? recipeRef.current! : item.history!.present, info: item.details! })) };
+            }}
+            onAdjustMove={(dx, dy) => {
+              const snapshot = dragRecipe.current; if (snapshot?.key !== entry.key) return;
+              cancelAutoOpen();
+              for (const item of snapshot.entries) draftGroup.current[item.key] = dragAdjustment(item.recipe, item.info.suggested ?? item.info.neutral, dx, dy);
+              if (selected && draftGroup.current[selected]) { draftRef.current = draftGroup.current[selected]; setDraft(draftGroup.current[selected]); }
+            }}
+            onAdjustEnd={() => { if (dragRecipe.current?.key === entry.key) { dragRecipe.current = null; commitDraft(); } }} />;
         })}
-      </div> : <div className="empty-workspace">{images.length > 0 ? <p>Select a thumbnail below to show a radiograph.</p> : !patientDialogOpen && <PatientOpenDialog inline onClose={() => {}} onOpen={openPatient} />}<button className="text-button" onClick={() => void chooseImages()} disabled={!desktop}>Open radiographs</button><span className="supported-formats">Or drop RVG · PANO · SC · DICOM · PNG · JPEG files</span></div>}
-      <div className="workspace-help"><span>{launchBusy ? <><span className="spinner" /> Finding patient radiographs…</> : loading ? <><span className="spinner" /> {loading}</> : move.source ? 'Drop onto another image to swap positions' : active ? `F11 fullscreen · Ctrl+scroll enhancement · Scroll zooms at pointer · Shift/middle drag pans · Grab ⠿ to swap${mouseShortcuts ? ' · Right-click rotates · Double right-click pins' : ''}` : 'Drop radiographs anywhere in the desktop window'}</span>{activeEntry && <button className="text-button" onClick={() => void closeImage()}>Close selected</button>}</div>
-      <div className="filmstrip" aria-label="Open images">{images.map((image, index) => <button key={image.key} aria-label={`${String(index + 1).padStart(2, '0')} ${image.name}`} aria-describedby={`date-${image.key}`} className={`thumbnail ${selected === image.key ? 'selected' : ''}`} title={image.error ?? image.path} onClick={() => activateImage(image.key)} aria-pressed={selected === image.key}>{image.thumbnail ? <span className={`thumbnail-image ${image.rotationQuarterTurns % 2 ? 'quarter-turned' : ''}`}><img src={image.thumbnail} alt="" style={{ transform: `translate(-50%, -50%) rotate(${image.rotationQuarterTurns * 90}deg)` }} /></span> : <span className="thumbnail-placeholder" aria-hidden="true">{image.error ? 'Unavailable' : 'Loading…'}</span>}<span className="thumbnail-number">{String(index + 1).padStart(2, '0')}</span>{image.pinned && <span className="thumbnail-pin" aria-label="Pinned">◆</span>}<span className="thumbnail-name">{image.name}</span><time id={`date-${image.key}`} className="thumbnail-date" title={dateSourceLabel(image.details?.metadata.dateSource)}>{formatImageDate(image.details?.metadata.imageDate)}</time></button>)}<button className="add-thumbnail" onClick={() => void chooseImages()} disabled={!desktop}><span>＋</span>{images.length ? 'Add images' : 'Open images'}</button></div>
-    </div><aside className="adjustments"><div className="panel-title"><h2>Adjustments</h2><span>NON-DESTRUCTIVE</span></div>
-      {activeEntry && <div className="selected-image-card" aria-label="Adjusting selected image">{activeEntry.thumbnail && <img src={activeEntry.thumbnail} alt="" style={{ transform: `rotate(${rotationQuarterTurns * 90}deg)` }} />}<div><span>EDITING SELECTED IMAGE</span><strong title={activeEntry.name}>{activeEntry.name}</strong><time>{formatImageDate(activeEntry.details?.metadata.imageDate)}</time><small>{activeEntry.pinned ? 'Pinned · stays visible' : 'Working image'}</small></div></div>}
-      <fieldset disabled={!active || compareHeld} className="adjustment-fields">
-      <div className="history-tools"><button disabled={!active?.history.past.length} title="Undo (Ctrl+Z)" onClick={() => changeHistory(undo)}>↶ Undo</button><button disabled={!active?.history.future.length} title="Redo (Ctrl+Y)" onClick={() => changeHistory(redo)}>↷ Redo</button><button onClick={() => active && applyRecipe(active.defaultRecipe)}>Reset</button></div>
-      <div className="section-label">PROCESSING LEVEL</div>
+      </div> : <div className="empty-workspace">{images.length > 0 ? <p>Select a thumbnail below to show a radiograph.</p> : !patientDialogOpen && (supportsPatientLookup ? <PatientOpenDialog inline onClose={() => {}} onOpen={openPatient} /> : <section className="patient-start"><h2>Open local radiographs</h2><p>{patientLookupUnavailable}</p><p>{printingUnavailable}</p><button disabled={!desktop} onClick={() => { void invoke<PatientDiscovery>('open_demo_patient').then(openPatient).catch(problem => setError(message(problem))); }}>Open John Smith demo</button></section>)}<button className="text-button" onClick={() => void chooseImages()} disabled={!desktop}>Open radiographs</button><span className="supported-formats">Or drop RVG · PANO · SC · DICOM · PNG · JPEG files</span></div>}
+      <div className="preview-header"><div className="workspace-help"><span>{launchBusy ? <><span className="spinner" /> Finding patient radiographs…</> : loading ? <><span className="spinner" /> {loading}</> : move.source ? 'Drop onto another image to swap positions' : active ? '' : 'Drop radiographs anywhere in the desktop window'}</span>{activeEntry && <button className="text-button" onClick={() => void closeImage()}>Close selected</button>}</div>
+      <button className="preview-toggle" aria-expanded={previewsOpen} aria-controls="preview-drawer" onClick={() => setPreviewsOpen(value => !value)}><Icon name="chevron" style={{ transform: previewsOpen ? 'rotate(90deg)' : 'rotate(-90deg)' }} />Previews <span className="preview-count">{images.length}</span><span className="visible-count">{visibleEntries.length} visible</span></button></div><div id="preview-drawer" className={`preview-drawer ${previewsOpen ? 'open' : ''}`} inert={!previewsOpen}><div className="filmstrip" aria-label="Open images">{groupByDate(images).map(group => <section className="filmstrip-date-group" key={group.date} aria-label={group.label}><h3>{group.label} <span>{group.items.length}</span></h3><div className="filmstrip-date-images">{group.items.map(({ image, index }) => <button key={image.key} aria-label={`${String(index + 1).padStart(2, '0')} ${image.name}`} aria-describedby={`date-${image.key}`} className={`thumbnail ${selectedKeys.includes(image.key) ? 'selected' : ''}`} title={image.error ?? image.path} onClick={event => activateImage(image.key, selectionModifier(event))} aria-pressed={selectedKeys.includes(image.key)}>{image.thumbnail ? <span className={`thumbnail-image ${image.rotationQuarterTurns % 2 ? 'quarter-turned' : ''}`}><img src={image.thumbnail} alt="" style={{ transform: `translate(-50%, -50%) rotate(${image.rotationQuarterTurns * 90}deg)` }} /></span> : <span className="thumbnail-placeholder" aria-hidden="true">{image.error ? 'Unavailable' : 'Loading…'}</span>}<span className="thumbnail-number">{String(index + 1).padStart(2, '0')}</span>{image.pinned && <span className="thumbnail-pin" aria-label="Pinned"><Icon name="pin" /></span>}<span className="thumbnail-name">{image.name}</span><time id={`date-${image.key}`} className="thumbnail-date" title={dateSourceLabel(image.details?.metadata.dateSource)}>{formatImageDate(image.details?.metadata.imageDate)}</time></button>)}</div></section>)}<button className="add-thumbnail" onClick={() => void chooseImages()} disabled={!desktop}><span>＋</span>{images.length ? 'Add images' : 'Open images'}</button></div>
+    </div></div><button className="adjustments-toggle" aria-label={adjustmentsOpen ? 'Hide adjustments' : 'Show adjustments'} aria-expanded={adjustmentsOpen} aria-controls="adjustments-drawer" onClick={() => setAdjustmentsOpen(value => !value)}><Icon name="chevron" style={{ transform: adjustmentsOpen ? undefined : 'rotate(180deg)' }} /><span>Adjustments</span></button><div id="adjustments-drawer" className={`adjustments-drawer ${adjustmentsOpen ? 'open' : ''}`} inert={!adjustmentsOpen}><aside className="adjustments"><div className="panel-title"><h2>Adjustments</h2><Icon name="adjust" /></div>
+      {activeEntry && <div className="selected-image-card" aria-label="Adjusting selected image">{activeEntry.thumbnail && <img src={activeEntry.thumbnail} alt="" style={{ transform: `rotate(${rotationQuarterTurns * 90}deg)` }} />}<div><strong className="selection-count" role="status">{selectedKeys.length} {selectedKeys.length === 1 ? 'image' : 'images'} selected</strong><strong title={activeEntry.name}>{activeEntry.name}</strong><time>{formatImageDate(activeEntry.details?.metadata.imageDate)}</time></div></div>}
+      <fieldset disabled={!active || !selectionReady || compareHeld} className="adjustment-fields">
+      <div className="history-tools"><button disabled={!selectedEntries.some(entry => entry.history?.past.length)} title={`Undo (${modifierLabel}+Z)`} onClick={() => changeHistory(undo)}><Icon name="undo" />Undo</button><button disabled={!selectedEntries.some(entry => entry.history?.future.length)} title={`Redo (${modifierLabel}+${isMac ? 'Shift+Z' : 'Y'})`} onClick={() => changeHistory(redo)}><Icon name="redo" />Redo</button><button onClick={resetSelection}><Icon name="reset" />Reset</button></div>
       {recipe && base && level && <div className="processing-level">
-        <Slider label="Processing level" value={level.level} min={1} max={7} step={1} formatValue={value => level.exact ? `${value} / 7` : `Custom · near ${value}`} endpoints={['Least processing', 'Most processing']} onChange={value => updateDraft(withProcessingLevel(recipe, base, value))} onCommit={commitDraft} />
-        <div className="processing-stops" aria-hidden="true">{[1, 2, 3, 4, 5, 6, 7].map(stop => <span key={stop} className={level.exact && level.level === stop ? 'active' : ''}>{stop}</span>)}</div>
-        <p className="control-note">Sharpness, contrast and adaptive contrast. Drag each image to adjust tone and gamma independently.</p>
+        <Slider label="Processing level" value={level.level} min={0} max={7} step={1} formatValue={value => level.exact ? `${value} / 7` : `Custom · near ${value}`} endpoints={['No processing', 'Most processing']} onChange={value => updateDraft(withProcessingLevel(recipe, base, value), (current, info) => withProcessingLevel(current, info.suggested ?? info.neutral, value))} onCommit={commitDraft} />
+        <div className="processing-stops" role="group" aria-label="Choose processing level">{[0, 1, 2, 3, 4, 5, 6, 7].map(stop => <button key={stop} data-processing-stop={stop} aria-keyshortcuts={`Control+${stop}`} aria-label={`Processing level ${stop}`} aria-pressed={level.exact && level.level === stop} className={level.exact && level.level === stop ? 'active' : ''} onClick={() => applyEdit((current, info) => withProcessingLevel(current, info.suggested ?? info.neutral, stop))}>{stop}</button>)}</div>
       </div>}
       {currentPreset && <div className="current-recipe" aria-label="Current processing preset"><span>Current: <strong>{currentPreset}</strong></span><span>v{recipe?.version}</span></div>}
-      {recipe && base ? <><div className="section-label">TONE</div>
-        <Slider label="Tone" center={35} value={toneValue(recipe, base, photometric)} min={-100} max={100} step={1} endpoints={['Darker', 'Lighter']} onChange={value => updateDraft(withTone(recipe, base, value, photometric))} onCommit={commitDraft} />
+      {recipe && base ? <>
+        <Slider label="Tone" center={35} value={toneValue(recipe, base, photometric)} min={-100} max={100} step={1} endpoints={['Darker', 'Lighter']} onChange={value => updateDraft(withTone(recipe, base, value, photometric), (current, info) => withTone(current, info.suggested ?? info.neutral, value, info.metadata.photometric))} onCommit={commitDraft} />
       </> : <div className="controls-empty">Open an image to adjust its tone and detail.</div>}
       </fieldset>
-      <button className={`compare-button ${compareHeld ? 'active' : ''}`} disabled={!active} aria-pressed={compareHeld} onPointerDown={event => { if (event.button !== 0) return; commitDraft(); event.currentTarget.setPointerCapture(event.pointerId); setCompareHeld(true); }} onPointerUp={() => setCompareHeld(false)} onPointerCancel={() => setCompareHeld(false)} onLostPointerCapture={() => setCompareHeld(false)} onKeyDown={event => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); setCompareHeld(true); } }} onKeyUp={() => setCompareHeld(false)} onBlur={() => setCompareHeld(false)}>{neutralBusy ? 'Preparing neutral image…' : comparing ? 'Neutral · release to restore' : 'Hold to compare with neutral'}</button>
-      <fieldset disabled={!active || compareHeld} className="adjustment-fields">
-      {recipe && base && <details className="control-section"><summary>Detailed adjustments</summary><div className="control-section-content">{range('gamma', 'Gamma', .1, .9, .01, .5)}
-        <Slider label="Contrast" center={-50} value={contrastValue(recipe, base)} min={-100} max={100} step={1} endpoints={['Softer', 'Stronger']} onChange={value => updateDraft(withContrast(recipe, base, value))} onCommit={commitDraft} />
-        <div className="section-label">DETAIL</div>{range('sharpen', 'Sharpness strength', 1, 10, .1, 6)}
-        <button className={`colorize-button ${recipe.colorize ? 'active' : ''}`} aria-pressed={Boolean(recipe.colorize)} onClick={() => applyRecipe({ ...recipe, colorize: !recipe.colorize, colorStrength: recipe.colorStrength ?? .8, colorScale: recipe.colorScale ?? 8, version: 2 })}>Colorize <span>{recipe.colorize ? 'On' : 'Off'}</span></button>
-        {recipe.colorize && <div className="local-color-controls">
-          <Slider label="Color amount" formatValue={value => `${Math.round(value * 100)}%`} value={recipe.colorStrength ?? .8} min={0} max={1} step={.01} onChange={value => changeValue('colorStrength', value)} onCommit={commitDraft} />
-          <Slider label="Feature size" formatValue={value => `${value} px`} value={recipe.colorScale ?? 8} min={2} max={24} step={1} endpoints={['Small · 2 px', 'Broad · 24 px']} onChange={value => changeValue('colorScale', value)} onCommit={commitDraft} />
-          <div className="color-legend local-color-legend" aria-label="Local contrast color legend"><div><span><i className="color-swatch amber" />Darker than nearby</span><span><i className="color-swatch cyan" />Lighter than nearby</span></div><p>Color emphasizes local midtone differences. Flat areas and extremes stay grayscale.</p></div>
-        </div>}
+      <button className={`compare-button ${compareHeld ? 'active' : ''}`} disabled={!active} aria-pressed={compareHeld} onPointerDown={event => { if (event.button !== 0) return; commitDraft(); event.currentTarget.setPointerCapture(event.pointerId); setCompareHeld(true); }} onPointerUp={() => setCompareHeld(false)} onPointerCancel={() => setCompareHeld(false)} onLostPointerCapture={() => setCompareHeld(false)} onKeyDown={event => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); setCompareHeld(true); } }} onKeyUp={() => setCompareHeld(false)} onBlur={() => setCompareHeld(false)}><Icon name="compare" />{neutralBusy ? 'Preparing neutral image…' : comparing ? 'Neutral · release to restore' : 'Hold to compare with neutral'}</button>
+      <fieldset disabled={!active || !selectionReady || compareHeld} className="adjustment-fields">
+      {recipe && base && <details className="control-section"><summary>Detailed adjustments</summary><div className="control-section-content">{range('gamma', 'Gamma', .1, .9, .01, defaultGamma)}
+        <Slider label="Contrast" center={defaultContrast} value={contrastValue(recipe, base)} min={-100} max={100} step={1} endpoints={['Softer', 'Stronger']} onChange={value => updateDraft(withContrast(recipe, base, value), (current, info) => withContrast(current, info.suggested ?? info.neutral, value))} onCommit={commitDraft} />
+        <div className="section-label">DETAIL</div>{range('sharpen', 'Sharpness strength', 0, 12, .1, 7)}
+        <button data-shortcut="c" title="Colorize (Ctrl+C)" className={`colorize-button ${recipe.colorize ? 'active' : ''}`} aria-pressed={Boolean(recipe.colorize)} onClick={() => applyEdit(current => ({ ...current, colorize: !recipe.colorize, colorStrength: current.colorStrength ?? .8, colorScale: current.colorScale ?? 8, midtoneLevel: current.midtoneLevel ?? null, version: 2 }))}>Colorize <span>{recipe.colorize ? 'On' : 'Off'}</span></button>
+        {recipe.colorize && <ColorControls recipe={recipe} onChange={patch => updateDraft({ ...recipe, ...patch, version: 2 }, current => ({ ...current, ...patch, version: 2 }))}
+          onCommit={commitDraft} onMode={mode => applyEdit(current => withColorMode(current, mode))} picking={picker.picking}
+          onPick={() => { commitDraft(); picker.toggle(); }} onHold={held => { setCompareHeld(false); gray.setHeld(held); }} held={gray.held} busy={gray.busy}/>}
         <button className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}><span>{advanced ? '−' : '+'} Advanced processing</span></button>
-        {advanced && <div className="advanced-controls"><label className="select-control">Detail method<select value={recipe.detailMode} onChange={event => applyRecipe({ ...recipe, detailMode: event.target.value, version: event.target.value === 'radiograph' ? 2 : recipe.version })}><option value="radiograph">Radiograph multiscale</option><option value="unsharp">Unsharp</option><option value="multiscale">Legacy two-scale</option></select></label>
+        {advanced && <div className="advanced-controls"><p className="control-note">Detail method: Radiograph multiscale</p>
           {range('radius', 'Radius / detail scale (px)', .5, 8, .1)}{range('threshold', 'Noise threshold', 0, .05, .0005)}{range('halo', 'Halo suppression', 0, 1)}{range('denoise', 'Noise reduction', 0, 1)}{range('localContrast', 'Local contrast', 0, 1)}{range('clahe', 'Adaptive contrast (CLAHE)', 0, 1)}
-          <label className="checkbox-control"><input type="checkbox" checked={recipe.invert} onChange={event => applyRecipe({ ...recipe, invert: event.target.checked })} /> Invert display</label><p className="control-note">Spatial scales use source pixels and stay unchanged when you zoom.</p></div>}
+          <label className="checkbox-control"><input type="checkbox" checked={recipe.invert} onChange={event => { const invert = event.target.checked; applyEdit(current => ({ ...current, invert })); }} /> Invert display</label><p className="control-note">Spatial scales use source pixels and stay unchanged when you zoom.</p></div>}
       </div></details>}
-      <details className="control-section"><summary>Dark-area review <small>Experimental</small></summary><div className="control-section-content"><p className="review-disclaimer">Not a decay detector. Highlights darker regions within a tooth area you select. Normal anatomy and artifacts can also be highlighted; decay can be missed.</p><button className={tool === 'region' ? 'active region-button' : 'region-button'} aria-pressed={tool === 'region'} onClick={() => { commitDraft(); setTool(tool === 'region' ? 'adjust' : 'region'); }}>Select tooth area</button><p className="control-note">Draw a rectangle around one tooth region, including nearby tooth structure for comparison.</p>
-        <Slider label="Dark-area sensitivity" value={sensitivity} min={0} max={100} step={1} formatValue={value => `${value}%`} onChange={setSensitivity} onCommit={() => { if (activeEntry && overlays[activeEntry.key]) void reviewRegion(activeEntry, overlays[activeEntry.key].region); }} endpoints={['Fewer highlights', 'More highlights']} />
-        {selected && overlays[selected] && <><div className="overlay-actions"><button aria-pressed={overlays[selected].visible} onClick={() => setOverlays(previous => ({ ...previous, [selected]: { ...previous[selected], visible: !previous[selected].visible } }))}>{overlays[selected].visible ? 'Hide overlay' : 'Show overlay'}</button><button onClick={() => { delete overlayRequests.current[selected]; setOverlays(previous => { const next = { ...previous }; delete next[selected]; return next; }); }}>Clear region</button></div>{overlays[selected].busy && <p role="status">Analyzing selected region…</p>}{overlays[selected].error && <p className="review-disclaimer" role="alert">{overlays[selected].error}</p>}</>}
-        <p className="control-note">Yellow → red = increasing local darkness, not disease probability. Screen-only overlay; excluded from PNG exports.</p>
-      </div></details>
       <details className="control-section"><summary>Intensity histogram</summary><div className="control-section-content">{rendered && active && <Histogram render={rendered} pixels={active.info.width * active.info.height} />}<p className="control-note">Monochrome intensity before false color. Clipping includes background.</p></div></details>
       <details className="control-section"><summary>Saved presets</summary><div className="control-section-content">{presets.length > 0 && <label className="select-control"><span className="sr-only">Apply saved preset</span><select value="" onChange={event => { const preset = presets.find(item => item.name === event.target.value); if (preset) applyRecipe(preset.recipe); }}><option value="">Apply a saved preset…</option>{presets.map(preset => <option key={preset.name} value={preset.name}>{preset.name}</option>)}</select></label>}
       <div className="save-preset"><input aria-label="New preset name" placeholder="Name these settings" value={presetName} maxLength={80} onChange={event => setPresetName(event.target.value)} /><button disabled={!active || !presetName.trim()} onClick={() => void savePreset()}>Save</button></div>
       </div></details></fieldset>
-      <details className="control-section"><summary>Mouse shortcuts</summary><div className="control-section-content"><label className="checkbox-control"><input type="checkbox" checked={mouseShortcuts} onChange={event => setMouseShortcuts(event.target.checked)} />Right-click rotates; double right-click pins</label><p className="control-note">Shift or middle-drag pans in every tool. Magnify: click to zoom in, Alt-click to zoom out. Use the grab handle to swap panes.</p></div></details>
-    </aside></div>
-    {exportJob && <ExportAllDialog items={exportJob.items} patientName={exportJob.patientName} onBusy={setExportBusy} onClose={() => setExportJob(null)} />}
+      <button className="save-settings-button" disabled={!active} onClick={() => void saveReview()}><Icon name="save" />Save settings</button>
+      <details className="control-section"><summary>Mouse shortcuts</summary><div className="control-section-content"><label className="checkbox-control"><input type="checkbox" checked={mouseShortcuts} onChange={event => setMouseShortcuts(event.target.checked)} />Right-click rotates; double right-click pins</label><dl className="mouse-shortcuts">
+        <dt>Keyboard shortcuts</dt><dd>Ctrl+A: A/B comparison; Ctrl+F: fullscreen; Ctrl+C: colorize; Ctrl+Q: rotate; Ctrl+E: Export for Letter; Ctrl+P: print; Ctrl+O: open images; Ctrl+R: reload images.</dd><dt>Scroll wheel</dt><dd>Zoom in or out around the pointer.</dd>
+        <dt>Shift + left-drag · Middle-drag</dt><dd>Pan the image in either tool.</dd>
+        <dt>{modifierLabel} + scroll wheel</dt><dd>Increase (up) or decrease (down) the processing level.</dd>
+        <dt>Left-drag in Adjust</dt><dd>Right/left changes contrast; up/down changes gamma.</dd>
+        <dt>{modifierLabel} + left-click</dt><dd>Add or remove an image from the selection. Adjustments apply to all selected images; sliders show the active image’s values.</dd>
+        <dt>Double left-click</dt><dd>Show only that image fullscreen. Esc restores the previous layout; F11 shows all visible images fullscreen.</dd>
+        <dt>Right-click · Double right-click</dt><dd>Rotate 90° or toggle the pin on the clicked image, even when it is not selected.</dd>
+        <dt>Drag an image header</dt><dd>Drop onto another image to swap positions. Arrow keys on a focused title also reorder.</dd>
+      </dl></div></details>
+    </aside></div></div>
+    {comparison && <ComparisonView entry={comparison} onClose={endComparison} onApply={(value, rotation) => { commitRecipes({ [comparison.key]: value }); for (let i = 0; i < (rotation - comparison.rotationQuarterTurns + 4) % 4; i++) rotateImage(comparison.key); endComparison(); }} />}
+    {deleteJob && <DeleteDialog items={deleteJob} busy={deleteBusy} error={deleteError} onClose={closeDelete} onConfirm={() => void confirmDelete()} />}
+    {printImages && <PrintDialog images={printImages} onBusy={busy => { printBusy.current = busy; }} onClose={() => setPrintImages(null)} />}
+    {exportJob && <ExportAllDialog items={exportJob.items} patientName={exportJob.patientName} patientId={exportJob.patientId} onBusy={setExportBusy} onClose={() => setExportJob(null)} />}
     {closeBlocked && <div className="notice error" role="alert"><span>Some adjustments could not be saved. Keep the viewer open to retry, or close without saving those changes.</span><button onClick={() => { void retrySettings().then(ok => { if (ok) void invoke('finish_close'); }); }}>Retry and close</button><button onClick={() => void invoke('finish_close')}>Close without saving</button><button onClick={() => setCloseBlocked(false)}>Keep open</button></div>}
-    <footer className="status-bar"><span className="autosave-status" role="status">{saveStatus === 'saving' ? <><span className="spinner" /> Saving adjustments…</> : saveStatus === 'error' ? <>Adjustments not saved <button onClick={() => void retrySettings()}>Retry save</button></> : images.some(entry => entry.settingsBlocked) ? 'Saved adjustments unavailable for some images' : 'Adjustments saved automatically · XML beside originals'}</span><span><span className="status-dot amber" />Image-quality review pending</span><span>{active ? `${Math.round(active.info.decodeMs)} ms decode · ${Math.round(rendered?.renderMs ?? 0)} ms processing · ${images.length} image${images.length === 1 ? '' : 's'}` : 'Offline · CPU processing'}</span></footer>
+    <footer className="status-bar"><span className="autosave-status" role="status">{saveStatus === 'saving' ? <><span className="spinner" /> Saving adjustments…</> : saveStatus === 'error' ? <>Adjustments not saved <button onClick={() => void retrySettings()}>Retry save</button></> : images.some(entry => entry.settingsBlocked) ? 'Saved adjustments unavailable for some images' : <><Icon name="check" />Saved</>}</span><span className="status-shortcuts">Scroll to zoom<span>·</span>Shift + drag to pan<span>·</span>{modifierLabel} + click to select<span>·</span>F11 fullscreen</span><button className="about-trigger" onClick={() => { commitDraft(); setAboutOpen(true); }}>About &amp; help</button></footer>
     {dragging && <div className="drop-overlay"><strong>Drop radiographs to open</strong><span>RVG · PANO · SC · DICOM · PNG · JPEG</span></div>}
     {patientDialogOpen && <PatientOpenDialog onClose={() => setPatientDialogOpen(false)} onOpen={openPatient} />}
+    {aboutOpen && <AboutDialog onClose={() => setAboutOpen(false)} />}
   </main>;
 }

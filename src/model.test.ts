@@ -1,8 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { commit, processingLevels, processingLevel, withProcessingLevel, contrastValue, dragAdjustment, experimentalPreset, formatImageDate, dateSourceLabel, orientedDimensions, redo, sameRecipe, sliderPosition, sliderValue, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
+import { commit, processingLevels, processingLevel, withProcessingLevel, withRadiographDetail, contrastValue, dragAdjustment, experimentalPreset, formatImageDate, dateSourceLabel, orientedDimensions, redo, sameRecipe, sliderPosition, sliderValue, sourcePixelScale, toneValue, undo, withContrast, withTone } from './model';
 import type { Recipe } from './model';
 
 const neutral: Recipe = { version: 1, windowCenter: 2048, windowWidth: 4096, gamma: 1, denoise: 0, localContrast: 0, clahe: 0, sharpen: 0, radius: 2, threshold: .01, halo: .7, detailMode: 'unsharp', invert: false, colorize: false };
+
+it('migrates legacy detail methods without changing numerical or color adjustments',()=>{
+  for(const version of [1,2])for(const detailMode of ['unsharp','multiscale','radiograph']){
+    const legacy={...neutral,version,detailMode,gamma:.63,sharpen:2.5,radius:3.1,colorize:true,colorStrength:.42};
+    const before={...legacy};
+    const fixed=withRadiographDetail(legacy);
+    expect(fixed).toEqual({...legacy,version:2,detailMode:'radiograph'});
+    expect(legacy).toEqual(before);
+    expect(withRadiographDetail(fixed)).toBe(fixed);
+  }
+});
 
 describe('Low, Med, and High adjustment presets', () => {
   it('increases enhancement while darkening midtones, and restores the earlier default sharpening', () => {
@@ -25,7 +36,7 @@ describe('Low, Med, and High adjustment presets', () => {
       const original = { ...base };
       for (const [name, gamma, sharpen, tone, contrast, localContrast, radius, threshold] of [['low', .7, 3, 45, -75, .2, 2.2, .0015], ['med', .5, 6, 35, -50, .4, 2.2, .0015], ['high', .22, 8, 0, 0, .5, 2.5, .001]] as const) {
         const preset = experimentalPreset(name, neutral, base);
-        expect(preset).toMatchObject({ version: 2, gamma, sharpen, localContrast, radius, threshold, halo: .35, denoise: 0, clahe: 0, detailMode: 'radiograph', colorize: false, colorStrength: .8, colorScale: 8 });
+        expect(preset).toMatchObject({ version: 2, gamma, sharpen, localContrast, radius, threshold, halo: .35, denoise: 0, clahe: 0, detailMode: 'radiograph', colorize: false, colorStrength: .4, colorScale: 8 });
         expect(toneValue(preset, base)).toBeCloseTo(tone, 12);
         expect(contrastValue(preset, base)).toBeCloseTo(contrast, 12);
         expect(preset.windowCenter).toBeCloseTo(base.windowCenter - base.windowWidth * .25 * tone / 100, 12);
@@ -134,21 +145,24 @@ describe('non-destructive per-image adjustment history', () => {
     expect(contrastValue(withContrast(enhanced, neutral, 40), neutral)).toBeCloseTo(40);
     expect(neutral.windowCenter).toBe(2048);
   });
-  it('keeps rightward tone brighter for both polarities and inverted display', () => {
-    const start = experimentalPreset('bitewing', neutral);
-    expect(dragAdjustment(start, neutral, 100, 0, 'MONOCHROME2').windowCenter).toBeLessThan(start.windowCenter);
-    expect(dragAdjustment(start, neutral, 100, 0, 'MONOCHROME1').windowCenter).toBeGreaterThan(start.windowCenter);
-    expect(dragAdjustment({ ...start, invert: true }, neutral, 100, 0, 'MONOCHROME2').windowCenter).toBeGreaterThan(start.windowCenter);
-    expect(dragAdjustment({ ...start, invert: true }, neutral, 100, 0, 'MONOCHROME1').windowCenter).toBeLessThan(start.windowCenter);
+  it('increases contrast rightward without changing tone or gamma, including inverted display', () => {
+    for (const invert of [false, true]) {
+      const start = { ...experimentalPreset('bitewing', neutral), invert };
+      const right = dragAdjustment(start, neutral, 100, 0);
+      expect(right.windowWidth).toBeLessThan(start.windowWidth);
+      expect(right.windowCenter).toBe(start.windowCenter);
+      expect(right.gamma).toBe(start.gamma);
+      expect(dragAdjustment(start, neutral, -100, 0).windowWidth).toBeGreaterThan(start.windowWidth);
+    }
   });
-  it('uses captured drag coordinates with bounded gamma and tone', () => {
+  it('uses captured drag coordinates with bounded gamma and contrast', () => {
     const start = experimentalPreset('bitewing', neutral);
     expect(dragAdjustment(start, neutral, 0, -80).gamma).toBeCloseTo(.42);
     expect(dragAdjustment(start, neutral, 0, -160).gamma).toBeCloseTo(.62);
     expect(dragAdjustment(start, neutral, 100000, -100000).gamma).toBe(.9);
     expect(dragAdjustment(start, neutral, -100000, 100000).gamma).toBe(.1);
-    expect(toneValue(dragAdjustment(start, neutral, 100000, 0), neutral)).toBe(100);
-    expect(toneValue(dragAdjustment(start, neutral, -100000, 0), neutral)).toBe(-100);
+    expect(contrastValue(dragAdjustment(start, neutral, 100000, 0), neutral)).toBe(100);
+    expect(contrastValue(dragAdjustment(start, neutral, -100000, 0), neutral)).toBe(-100);
   });
   it('preserves legacy out-of-range values on an unmoved axis', () => {
     const legacy = { ...neutral, gamma: 1.2, windowCenter: neutral.windowCenter + neutral.windowWidth };
@@ -185,7 +199,11 @@ describe('local color recipe compatibility', () => {
     expect(sameRecipe(neutral, { ...neutral, colorStrength: .8, colorScale: 8 })).toBe(true);
     expect(sameRecipe(neutral, { ...neutral, colorStrength: .5 })).toBe(false);
     expect(sameRecipe(neutral, { ...neutral, colorScale: 12 })).toBe(false);
-    expect(experimentalPreset('bitewing', neutral)).toMatchObject({ colorStrength: .8, colorScale: 8 });
+    expect(sameRecipe(neutral, { ...neutral, colorMode: 'local', midtoneWidth: .15 })).toBe(true);
+    expect(sameRecipe({ ...neutral, midtoneLevel: .5 }, { ...neutral, midtoneLevel: .5, colorMode: 'midtone' })).toBe(true);
+    expect(sameRecipe(neutral, { ...neutral, colorMode: 'midtoneContrast' })).toBe(false);
+    expect(sameRecipe(neutral, { ...neutral, midtoneWidth: .05 })).toBe(false);
+    expect(experimentalPreset('bitewing', neutral)).toMatchObject({ colorStrength: .4, colorScale: 8 });
     const legacy = { past: [], present: neutral, future: [] };
     expect(commit(legacy, { ...neutral, colorStrength: .8, colorScale: 8 })).toBe(legacy);
   });
@@ -193,6 +211,17 @@ describe('local color recipe compatibility', () => {
 
 
 describe('seven processing levels', () => {
+  it('uses old levels two through seven as new levels one through six and adds a stronger seventh', () => {
+    expect(processingLevels.slice(1, 7)).toEqual([
+      { sharpen: 2.5, contrast: -75, localContrast: .12, clahe: .04 },
+      { sharpen: 4, contrast: -62.5, localContrast: .26, clahe: .08 },
+      { sharpen: 6, contrast: -50, localContrast: .4, clahe: .12 },
+      { sharpen: 7, contrast: -30, localContrast: .5, clahe: .18 },
+      { sharpen: 8.5, contrast: -10, localContrast: .6, clahe: .24 },
+      { sharpen: 10, contrast: 15, localContrast: .7, clahe: .3 },
+    ]);
+    for (const key of ['sharpen', 'contrast', 'localContrast', 'clahe'] as const) expect(processingLevels[7][key]).toBeGreaterThan(processingLevels[6][key]);
+  });
   it('progresses processing monotonically and preserves all independent settings at every stop', () => {
     for (const photometric of ['MONOCHROME1', 'MONOCHROME2']) {
       const source = { ...neutral, gamma: .62, windowCenter: 1812, colorize: true, colorStrength: .31, colorScale: 17, invert: true, denoise: .3 };
@@ -209,12 +238,23 @@ describe('seven processing levels', () => {
       }
       expect(source.windowCenter).toBe(1812);
     }
-    expect(processingLevels).toHaveLength(7);
+    expect(processingLevels).toHaveLength(8);
   });
-  it('keeps the stop after tone/gamma drags and recognizes manually customized processing', () => {
+  it('keeps the stop after gamma drags and recognizes manually customized processing', () => {
     const level = withProcessingLevel(neutral, neutral, 4);
-    expect(processingLevel(dragAdjustment(level, neutral, 40, -60), neutral)).toEqual({ level: 4, exact: true });
+    expect(processingLevel(dragAdjustment(level, neutral, 0, -60), neutral)).toEqual({ level: 4, exact: true });
     expect(processingLevel({ ...level, sharpen: 6.1 }, neutral).exact).toBe(false);
     expect(withProcessingLevel(neutral, neutral, 999)).toEqual(withProcessingLevel(neutral, neutral, 7));
   });
+});
+
+
+it('level zero disables enhancement and noise filtering while preserving display settings', () => {
+  const source = { ...withProcessingLevel(neutral, neutral, 7), denoise: .8, gamma: .63, windowCenter: 1812, colorize: true, invert: true };
+  for (const stop of [0, -10, .4]) {
+    const zero = withProcessingLevel(source, neutral, stop);
+    expect(zero).toMatchObject({ sharpen: 0, denoise: 0, localContrast: 0, clahe: 0, windowWidth: neutral.windowWidth, gamma: .63, windowCenter: 1812, colorize: true, invert: true });
+    expect(processingLevel(zero, neutral)).toEqual({ level: 0, exact: true });
+    expect(processingLevel({ ...zero, denoise: .3 }, neutral).exact).toBe(false);
+  }
 });

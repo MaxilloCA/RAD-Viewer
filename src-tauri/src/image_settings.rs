@@ -272,6 +272,10 @@ mod tests {
         value.recipe.gamma = 0.7;
         value.recipe.version = 2;
         value.recipe.colorize = true;
+        value.recipe.midtone_level = Some(0.65);
+        value.recipe.color_mode = Some("midtoneContrast".into());
+        value.recipe.midtone_width = 0.07;
+        value.recipe.color_strength = 0.4;
         let source = root.path().join("source.png");
         let hash = fingerprint(&source).unwrap();
         let path = sidecar(&source).unwrap();

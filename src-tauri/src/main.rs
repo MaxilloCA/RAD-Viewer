@@ -2,7 +2,7 @@
 
 use image::ImageEncoder;
 use rad_core::processing::ProcessingSession;
-use rad_core::review::{dark_regions, draw_ellipses, Ellipse, Region};
+use rad_core::review::{draw_ellipses, Ellipse};
 use rad_core::{decode, process, suggested_recipe, ImageMetadata, Recipe, SourceImage};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,10 +13,13 @@ use std::{
 };
 use tauri::{Manager, State};
 use tokio::sync::Semaphore;
+mod deleted;
+mod demo;
 mod image_settings;
 mod jpg_export;
 mod launch;
 mod patient;
+mod printing;
 
 #[derive(Clone)]
 struct SettingsTarget {
@@ -73,45 +76,6 @@ fn set_viewer_title(window: tauri::Window, title: String) -> Result<(), String> 
         .map_err(|e| e.to_string())
 }
 
-#[derive(Serialize)]
-struct DarkRegionResult {
-    region: Region,
-    url: String,
-}
-
-#[tauri::command]
-async fn review_dark_regions(
-    id: String,
-    region: Region,
-    sensitivity: f32,
-    state: State<'_, AppState>,
-) -> Result<DarkRegionResult, String> {
-    let source = state
-        .images
-        .lock()
-        .unwrap()
-        .get(&id)
-        .ok_or("Image is closed")?
-        .source
-        .clone();
-    let permit = state
-        .workers
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|e| e.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _permit = permit;
-        let overlay = dark_regions(&source, region, sensitivity)?;
-        Ok(DarkRegionResult {
-            region,
-            url: snapshot_data_url(&png(&overlay)?),
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 #[tauri::command]
 fn launch_patient_number(state: State<'_, LaunchPatientNumber>) -> Result<Option<String>, String> {
     state.0.clone()
@@ -124,7 +88,7 @@ struct Entry {
 }
 #[derive(Clone)]
 struct Cached {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     info: RenderInfo,
     image_id: String,
     neutral: bool,
@@ -182,6 +146,40 @@ struct CustomPreset {
     recipe: Recipe,
 }
 
+fn validate_presets(presets: &[CustomPreset]) -> Result<(), String> {
+    if presets.len() > 100
+        || presets
+            .iter()
+            .any(|p| p.name.trim().is_empty() || p.name.len() > 100)
+    {
+        return Err("Use up to 100 named presets (100 characters each).".into());
+    }
+    for preset in presets {
+        preset.recipe.validate()?;
+    }
+    Ok(())
+}
+
+fn read_presets(path: &Path) -> Result<Vec<CustomPreset>, String> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut bytes = Vec::new();
+    file.take(1_000_001)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 1_000_000 {
+        return Err("Custom preset file is too large".into());
+    }
+    let presets = serde_json::from_slice::<Vec<CustomPreset>>(&bytes)
+        .map_err(|e| format!("Cannot load custom presets: {e}"))?;
+    validate_presets(&presets)?;
+    Ok(presets)
+}
+
 fn png(render: &rad_core::RenderedImage) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     image::codecs::png::PngEncoder::new_with_quality(
@@ -199,6 +197,7 @@ fn png(render: &rad_core::RenderedImage) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn export_png(render: &rad_core::RenderedImage, quarter_turns: u8) -> Result<Vec<u8>, String> {
     if quarter_turns == 0 {
         return png(render);
@@ -229,6 +228,15 @@ async fn choose_images() -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn delete_images(
+    items: Vec<deleted::DeleteItem>,
+) -> Result<Vec<deleted::DeleteResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || deleted::move_images(items))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn pick_radiographs(directory: Option<&Path>) -> Vec<String> {
     let mut dialog = rfd::FileDialog::new().set_title("Open radiographs");
     if let Some(directory) = directory {
@@ -245,6 +253,7 @@ fn pick_radiographs(directory: Option<&Path>) -> Vec<String> {
         .pick_files()
         .unwrap_or_default()
         .iter()
+        .filter(|p| !deleted::is_deleted(p))
         .map(|p| p.to_string_lossy().into_owned())
         .collect()
 }
@@ -315,10 +324,39 @@ fn discover_patient(
 }
 
 #[tauri::command]
+async fn open_demo_patient(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<patient::PatientStudy, String> {
+    let root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("Samples");
+    let protected_sources = state.source_paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let study = demo::open(&root)?;
+        let mut sources = protected_sources.lock().unwrap();
+        for path in &study.paths {
+            let path = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+            if !sources.contains(&path) {
+                sources.push(path);
+            }
+        }
+        Ok(study)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn open_patient(
     patient_number: String,
     state: State<'_, AppState>,
 ) -> Result<patient::PatientStudy, String> {
+    if !cfg!(windows) {
+        return Err("Patient-number lookup is unavailable on macOS. Use Open Images to choose local radiographs.".into());
+    }
     let protected_sources = state.source_paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let study = discover_patient(
@@ -355,6 +393,10 @@ async fn choose_reference() -> Result<Option<String>, String> {
 }
 #[tauri::command]
 async fn import_image(path: String, state: State<'_, AppState>) -> Result<ImageInfo, String> {
+    let resolved = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    if deleted::is_deleted(&resolved) {
+        return Err("Files in DELETED are excluded from the viewer.".into());
+    }
     if state.images.lock().unwrap().len() >= 24 {
         return Err("Close an image before opening more (24 image limit).".into());
     }
@@ -389,14 +431,10 @@ async fn import_image(path: String, state: State<'_, AppState>) -> Result<ImageI
                             Some(format!("Could not restore saved adjustments: {error}")),
                         ),
                     };
+                // Older sidecars remain readable, but the retired review overlay
+                // is never restored or rendered by this version.
                 if let Some((_, appearance)) = &mut saved {
-                    if let Some(overlay) = &mut appearance.overlay {
-                        let result = dark_regions(&s, overlay.region, overlay.sensitivity / 100.0)
-                            .and_then(|r| png(&r));
-                        if let Ok(bytes) = result {
-                            overlay.url = Some(snapshot_data_url(&bytes));
-                        }
-                    }
+                    appearance.overlay = None;
                 }
                 Ok((s, suggested, elapsed, hash, saved, settings_error))
             })
@@ -497,7 +535,7 @@ async fn render_image(
     let info = RenderInfo {
         id: id.clone(),
         request_id,
-        url: format!("http://rad.localhost/{token}"),
+        url: render_url(&token),
         histogram: render.histogram,
         clipped_low: render.clipped_low,
         clipped_high: render.clipped_high,
@@ -509,7 +547,7 @@ async fn render_image(
     cache.insert(
         key,
         Cached {
-            bytes,
+            bytes: Arc::new(bytes),
             info: info.clone(),
             image_id: id,
             neutral,
@@ -561,12 +599,55 @@ async fn processing_slot(
 }
 
 #[tauri::command]
+async fn sample_reference(
+    id: String,
+    recipe: Recipe,
+    x: u32,
+    y: u32,
+    state: State<'_, AppState>,
+) -> Result<f32, String> {
+    let processor = state
+        .images
+        .lock()
+        .unwrap()
+        .get(&id)
+        .ok_or("Image is closed")?
+        .processor
+        .clone();
+    let processor = processor.lock_owned().await;
+    let permit = state
+        .workers
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        processor.sample_reference(&recipe, x, y)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn render_snapshot(
     id: String,
     recipe: Recipe,
     request_id: u64,
     state: State<'_, AppState>,
 ) -> Result<RenderInfo, String> {
+    // Pins often follow an exact render of this recipe. Reuse its lossless
+    // pixels instead of processing and encoding the source a second time.
+    let key = format!(
+        "{id}:false:{}",
+        serde_json::to_string(&recipe).map_err(|e| e.to_string())?
+    );
+    let cached = state.renders.lock().unwrap().get(&key).cloned();
+    if let Some(cached) = cached {
+        return tauri::async_runtime::spawn_blocking(move || cached_snapshot(cached, request_id))
+            .await
+            .map_err(|e| e.to_string());
+    }
     let processor = state
         .images
         .lock()
@@ -602,6 +683,14 @@ async fn render_snapshot(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+fn cached_snapshot(cached: Cached, request_id: u64) -> RenderInfo {
+    RenderInfo {
+        request_id,
+        url: snapshot_data_url(&cached.bytes),
+        ..cached.info
+    }
 }
 
 fn snapshot_data_url(bytes: &[u8]) -> String {
@@ -687,30 +776,23 @@ async fn load_presets(app: tauri::AppHandle) -> Result<Vec<CustomPreset>, String
         .app_config_dir()
         .map_err(|e| e.to_string())?
         .join("presets-v1.json");
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-    serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("Cannot load custom presets: {e}"))
+    tauri::async_runtime::spawn_blocking(move || read_presets(&path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 #[tauri::command]
 async fn save_presets(presets: Vec<CustomPreset>, app: tauri::AppHandle) -> Result<(), String> {
-    if presets.len() > 100
-        || presets
-            .iter()
-            .any(|p| p.name.trim().is_empty() || p.name.len() > 100)
-    {
-        return Err("Use up to 100 named presets (100 characters each).".into());
-    }
-    for preset in &presets {
-        preset.recipe.validate()?;
-    }
+    validate_presets(&presets)?;
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    atomic_write(
-        &dir.join("presets-v1.json"),
-        &serde_json::to_vec_pretty(&presets).map_err(|e| e.to_string())?,
-    )
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        atomic_write(
+            &dir.join("presets-v1.json"),
+            &serde_json::to_vec_pretty(&presets).map_err(|e| e.to_string())?,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 fn protects_source(path: &Path, sources: &[PathBuf]) -> bool {
     let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -724,6 +806,7 @@ fn protects_source(path: &Path, sources: &[PathBuf]) -> bool {
 #[tauri::command]
 async fn export_image(
     id: String,
+    directory: String,
     recipe: Recipe,
     rotation_quarter_turns: Option<u8>,
     ellipses: Option<Vec<Ellipse>>,
@@ -743,6 +826,7 @@ async fn export_image(
         .source
         .clone();
     let source_paths = state.source_paths.clone();
+    let directory = PathBuf::from(directory);
     let permit = state
         .workers
         .clone()
@@ -751,26 +835,20 @@ async fn export_image(
         .map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Export full resolution adjusted image")
-            .set_file_name("radiograph-adjusted.png")
-            .add_filter("PNG", &["png"])
-            .save_file()
-        else {
-            return Ok(None);
-        };
         let mut render = process(&source, &recipe)?;
         draw_ellipses(
             &mut render,
             &ellipses.unwrap_or_default(),
             annotation_stroke.unwrap_or(3.0),
         )?;
-        let bytes = export_png(&render, quarter_turns)?;
+        let bytes = jpg_export::selected_jpeg(&render, quarter_turns)?;
         let sources = source_paths.lock().unwrap();
-        if protects_source(&path, &sources) {
-            return Err("Choose a new file. Original images cannot be overwritten.".into());
-        }
-        atomic_write(&path, &bytes)?;
+        let path = jpg_export::save_selected_jpeg(
+            &directory,
+            &bytes,
+            source.metadata.image_date.as_deref(),
+            &sources,
+        )?;
         Ok(Some(path.to_string_lossy().into_owned()))
     })
     .await
@@ -804,6 +882,15 @@ async fn save_review(
     .await
     .map_err(|e| e.to_string())?
 }
+// Tauri uses HTTP hosts on Windows and native custom schemes on macOS.
+fn render_url(token: &str) -> String {
+    if cfg!(windows) {
+        format!("http://rad.localhost/{token}")
+    } else {
+        format!("rad://localhost/{token}")
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -821,7 +908,7 @@ fn main() {
                 Some(c) => tauri::http::Response::builder()
                     .header("Content-Type", "image/png")
                     .header("Cache-Control", "private, max-age=3600, immutable")
-                    .body(c.bytes.clone())
+                    .body(c.bytes.as_ref().clone())
                     .unwrap(),
                 None => tauri::http::Response::builder()
                     .status(404)
@@ -830,15 +917,23 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            delete_images,
+            sample_reference,
             choose_images,
             set_viewer_title,
             set_viewer_fullscreen,
             save_image_settings,
             finish_close,
             jpg_export::export_jpg_image,
-            review_dark_regions,
+            jpg_export::choose_jpeg_export_directory,
+            jpg_export::prepare_export_image,
+            jpg_export::export_viewer_jpg,
+            jpg_export::preview_viewer_jpg,
+            printing::list_printers,
+            printing::print_radiographs,
             launch_patient_number,
             open_patient,
+            open_demo_patient,
             choose_reference,
             import_image,
             render_image,
@@ -857,6 +952,20 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn render_urls_use_the_platform_custom_protocol_and_keep_the_token() {
+        let token = "f8ba6cba-922e-4ea2-a3ed-adf0d5008b3a";
+        let url = render_url(token);
+        let uri: tauri::http::Uri = url.parse().unwrap();
+        assert_eq!(uri.path(), format!("/{token}"));
+        if cfg!(windows) {
+            assert_eq!(uri.scheme_str(), Some("http"));
+            assert_eq!(uri.host(), Some("rad.localhost"));
+        } else {
+            assert_eq!(uri.scheme_str(), Some("rad"));
+            assert_eq!(uri.host(), Some("localhost"));
+        }
+    }
     #[test]
     fn patient_paths_use_last_two_digits_and_preserve_leading_zeros() {
         let root = Path::new("notes");
@@ -1030,6 +1139,34 @@ mod tests {
         });
     }
     #[test]
+    fn preset_loading_rejects_invalid_and_oversized_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("presets.json");
+        assert!(read_presets(&path).unwrap().is_empty());
+        let source = directory.path().join("source.png");
+        image::GrayImage::from_pixel(2, 2, image::Luma([128]))
+            .save(&source)
+            .unwrap();
+        let recipe = Recipe::neutral(&decode(&source).unwrap());
+        let mut presets = vec![CustomPreset {
+            name: "Test".into(),
+            recipe: recipe.clone(),
+        }];
+        std::fs::write(&path, serde_json::to_vec(&presets).unwrap()).unwrap();
+        assert_eq!(read_presets(&path).unwrap().len(), 1);
+        presets[0].recipe.gamma = 0.0;
+        std::fs::write(&path, serde_json::to_vec(&presets).unwrap()).unwrap();
+        assert!(read_presets(&path).is_err());
+        presets[0].recipe = recipe;
+        presets[0].name = " ".into();
+        std::fs::write(&path, serde_json::to_vec(&presets).unwrap()).unwrap();
+        assert!(read_presets(&path).is_err());
+        std::fs::write(&path, vec![b' '; 1_000_001]).unwrap();
+        assert!(read_presets(&path).err().unwrap().contains("too large"));
+        std::fs::write(&path, b"{broken").unwrap();
+        assert!(read_presets(&path).is_err());
+    }
+    #[test]
     fn atomic_save_replaces_complete_document_and_leaves_no_temp() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("presets.json");
@@ -1115,7 +1252,7 @@ mod tests {
             cache.insert(
                 key.clone(),
                 Cached {
-                    bytes: vec![1],
+                    bytes: Arc::new(vec![1]),
                     info: RenderInfo {
                         id: id.into(),
                         request_id,
@@ -1149,6 +1286,34 @@ mod tests {
         assert!(cache.contains_key("one:0"));
         assert!(cache.contains_key("one:20"));
         assert!(cache.contains_key("one:21"));
+    }
+
+    #[test]
+    fn cached_pin_owns_exact_bytes_without_mutating_display_request() {
+        let bytes = Arc::new(vec![1, 2, 3, 255]);
+        let cached = Cached {
+            bytes: bytes.clone(),
+            image_id: "one".into(),
+            neutral: false,
+            info: RenderInfo {
+                id: "one".into(),
+                request_id: 7,
+                url: "http://rad.localhost/token".into(),
+                histogram: vec![3, 5],
+                clipped_low: 1,
+                clipped_high: 2,
+                render_ms: 10.0,
+                preview: false,
+            },
+        };
+        let snapshot = cached_snapshot(cached.clone(), 9);
+        assert_eq!(snapshot.request_id, 9);
+        assert_eq!(snapshot.url, snapshot_data_url(&bytes));
+        assert_eq!(snapshot.histogram, cached.info.histogram);
+        assert!(!snapshot.preview);
+        assert_eq!(cached.info.request_id, 7);
+        assert_eq!(cached.info.url, "http://rad.localhost/token");
+        assert!(Arc::ptr_eq(&bytes, &cached.bytes));
     }
 
     #[test]

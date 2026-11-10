@@ -9,3 +9,11 @@ local-verification/
 __pycache__/
 src-tauri/gen/
 .env*
+/demo/John Smith/
+/output/RAD-Viewer-Demo-*/
+/output/RAD-Viewer-*-Demo.zip
+/output/RAD-Viewer-*-Mac-source.zip
+/output/RAD-Viewer-*-Mac-source.zip.sha256
+/output/RAD-Viewer-Portable-*/
+/output/RAD-Viewer-*-Portable.zip
+/tmp/
