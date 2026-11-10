@@ -49,7 +49,7 @@ describe('Mac compatibility', () => {
     expect(print.disabled).toBe(true);
     expect(print.title).toContain('Direct printing is unavailable');
     expect(screen.queryByRole('textbox', { name: 'Patient number' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Open John Smith demo' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Open Synthetic Sample demo' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Open radiographs' }));
     expect(await screen.findByAltText('Enhanced: Local image')).toBeTruthy();
     expect(print.disabled).toBe(true);

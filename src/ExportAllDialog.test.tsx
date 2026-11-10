@@ -20,7 +20,7 @@ it('uses the letter-export title and a local Pictures destination for the demo',
   render(<ExportAllDialog items={items} patientName="Smith, John" patientId="DEMO" onClose={vi.fn()} onBusy={vi.fn()}/>);
   await screen.findByAltText('JPEG export preview');
   expect(screen.getByRole('heading',{name:'Export for Letter'})).toBeTruthy();
-  expect(screen.getByText(/your Pictures folder under RAD Viewer \/ John Smith/)).toBeTruthy();
+  expect(screen.getByText(/your Pictures folder under RAD Viewer \/ Synthetic Sample/)).toBeTruthy();
   expect(screen.queryByText(/server\\incoming/)).toBeNull();
   expect(mocks.invoke.mock.calls.some(([command])=>command==='export_viewer_jpg')).toBe(false);
 });

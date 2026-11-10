@@ -173,13 +173,7 @@ pub async fn choose_jpeg_export_directory(
     patient_name: String,
     app: tauri::AppHandle,
 ) -> Result<Option<String>, String> {
-    let root = if cfg!(windows) {
-        PathBuf::from(r"\\server\Incoming")
-    } else {
-        app.path()
-            .picture_dir()
-            .map_err(|error| error.to_string())?
-    };
+    let root = app.path().picture_dir().map_err(|error| error.to_string())?;
     let suggested = selected_export_directory(&root, &patient_name)?;
     tauri::async_runtime::spawn_blocking(move || {
         // Folder pickers can only focus existing folders. If the office share is
@@ -290,7 +284,7 @@ pub async fn export_jpg_image(
     tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
         export_to(
-            &PathBuf::from(r"\\C04577\incoming"),
+            &PathBuf::from(r"\\EXAMPLE-SERVER\incoming"),
             &patient_name,
             &batch_id,
             index,
@@ -685,15 +679,10 @@ pub async fn export_viewer_jpg(
             .picture_dir()
             .map_err(|e| e.to_string())?
             .join("RAD Viewer")
-            .join("John Smith")
-    } else if cfg!(target_os = "macos") {
-        app.path()
-            .picture_dir()
-            .map_err(|e| e.to_string())?
-            .join("RAD Viewer")
-            .join("Exports")
+            .join("Synthetic Sample")
     } else {
-        PathBuf::from(r"\\server\incoming")
+        app.path().picture_dir().map_err(|e| e.to_string())?
+            .join("RAD Viewer").join("Exports")
     };
     tauri::async_runtime::spawn_blocking(move || {
         save_composite(&root, &patient_name, &patient_id, &png)

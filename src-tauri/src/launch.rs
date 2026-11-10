@@ -23,7 +23,7 @@ pub fn parse_patient_number(
         let value = if argument == "--patnum" {
             arguments
                 .next()
-                .ok_or("Missing patient number. Use --patnum 67751.")?
+                .ok_or("Missing patient number. Use --patnum 10001.")?
                 .into_string()
                 .map_err(|_| "Patient number must contain 2–64 digits only.".to_string())?
         } else if let Some(value) = argument
@@ -80,14 +80,14 @@ mod tests {
         for value in [
             "",
             "1",
-            "../67751",
+            "../10001",
             "67/751",
             "67\\751",
-            "-67751",
+            "-10001",
             "67 751",
             "６７７５１",
             "[PatNum]",
-            "67751&other=1",
+            "10001&other=1",
         ] {
             assert!(parse(&["--patnum", value]).is_err(), "{value}");
             assert!(parse(&[&format!("--patnum={value}")]).is_err(), "{value}");
@@ -99,11 +99,11 @@ mod tests {
     #[test]
     fn rejects_duplicate_ids_and_unknown_arguments() {
         for arguments in [
-            vec!["--patnum", "67751", "--patnum=67751"],
-            vec!["patnum=67751", "?patnum=66675"],
-            vec!["--other", "67751"],
-            vec!["67751"],
-            vec!["--patnum=67751", "unexpected"],
+            vec!["--patnum", "10001", "--patnum=10001"],
+            vec!["patnum=10001", "?patnum=10002"],
+            vec!["--other", "10001"],
+            vec!["10001"],
+            vec!["--patnum=10001", "unexpected"],
         ] {
             assert!(parse(&arguments).is_err(), "{arguments:?}");
         }

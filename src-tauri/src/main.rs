@@ -359,14 +359,11 @@ async fn open_patient(
     }
     let protected_sources = state.source_paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let study = discover_patient(
-            &[
-                Path::new(r"D:\ABELDent\DATA\NOTES"),
-                Path::new(r"\\C04577\ABELDent\DATA\NOTES"),
-                Path::new(r"\\SERVER\ABELDent\DATA\NOTES"),
-            ],
-            &patient_number,
-        )?;
+        let root = std::env::var_os("RAD_VIEWER_PATIENT_ROOT")
+            .filter(|value| !value.is_empty())
+            .ok_or("Patient lookup is not configured. Set RAD_VIEWER_PATIENT_ROOT or use Open Images.")?;
+        let root = PathBuf::from(root);
+        let study = discover_patient(&[root.as_path()], &patient_number)?;
         let mut sources = protected_sources.lock().unwrap();
         for path in &study.paths {
             let path = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));

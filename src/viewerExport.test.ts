@@ -44,7 +44,7 @@ it('uses the original bitmap at fit without cropping or distortion, and keeps th
 });
 
 it('draws the bundled logo and complete patient name without ID or doctor names, even for long names',async()=>{
-  vi.stubGlobal('Image',class {naturalWidth=934;naturalHeight=469;onload?:()=>void;set src(value:string){expect(value).toBe('/office-logo.png');queueMicrotask(()=>this.onload?.());}});
+  vi.stubGlobal('Image',class {naturalWidth=934;naturalHeight=469;onload?:()=>void;set src(value:string){expect(value).toBe('/rad-viewer-icon.svg');queueMicrotask(()=>this.onload?.());}});
   for(const name of ['Kooring, Daniel','A'.repeat(80),'Alexandria-Marguerite van der Westhuizen, Christopher Alexander']){
     for(const [width,height] of [[3840,2160],[800,1200],[4096,1080]]){
       const text:{value:string;x:number;y:number;width:number}[]=[];
@@ -53,8 +53,8 @@ it('draws the bundled logo and complete patient name without ID or doctor names,
       const layout=viewerLayout(1,width,height);
       expect(ctx.drawImage).toHaveBeenCalledOnce();
       expect(vi.mocked(ctx.fillRect).mock.calls[0]).toEqual([0,0,layout.sidebar,height]);
-      expect(text.map(t=>t.value)).toContain('info@KidsDentistry.ca');
-      expect(text.some(t=>/^Dr\./.test(t.value) || /Patient ID|Goralski|Ghatak/.test(t.value))).toBe(false);
+      expect(text.map(t=>t.value)).toContain('example.invalid');
+      expect(text.some(t=>/^Dr\./.test(t.value) || /Patient ID|Goralski/.test(t.value))).toBe(false);
       const patientLines=text.slice(1,-4);
       expect(patientLines.map(t=>t.value).join('').replaceAll(' ','')).toBe(name.replaceAll(' ',''));
       for(const line of patientLines){expect(line.x+line.width).toBeLessThanOrEqual(layout.sidebar-32*layout.unit+.001);expect(line.y).toBeLessThan(height-194*layout.unit);}

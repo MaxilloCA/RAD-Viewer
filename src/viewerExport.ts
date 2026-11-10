@@ -44,7 +44,7 @@ function nameLines(ctx:CanvasRenderingContext2D,name:string,width:number):string
 }
 
 export async function drawExportBranding(ctx:CanvasRenderingContext2D,width:number,height:number,name:string) {
-  const logo=await loadBitmap('/office-logo.png');
+  const logo=await loadBitmap('/rad-viewer-icon.svg');
   const {unit,sidebar}=viewerLayout(1,width,height);
   const left=32*unit, textWidth=sidebar-2*left, top=44*unit;
   const logoHeight=textWidth*logo.naturalHeight/logo.naturalWidth;
@@ -69,6 +69,6 @@ export async function drawExportBranding(ctx:CanvasRenderingContext2D,width:numb
   lines.forEach((line,index)=>ctx.fillText(line,left,nameY+index*fontSize*1.12));
   ctx.fillStyle='#35bfe7';ctx.fillRect(left,contactY-24*unit,textWidth,unit);
   ctx.fillStyle='#4e5963';ctx.font=`${19*unit}px "Segoe UI", Arial, sans-serif`;
-  ['300 Lakeshore Dr. Suite 200','Barrie, ON L4N 0B4','705 722 3213','info@KidsDentistry.ca'].forEach((line,index)=>ctx.fillText(line,left,contactY+index*29*unit));
+  ['Example practice','Synthetic review build','No clinical contact','example.invalid'].forEach((line,index)=>ctx.fillText(line,left,contactY+index*29*unit));
   ctx.restore();
 }

@@ -1,4 +1,3 @@
-import { isMac } from './platform';
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { ImageAppearance } from './model';
@@ -11,7 +10,7 @@ export default function ExportAllDialog({ items, patientName, patientId='', onCl
   const [name,setName]=useState(patientName),[stage,setStage]=useState<'name'|'running'|'preview'|'saving'|'done'|'error'>(patientName?'running':'name');
   const [completed,setCompleted]=useState(0),[destination,setDestination]=useState(''),[failure,setFailure]=useState('');
   const [preview,setPreview]=useState<{png:string;url:string;name:string}|null>(null);
-  const saveLocation=patientId==='DEMO'?'your Pictures folder under RAD Viewer / John Smith':isMac?'your Pictures folder under RAD Viewer / Exports':'\\\\server\\incoming';
+  const saveLocation=patientId==='DEMO'?'your Pictures folder under RAD Viewer / Synthetic Sample':'your Pictures folder under RAD Viewer / Exports';
   const cancel=()=>{if(saving.current)return;cancelled.current=true;onBusy(false);onClose();};
   const run=async(value:string)=>{
     if(started.current||!value.trim())return;

@@ -1,37 +1,36 @@
 use crate::patient::{self, PatientStudy};
 use std::{io::Write, path::Path};
 
-// Demo data is prepared locally with scripts/prepare_demo.py, excluded from Git,
-// and embedded so the installed app and standalone executable need no office share.
+// Public review fixtures are generated mathematically; see scripts/generate_synthetic_demo.py.
 const FILES: &[(&str, &[u8])] = &[
     (
         "Radiograph-01.dcm",
-        include_bytes!("../../demo/John Smith/Radiograph-01.dcm"),
+        include_bytes!("../../fixtures/synthetic/Radiograph-01.dcm"),
     ),
     (
         "Radiograph-02.dcm",
-        include_bytes!("../../demo/John Smith/Radiograph-02.dcm"),
+        include_bytes!("../../fixtures/synthetic/Radiograph-02.dcm"),
     ),
     (
         "Radiograph-03.dcm",
-        include_bytes!("../../demo/John Smith/Radiograph-03.dcm"),
+        include_bytes!("../../fixtures/synthetic/Radiograph-03.dcm"),
     ),
     (
         "Radiograph-04.dcm",
-        include_bytes!("../../demo/John Smith/Radiograph-04.dcm"),
+        include_bytes!("../../fixtures/synthetic/Radiograph-04.dcm"),
     ),
     (
         "Radiograph-05.dcm",
-        include_bytes!("../../demo/John Smith/Radiograph-05.dcm"),
+        include_bytes!("../../fixtures/synthetic/Radiograph-05.dcm"),
     ),
     (
         "PatientInfo.xml",
-        include_bytes!("../../demo/John Smith/PatientInfo.xml"),
+        include_bytes!("../../fixtures/synthetic/PatientInfo.xml"),
     ),
 ];
 
 pub fn open(root: &Path) -> Result<PatientStudy, String> {
-    let directory = root.join("John Smith");
+    let directory = root.join("Synthetic Sample");
     std::fs::create_dir_all(&directory)
         .map_err(|e| format!("Cannot create the demo folder: {e}"))?;
     for &(name, bytes) in FILES {
@@ -55,7 +54,7 @@ pub fn open(root: &Path) -> Result<PatientStudy, String> {
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if std::fs::read(&path).map_err(|e| e.to_string())? != bytes {
-                    return Err("A demo file has changed. Move the John Smith sample folder aside, then reopen the demo to restore the bundled images.".into());
+                    return Err("A demo file has changed. Move the Synthetic Sample sample folder aside, then reopen the demo to restore the bundled images.".into());
                 }
             }
             Err(error) => return Err(format!("Cannot prepare the demo folder: {error}")),
@@ -91,11 +90,11 @@ mod tests {
     fn self_contained_demo_opens_five_unchanged_images_as_john_smith_and_keeps_edits() {
         let root = tempfile::tempdir().unwrap();
         let study = open(root.path()).unwrap();
-        assert_eq!(study.patient_name.as_deref(), Some("John Smith"));
+        assert_eq!(study.patient_name.as_deref(), Some("Synthetic Sample"));
         assert_eq!(study.patient_number, "DEMO");
         assert_eq!(study.paths.len(), 5);
         assert_eq!(study.latest_date_paths, study.paths);
-        assert!(Path::new(&study.directory).ends_with("John Smith"));
+        assert!(Path::new(&study.directory).ends_with("Synthetic Sample"));
         for &(name, bytes) in FILES {
             assert_eq!(
                 std::fs::read(Path::new(&study.directory).join(name)).unwrap(),
@@ -117,7 +116,7 @@ mod tests {
     fn demo_does_not_overwrite_changed_sample_files() {
         let root = tempfile::tempdir().unwrap();
         open(root.path()).unwrap();
-        let path = root.path().join("John Smith/Radiograph-01.dcm");
+        let path = root.path().join("Synthetic Sample/Radiograph-01.dcm");
         std::fs::write(&path, b"changed").unwrap();
         assert!(open(root.path()).is_err());
         assert_eq!(std::fs::read(path).unwrap(), b"changed");

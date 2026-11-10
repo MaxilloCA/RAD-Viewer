@@ -119,8 +119,7 @@ describe('About and help', () => {
     trigger.focus(); fireEvent.click(trigger);
     const dialog = screen.getByRole('dialog', { name: 'About & help' });
     expect(within(dialog).getByText('Michal Goralski, DDS, MSc FRCD(C)')).toBeTruthy();
-    expect(dialog.textContent).toContain('goralsi@kidsdentistry.ca');
-    expect(dialog.textContent).toContain('Barrie, ON - Canada');
+    expect(dialog.textContent).toContain('Public source review');
     expect(within(dialog).getByText(packageInfo.version)).toBeTruthy();
     expect(within(dialog).getByRole('heading', { name: 'Quick help' })).toBeTruthy();
     fireEvent.keyDown(dialog, { key: 'Escape' });
@@ -205,13 +204,13 @@ describe('deletion review', () => {
 });
 const patient = (paths: string[], patientNumber = '00123', patientName: string | null = 'Example Person'): PatientDiscovery => ({ patientNumber, patientName, directory: 'C:\\Synthetic', paths, latestDatePaths: paths.slice(0, 2), warnings: [] });
 
-it('opens John Smith demo without a patient number or office lookup, and refreshes it locally', async () => {
-  const demo={...patient(['demo-1.dcm','demo-2.dcm'],'DEMO','John Smith'),firstName:'John',lastName:'Smith'};
+it('opens Synthetic Sample demo without a patient number or office lookup, and refreshes it locally', async () => {
+  const demo={...patient(['demo-1.dcm','demo-2.dcm'],'DEMO','Synthetic Sample'),firstName:'John',lastName:'Smith'};
   customInvoke=command=>command==='open_demo_patient'?Promise.resolve(demo):undefined;
   render(<App/>);
-  fireEvent.click(screen.getByRole('button',{name:'Open John Smith demo'}));
+  fireEvent.click(screen.getByRole('button',{name:'Open Synthetic Sample demo'}));
   await screen.findByAltText('Enhanced: demo-1.dcm');
-  expect(screen.getByLabelText('Current patient').textContent).toContain('John Smith');
+  expect(screen.getByLabelText('Current patient').textContent).toContain('Synthetic Sample');
   expect(mocks.invoke.mock.calls.some(([command])=>command==='open_patient')).toBe(false);
   fireEvent.click(screen.getByRole('button',{name:'Reload Images'}));
   await waitFor(()=>expect(mocks.invoke.mock.calls.filter(([command])=>command==='open_demo_patient')).toHaveLength(2));
@@ -222,7 +221,7 @@ it('prevents duplicate demo opening and reports demo errors in the patient form'
   let fail!:(reason:string)=>void;
   customInvoke=command=>command==='open_demo_patient'?new Promise((_,reject)=>{fail=reject;}):undefined;
   render(<App/>);
-  const demo=screen.getByRole('button',{name:'Open John Smith demo'});
+  const demo=screen.getByRole('button',{name:'Open Synthetic Sample demo'});
   fireEvent.click(demo);fireEvent.click(demo);
   expect(mocks.invoke.mock.calls.filter(([command])=>command==='open_demo_patient')).toHaveLength(1);
   expect((demo as HTMLButtonElement).disabled).toBe(true);
@@ -322,7 +321,7 @@ describe('enhanced viewer with test-only Tauri IPC', () => {
     expect(screen.getByRole('dialog', { name: 'Open patient' })).toBeTruthy();
     expect(document.activeElement).toBe(screen.getByLabelText('Patient number'));
     fireEvent.change(screen.getByLabelText('Patient number'), { target: { value: ' 0067589 ' } });
-    expect(screen.getByText('D:\\ABELDent\\DATA\\NOTES\\89\\0067589')).toBeTruthy();
+    expect(screen.getByText('Configured patient root / 89 / 0067589')).toBeTruthy();
     fireEvent.submit(screen.getByRole('form', { name: 'Open patient' }));
     await screen.findByAltText('Enhanced: selected-patient.rvg');
     expect(mocks.invoke).toHaveBeenCalledWith('open_patient', { patientNumber: '0067589' });
@@ -1064,7 +1063,7 @@ it('exports only visible panes with restored processing and annotations', async 
     if(command==='save_image_settings') return Promise.resolve('r2');
     if(command==='prepare_export_image') return Promise.resolve({url:'frame',width:900,height:1200});
     if(command==='preview_viewer_jpg') return Promise.resolve('data:image/jpeg;base64,preview');
-    if(command==='export_viewer_jpg') return Promise.resolve({directory:'\\\\C04577\\incoming\\Example Person',path:'export.jpg'});
+    if(command==='export_viewer_jpg') return Promise.resolve({directory:'\\\\EXAMPLE-SERVER\\incoming\\Example Person',path:'export.jpg'});
   };
   render(<App/>); submitPatient(); await screen.findByAltText('Enhanced: two.rvg');
   fireEvent.click(screen.getByRole('button',{name:'Close image one.rvg from viewer'}));
@@ -1106,9 +1105,9 @@ describe('Focus Dark controls', () => {
   });
   it('reflows five open radiographs down to one as panes close and keeps every preview', async () => {
     const paths = Array.from({ length: 5 }, (_, index) => `image-${index + 1}.rvg`);
-    customInvoke = command => command === 'open_demo_patient' ? Promise.resolve({ ...patient(paths, 'DEMO', 'John Smith'), latestDatePaths: paths }) : undefined;
+    customInvoke = command => command === 'open_demo_patient' ? Promise.resolve({ ...patient(paths, 'DEMO', 'Synthetic Sample'), latestDatePaths: paths }) : undefined;
     render(<App />);
-    fireEvent.click(screen.getByRole('button', { name: 'Open John Smith demo' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open Synthetic Sample demo' }));
     await waitFor(() => expect(screen.getAllByAltText(/^Enhanced:/)).toHaveLength(5));
     const grid = screen.getByLabelText('Image panes');
     expect(grid.style.gridTemplateColumns).toBe('repeat(3, minmax(0, 1fr))');
@@ -1439,9 +1438,9 @@ describe('Selected JPEG export', () => {
     expect(screen.getByText('2 selected radiographs exported as full-resolution JPEGs at 70% quality.')).toBeTruthy();
   });
   it('uses Last name, First name for the native destination prompt', async () => {
-    const demo = { ...patient(['demo-1.dcm'], 'DEMO', 'John Smith'), firstName: 'John', lastName: 'Smith' };
+    const demo = { ...patient(['demo-1.dcm'], 'DEMO', 'Synthetic Sample'), firstName: 'John', lastName: 'Smith' };
     customInvoke = command => command === 'open_demo_patient' ? Promise.resolve(demo) : undefined;
-    render(<App />); fireEvent.click(screen.getByRole('button', { name: 'Open John Smith demo' }));
+    render(<App />); fireEvent.click(screen.getByRole('button', { name: 'Open Synthetic Sample demo' }));
     await screen.findByAltText('Enhanced: demo-1.dcm');
     fireEvent.click(screen.getByRole('button', { name: 'Export to JPEG' }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('choose_jpeg_export_directory', { patientName: 'Smith, John' }));
